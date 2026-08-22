@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway-service
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: false
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - StripPrefix=1
+        - id: pet-service
+          uri: lb://pet-service
+          predicates:
+            - Path=/api/pet/**
+          filters:
+            - StripPrefix=1
+        - id: note-service
+          uri: lb://note-service
+          predicates:
+            - Path=/api/note/**
+          filters:
+            - StripPrefix=1
+        - id: social-service
+          uri: lb://social-service
+          predicates:
+            - Path=/api/social/**
+          filters:
+            - StripPrefix=1
+
+auth:
+  # 免鉴权路径白名单，逗号分隔，支持前缀匹配
+  whitelist-paths: /api/user/login,/api/user/register
+
+jwt:
+  # 与 user-service 保持一致
+  secret: petverse-jwt-secret-key-please-change-in-production-2026
