@@ -7,6 +7,7 @@ import com.my.petverse.common.dto.user.UserUpdateDTO;
 import com.my.petverse.common.entity.user.User;
 import com.my.petverse.common.vo.user.LoginVO;
 import com.my.petverse.common.vo.user.UserVO;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
@@ -55,4 +56,13 @@ public interface UserService extends IService<User> {
      * @return 是否成功
      */
     boolean updateUser(UserUpdateDTO dto);
+
+    /**
+     * 上传用户头像：校验图片后存入阿里云 OSS，并将访问地址更新到用户资料
+     *
+     * @param userId 用户ID
+     * @param file   头像图片文件
+     * @return 更新后的用户信息
+     */
+    UserVO uploadAvatar(Long userId, MultipartFile file);
 }

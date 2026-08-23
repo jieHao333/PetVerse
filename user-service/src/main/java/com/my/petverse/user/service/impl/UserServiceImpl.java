@@ -7,6 +7,7 @@ import com.my.petverse.common.dto.user.UserRegisterDTO;
 import com.my.petverse.common.dto.user.UserUpdateDTO;
 import com.my.petverse.common.entity.user.User;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.oss.OssService;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.util.JwtUtil;
 import com.my.petverse.common.vo.user.LoginVO;
@@ -18,9 +19,14 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -32,8 +38,19 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     private final JwtUtil jwtUtil;
 
+    private final OssService ossService;
+
     /** 密码加密器（BCrypt） */
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+
+    /** 头像大小上限：2MB */
+    private static final long MAX_AVATAR_SIZE = 2 * 1024 * 1024;
+
+    /** 允许的头像内容类型 */
+    private static final Set<String> AVATAR_CONTENT_TYPES = Set.of(
+            "image/png", "image/jpeg", "image/jpg", "image/webp");
+
+    private static final DateTimeFormatter AVATAR_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     @Override
     public LoginVO register(UserRegisterDTO dto) {
@@ -115,6 +132,43 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             user.setPassword(passwordEncoder.encode(dto.getNewPassword()));
         }
         return updateById(user);
+    }
+
+    /** 上传头像：校验图片 -> 存入 OSS -> 更新用户头像地址 */
+    @Override
+    public UserVO uploadAvatar(Long userId, MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "请选择要上传的图片");
+        }
+        if (file.getSize() > MAX_AVATAR_SIZE) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "头像图片不能超过 2MB");
+        }
+        String contentType = file.getContentType();
+        if (contentType == null || !AVATAR_CONTENT_TYPES.contains(contentType.toLowerCase())) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "仅支持 PNG / JPEG / WEBP 格式的图片");
+        }
+        User user = getById(userId);
+        if (user == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
+        }
+        // 按日期分目录 + UUID 文件名，避免重名覆盖
+        String objectKey = "avatar/" + LocalDate.now().format(AVATAR_DATE_FORMAT) + "/"
+                + UUID.randomUUID().toString().replace("-", "") + getSuffix(file.getOriginalFilename());
+        user.setAvatar(ossService.upload(objectKey, file));
+        updateById(user);
+        return toVO(user);
+    }
+
+    /** 取文件后缀（含点），无后缀返回空串 */
+    private String getSuffix(String filename) {
+        if (!StringUtils.hasText(filename)) {
+            return "";
+        }
+        int index = filename.lastIndexOf('.');
+        if (index < 0 || index == filename.length() - 1) {
+            return "";
+        }
+        return filename.substring(index).toLowerCase();
     }
 
     /**

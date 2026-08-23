@@ -26,6 +26,9 @@ public interface FriendService {
     /** 查询我的好友列表 */
     List<FriendVO> listFriends(Long userId);
 
+    /** 查询我的好友用户ID列表（供其他服务做可见性判断，不聚合用户资料） */
+    List<Long> listFriendIds(Long userId);
+
     /** 删除好友（双向解除） */
     boolean removeFriend(Long userId, Long friendUserId);
 

@@ -55,6 +55,18 @@ public class FriendController {
         return Result.success(friendService.listFriends(userId));
     }
 
+    /** 查询我的好友用户ID列表（供其他服务做可见性判断） */
+    @GetMapping("/ids")
+    public Result<List<Long>> listFriendIds(@RequestHeader("X-User-Id") Long userId) {
+        return Result.success(friendService.listFriendIds(userId));
+    }
+
+    /** 内部接口：按用户ID查其好友ID列表（服务间 Feign 直调，不经网关无身份头） */
+    @GetMapping("/internal/friend-ids/{userId}")
+    public Result<List<Long>> internalFriendIds(@PathVariable("userId") Long userId) {
+        return Result.success(friendService.listFriendIds(userId));
+    }
+
     /** 删除好友 */
     @DeleteMapping("/{friendUserId}")
     public Result<Boolean> removeFriend(@RequestHeader("X-User-Id") Long userId,

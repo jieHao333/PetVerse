@@ -27,4 +27,7 @@ public class Note extends BaseEntity {
 
     /** 所属用户ID */
     private Long userId;
+
+    /** 可见性：0-公开 1-仅好友 2-仅自己 */
+    private Integer visibility;
 }

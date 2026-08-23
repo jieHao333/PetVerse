@@ -34,4 +34,7 @@ public class NoteSaveDTO implements Serializable {
     /** 所属用户ID */
     @NotNull(message = "用户ID不能为空")
     private Long userId;
+
+    /** 可见性：0-公开 1-仅好友 2-仅自己，缺省为公开 */
+    private Integer visibility;
 }

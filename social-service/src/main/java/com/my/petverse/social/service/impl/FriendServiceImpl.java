@@ -155,6 +155,19 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
         return result;
     }
 
+    /** 查询我的好友用户ID列表，仅查关系表不聚合资料，供其他服务做可见性判断 */
+    @Override
+    public List<Long> listFriendIds(Long userId) {
+        List<Friendship> friendships = friendshipMapper.selectList(new LambdaQueryWrapper<Friendship>()
+                .eq(Friendship::getUserId, userId)
+                .select(Friendship::getFriendUserId));
+        List<Long> ids = new ArrayList<>();
+        for (Friendship friendship : friendships) {
+            ids.add(friendship.getFriendUserId());
+        }
+        return ids;
+    }
+
     /** 删除好友，双向解除关系 */
     @Override
     @Transactional(rollbackFor = Exception.class)

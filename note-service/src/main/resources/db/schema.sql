@@ -1,6 +1,7 @@
 -- petverse_note 数据库初始化脚本
 -- 使用方式：先创建数据库，再执行本脚本
 -- CREATE DATABASE IF NOT EXISTS petverse_note DEFAULT CHARSET utf8mb4;
+-- 已有库升级：ALTER TABLE note ADD COLUMN visibility TINYINT NOT NULL DEFAULT 0 COMMENT '可见性 0-公开 1-仅好友 2-仅自己' AFTER user_id;
 
 CREATE TABLE IF NOT EXISTS note
 (
@@ -10,6 +11,7 @@ CREATE TABLE IF NOT EXISTS note
     category    VARCHAR(50)  DEFAULT NULL COMMENT '笔记分类',
     pet_id      BIGINT       DEFAULT NULL COMMENT '关联的宠物ID，可为空',
     user_id     BIGINT       NOT NULL COMMENT '所属用户ID',
+    visibility  TINYINT      NOT NULL DEFAULT 0 COMMENT '可见性 0-公开 1-仅好友 2-仅自己',
     create_time DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted     TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',

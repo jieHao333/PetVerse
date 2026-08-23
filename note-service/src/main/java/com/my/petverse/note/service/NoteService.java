@@ -19,11 +19,14 @@ public interface NoteService extends IService<Note> {
     /** 根据ID查询笔记 */
     NoteVO getNoteById(Long id);
 
-    /** 查询笔记列表 */
-    List<NoteVO> listNotes();
+    /** 按可见性规则查询笔记详情，无权查看或不存在时返回 null */
+    NoteVO getVisibleNote(Long id, Long callerId);
 
-    /** 分页查询笔记 */
-    PageResult<NoteVO> pageNotes(NotePageQueryDTO query);
+    /** 查询当前用户可见的笔记列表 */
+    List<NoteVO> listNotes(Long callerId);
+
+    /** 分页查询当前用户可见的笔记 */
+    PageResult<NoteVO> pageNotes(NotePageQueryDTO query, Long callerId);
 
     /** 新增笔记并为宠物发放经验奖励，返回创建结果 */
     NoteCreateVO saveNote(NoteSaveDTO dto);

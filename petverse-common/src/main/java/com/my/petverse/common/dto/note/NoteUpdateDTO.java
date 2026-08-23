@@ -34,4 +34,7 @@ public class NoteUpdateDTO implements Serializable {
 
     /** 关联的宠物ID，可为空 */
     private Long petId;
+
+    /** 可见性：0-公开 1-仅好友 2-仅自己，为空时不修改 */
+    private Integer visibility;
 }

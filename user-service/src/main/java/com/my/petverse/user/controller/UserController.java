@@ -10,6 +10,7 @@ import com.my.petverse.user.service.UserService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
@@ -61,5 +62,12 @@ public class UserController {
         // 服务端以令牌中的用户ID为准，不允许修改他人资料
         dto.setId(userId);
         return Result.success(userService.updateUser(dto));
+    }
+
+    /** 上传用户头像（存储到阿里云OSS），返回最新用户信息 */
+    @PostMapping("/avatar")
+    public Result<UserVO> uploadAvatar(@RequestHeader("X-User-Id") Long userId,
+                                       @RequestParam("file") MultipartFile file) {
+        return Result.success(userService.uploadAvatar(userId, file));
     }
 }

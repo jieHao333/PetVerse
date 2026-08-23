@@ -31,6 +31,7 @@
         <mybatis-plus.version>3.5.9</mybatis-plus.version>
         <lombok.version>1.18.36</lombok.version>
         <jjwt.version>0.12.7</jjwt.version>
+        <aliyun-oss.version>3.18.1</aliyun-oss.version>
     </properties>
 
     <dependencyManagement>
@@ -92,6 +93,11 @@
                 <artifactId>jjwt-jackson</artifactId>
                 <version>${jjwt.version}</version>
                 <scope>runtime</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.aliyun.oss</groupId>
+                <artifactId>aliyun-sdk-oss</artifactId>
+                <version>${aliyun-oss.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
