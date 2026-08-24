@@ -15,7 +15,7 @@
     <modules>
         <module>petverse-common</module>
         <module>pet-service</module>
-        <module>note-service</module>
+        <module>space-service</module>
         <module>user-service</module>
         <module>social-service</module>
         <module>gateway-service</module>

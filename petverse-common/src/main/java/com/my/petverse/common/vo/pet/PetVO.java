@@ -53,6 +53,9 @@ public class PetVO implements Serializable {
     /** 最近签到日期 */
     private LocalDate lastSignDate;
 
+    /** 是否当前出场宠物 */
+    private Boolean active;
+
     /** 创建时间 */
     private LocalDateTime createTime;
 }

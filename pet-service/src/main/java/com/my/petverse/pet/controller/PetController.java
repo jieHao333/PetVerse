@@ -5,6 +5,7 @@ import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetRenameDTO;
 import com.my.petverse.common.dto.pet.PetSaveDTO;
+import com.my.petverse.common.dto.pet.PetSetActiveDTO;
 import com.my.petverse.common.dto.pet.PetSignInDTO;
 import com.my.petverse.common.dto.pet.PetUpdateDTO;
 import com.my.petverse.common.result.PageResult;
@@ -63,13 +64,19 @@ public class PetController {
         return Result.success(petCatalogService.randomCatalog());
     }
 
-    /** 查询当前用户的宠物 */
+    /** 查询当前用户的出场宠物 */
     @GetMapping("/me")
     public Result<PetVO> me(@RequestParam("userId") Long userId) {
         return Result.success(petService.getMyPet(userId));
     }
 
-    /** 新用户领取宠物（随机抽取或自选） */
+    /** 查询当前用户的全部宠物 */
+    @GetMapping("/my-list")
+    public Result<List<PetVO>> myList(@RequestParam("userId") Long userId) {
+        return Result.success(petService.listMyPets(userId));
+    }
+
+    /** 领取宠物（随机抽取或自选），支持领养多只 */
     @PostMapping("/claim")
     public Result<PetVO> claim(@RequestBody @Valid PetClaimDTO dto) {
         return Result.success(petService.claimPet(dto));
@@ -81,13 +88,19 @@ public class PetController {
         return Result.success(petService.renamePet(dto));
     }
 
-    /** 宠物每日签到获得经验值 */
+    /** 设置出场宠物 */
+    @PutMapping("/active")
+    public Result<PetVO> setActive(@RequestBody @Valid PetSetActiveDTO dto) {
+        return Result.success(petService.setActivePet(dto));
+    }
+
+    /** 每日签到，为用户所有宠物发放经验值 */
     @PostMapping("/sign-in")
     public Result<PetSignInVO> signIn(@RequestBody @Valid PetSignInDTO dto) {
         return Result.success(petService.signIn(dto));
     }
 
-    /** 按来源为宠物发放经验值（供其他服务调用，如发布笔记奖励） */
+    /** 按来源为出场宠物发放经验值（供其他服务调用，如发布动态奖励） */
     @PostMapping("/exp/grant")
     public Result<PetExpGainVO> grantExp(@RequestBody @Valid PetExpGrantDTO dto) {
         return Result.success(petService.grantExp(dto));

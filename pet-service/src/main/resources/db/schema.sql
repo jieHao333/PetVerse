@@ -1,4 +1,9 @@
 -- petverse_pet 数据库初始化脚本
+-- 存量库多宠物改造迁移脚本（仅需执行一次）：
+-- ALTER TABLE pet DROP INDEX uk_user_id;
+-- ALTER TABLE pet ADD INDEX idx_user_id (user_id);
+-- ALTER TABLE pet ADD COLUMN active TINYINT DEFAULT 0 COMMENT '是否出场 0-否 1-是' AFTER sign_streak;
+-- UPDATE pet SET active = 1 WHERE deleted = 0;
 
 CREATE TABLE IF NOT EXISTS pet
 (
@@ -14,11 +19,12 @@ CREATE TABLE IF NOT EXISTS pet
     exp            BIGINT       DEFAULT 0 COMMENT '当前等级经验值',
     last_sign_date DATE         DEFAULT NULL COMMENT '最近签到日期',
     sign_streak    INT          DEFAULT 0 COMMENT '连续签到天数',
+    active         TINYINT      DEFAULT 0 COMMENT '是否出场 0-否 1-是',
     create_time    DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time    DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted        TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_user_id (user_id)
+    KEY idx_user_id (user_id)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='用户宠物';
 

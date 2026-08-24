@@ -9,7 +9,7 @@ import java.time.LocalDate;
 
 /**
  * 用户宠物实体，对应数据库表 pet
- * 一个用户拥有一个宠物，作为社交形象
+ * 一个用户可拥有多只宠物，其中一只为出场宠物，作为社交形象
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -34,7 +34,7 @@ public class Pet extends BaseEntity {
     /** 形象图片地址 */
     private String imageUrl;
 
-    /** 所属用户ID（唯一，一人一宠） */
+    /** 所属用户ID */
     private Long userId;
 
     /** 宠物等级，范围 1-100 */
@@ -48,4 +48,7 @@ public class Pet extends BaseEntity {
 
     /** 连续签到天数 */
     private Integer signStreak;
+
+    /** 是否出场 0-否 1-是，同一用户仅一只出场 */
+    private Integer active;
 }

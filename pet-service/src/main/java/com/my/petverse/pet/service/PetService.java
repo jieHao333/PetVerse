@@ -6,6 +6,7 @@ import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetRenameDTO;
 import com.my.petverse.common.dto.pet.PetSaveDTO;
+import com.my.petverse.common.dto.pet.PetSetActiveDTO;
 import com.my.petverse.common.dto.pet.PetSignInDTO;
 import com.my.petverse.common.dto.pet.PetUpdateDTO;
 import com.my.petverse.common.entity.pet.Pet;
@@ -39,18 +40,24 @@ public interface PetService extends IService<Pet> {
     /** 删除宠物 */
     boolean deletePet(Long id);
 
-    /** 查询当前用户的宠物 */
+    /** 查询当前用户的出场宠物 */
     PetVO getMyPet(Long userId);
 
-    /** 新用户领取宠物（随机抽取或自选） */
+    /** 查询当前用户的全部宠物 */
+    List<PetVO> listMyPets(Long userId);
+
+    /** 设置出场宠物 */
+    PetVO setActivePet(PetSetActiveDTO dto);
+
+    /** 领取宠物（随机抽取或自选），支持领养多只 */
     PetVO claimPet(PetClaimDTO dto);
 
     /** 修改宠物名称 */
     PetVO renamePet(PetRenameDTO dto);
 
-    /** 宠物每日签到获取经验值 */
+    /** 每日签到，为用户所有宠物发放经验 */
     PetSignInVO signIn(PetSignInDTO dto);
 
-    /** 按来源为宠物发放经验值（如发布笔记），用户无宠物时返回 null */
+    /** 按来源为出场宠物发放经验值（如发布动态），用户无宠物时返回 null */
     PetExpGainVO grantExp(PetExpGrantDTO dto);
 }

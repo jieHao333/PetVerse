@@ -15,9 +15,13 @@ public class PetRenameDTO implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** 用户ID（一个用户仅有一只宠物，按用户定位宠物） */
+    /** 用户ID（用于归属校验） */
     @NotNull(message = "用户ID不能为空")
     private Long userId;
+
+    /** 宠物ID（多宠后按宠物ID定位） */
+    @NotNull(message = "宠物ID不能为空")
+    private Long petId;
 
     /** 新的宠物名称 */
     @NotBlank(message = "宠物名称不能为空")

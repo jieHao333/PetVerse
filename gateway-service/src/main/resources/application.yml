@@ -4,6 +4,9 @@ server:
 spring:
   application:
     name: gateway-service
+  codec:
+    # 网关为 WebFlux 架构，需放行宠域空间大视频上传的请求体缓存
+    max-in-memory-size: 55MB
   cloud:
     gateway:
       discovery:
@@ -22,10 +25,10 @@ spring:
             - Path=/api/pet/**
           filters:
             - StripPrefix=1
-        - id: note-service
-          uri: lb://note-service
+        - id: space-service
+          uri: lb://space-service
           predicates:
-            - Path=/api/note/**
+            - Path=/api/space/**
           filters:
             - StripPrefix=1
         - id: social-service

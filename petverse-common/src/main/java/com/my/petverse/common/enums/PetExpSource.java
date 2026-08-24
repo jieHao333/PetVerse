@@ -5,8 +5,8 @@ package com.my.petverse.common.enums;
  */
 public enum PetExpSource {
 
-    /** 发布笔记 */
-    NOTE(10, "发布笔记");
+    /** 发布宠域空间动态（常量名保留 NOTE 以兼容历史数据） */
+    NOTE(10, "发布动态");
 
     /** 该来源一次获得的经验值 */
     private final int exp;

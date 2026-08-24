@@ -1,6 +1,7 @@
 package com.my.petverse.pet.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
@@ -8,6 +9,7 @@ import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetRenameDTO;
 import com.my.petverse.common.dto.pet.PetSaveDTO;
+import com.my.petverse.common.dto.pet.PetSetActiveDTO;
 import com.my.petverse.common.dto.pet.PetSignInDTO;
 import com.my.petverse.common.dto.pet.PetUpdateDTO;
 import com.my.petverse.common.entity.pet.Pet;
@@ -27,9 +29,11 @@ import com.my.petverse.pet.service.PetService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -100,24 +104,44 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         return removeById(id);
     }
 
-    /** 查询当前用户的宠物 */
+    /** 查询当前用户的出场宠物 */
     @Override
     public PetVO getMyPet(Long userId) {
-        Pet pet = getByUserId(userId);
+        Pet pet = getActivePet(userId);
         return pet == null ? null : toVO(pet);
     }
 
+    /** 查询当前用户的全部宠物，按领养先后排序 */
+    @Override
+    public List<PetVO> listMyPets(Long userId) {
+        return listByUserId(userId).stream().map(this::toVO).collect(Collectors.toList());
+    }
+
+    /** 设置出场宠物：先清空该用户所有宠物的出场标记，再置目标宠物出场 */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public PetVO setActivePet(PetSetActiveDTO dto) {
+        Pet pet = getById(dto.getPetId());
+        if (pet == null || !pet.getUserId().equals(dto.getUserId())) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
+        }
+        update(new LambdaUpdateWrapper<Pet>()
+                .eq(Pet::getUserId, dto.getUserId())
+                .set(Pet::getActive, 0));
+        pet.setActive(1);
+        updateById(pet);
+        return toVO(pet);
+    }
+
     /**
-     * 新用户领取宠物
+     * 领取宠物
      * RANDOM 方式从图鉴随机抽取，CHOOSE 方式按图鉴ID自选
-     * 一个用户只能拥有一只宠物
+     * 支持领养多只：首只自动出场，后续宠物默认不出场
      */
     @Override
     public PetVO claimPet(PetClaimDTO dto) {
-        // 校验用户是否已有宠物
-        if (getByUserId(dto.getUserId()) != null) {
-            throw new BusinessException(ResultCode.BAD_REQUEST, "该用户已拥有宠物");
-        }
+        boolean firstPet = count(new LambdaQueryWrapper<Pet>()
+                .eq(Pet::getUserId, dto.getUserId())) == 0;
         // 根据领取方式确定图鉴数据
         PetCatalog catalog;
         if (dto.getMethod() == PetClaimMethod.CHOOSE) {
@@ -144,6 +168,7 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         pet.setLevel(1);
         pet.setExp(0L);
         pet.setSignStreak(0);
+        pet.setActive(firstPet ? 1 : 0);
         save(pet);
         return toVO(pet);
     }
@@ -151,9 +176,9 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
     /** 修改宠物名称，仅允许修改本人宠物 */
     @Override
     public PetVO renamePet(PetRenameDTO dto) {
-        Pet pet = getByUserId(dto.getUserId());
-        if (pet == null) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "用户尚未领取宠物");
+        Pet pet = getById(dto.getPetId());
+        if (pet == null || !pet.getUserId().equals(dto.getUserId())) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
         }
         pet.setName(dto.getName().trim());
         updateById(pet);
@@ -161,48 +186,56 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
     }
 
     /**
-     * 宠物每日签到
-     * 每天限签一次，连续签到可获得递增经验值
+     * 每日签到
+     * 每天限签一次，为用户所有宠物统一发放递增经验并累计连续天数
      */
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public PetSignInVO signIn(PetSignInDTO dto) {
-        Pet pet = getByUserId(dto.getUserId());
-        if (pet == null) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "用户尚未领取宠物");
+        List<Pet> pets = listByUserId(dto.getUserId());
+        if (pets.isEmpty()) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "用户尚未领养宠物");
         }
         LocalDate today = LocalDate.now();
-        // 当天已签到则拒绝
-        if (today.equals(pet.getLastSignDate())) {
+        // 签到为整体行为，任一宠物已记录当天签到即拒绝
+        if (pets.stream().anyMatch(p -> today.equals(p.getLastSignDate()))) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "今天已签到，请明天再来");
         }
-        // 判断是否连续签到，间隔超过一天则重新从 1 天开始
-        boolean continuous = pet.getLastSignDate() != null
-                && pet.getLastSignDate().equals(today.minusDays(1));
-        int streak = continuous ? (pet.getSignStreak() == null ? 0 : pet.getSignStreak()) + 1 : 1;
+        // 所有宠物同步签到，连续天数一致，任取一只计算即可
+        Pet first = pets.get(0);
+        boolean continuous = first.getLastSignDate() != null
+                && first.getLastSignDate().equals(today.minusDays(1));
+        int streak = continuous ? (first.getSignStreak() == null ? 0 : first.getSignStreak()) + 1 : 1;
         // 经验值 = 基础 20 + (连续天数-1) * 5
         long gainedExp = SIGN_IN_BASE_EXP + (long) (streak - 1) * SIGN_IN_STREAK_EXP;
-        int levelBefore = pet.getLevel() == null ? 1 : pet.getLevel();
-        // 累加经验并处理升级
-        PetLevelCalculator.gainExp(pet, gainedExp);
-        pet.setSignStreak(streak);
-        pet.setLastSignDate(today);
-        updateById(pet);
 
-        // 组装签到结果
+        List<PetSignInVO.Item> items = new ArrayList<>();
+        for (Pet pet : pets) {
+            int levelBefore = pet.getLevel() == null ? 1 : pet.getLevel();
+            PetLevelCalculator.gainExp(pet, gainedExp);
+            pet.setSignStreak(streak);
+            pet.setLastSignDate(today);
+            PetSignInVO.Item item = new PetSignInVO.Item();
+            item.setPetId(pet.getId());
+            item.setName(pet.getName());
+            item.setLevel(pet.getLevel());
+            item.setExp(pet.getExp());
+            item.setLeveledUp(pet.getLevel() > levelBefore);
+            items.add(item);
+        }
+        updateBatchById(pets);
+
         PetSignInVO vo = new PetSignInVO();
-        vo.setUserId(pet.getUserId());
-        vo.setPetId(pet.getId());
+        vo.setUserId(dto.getUserId());
         vo.setGainedExp(gainedExp);
         vo.setSignStreak(streak);
-        vo.setLevel(pet.getLevel());
-        vo.setExp(pet.getExp());
-        vo.setLeveledUp(pet.getLevel() > levelBefore);
+        vo.setPets(items);
         return vo;
     }
 
     /**
      * 按来源发放经验值，经验来源与奖励数值由 PetExpSource 枚举定义
-     * 用户尚未领取宠物时返回 null，不阻断上游业务流程
+     * 仅发放给当前出场宠物，用户无宠物时返回 null，不阻断上游业务流程
      */
     @Override
     public PetExpGainVO grantExp(PetExpGrantDTO dto) {
@@ -213,7 +246,7 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         } catch (IllegalArgumentException e) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "未知的经验来源：" + dto.getSource());
         }
-        Pet pet = getByUserId(dto.getUserId());
+        Pet pet = getActivePet(dto.getUserId());
         if (pet == null) {
             return null;
         }
@@ -233,17 +266,33 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         return vo;
     }
 
-    /** 根据用户ID查询宠物 */
-    private Pet getByUserId(Long userId) {
+    /** 查询用户名下全部宠物，按领养先后排序 */
+    private List<Pet> listByUserId(Long userId) {
+        return list(new LambdaQueryWrapper<Pet>()
+                .eq(Pet::getUserId, userId)
+                .orderByAsc(Pet::getCreateTime));
+    }
+
+    /** 查询用户当前出场宠物；兼容存量数据，无出场标记时取第一只 */
+    private Pet getActivePet(Long userId) {
+        Pet active = getOne(new LambdaQueryWrapper<Pet>()
+                .eq(Pet::getUserId, userId)
+                .eq(Pet::getActive, 1)
+                .last("limit 1"));
+        if (active != null) {
+            return active;
+        }
         return getOne(new LambdaQueryWrapper<Pet>()
                 .eq(Pet::getUserId, userId)
+                .orderByAsc(Pet::getCreateTime)
                 .last("limit 1"));
     }
 
-    /** DO 转 VO，补充升级所需经验 */
+    /** DO 转 VO，补充升级所需经验与出场标记 */
     private PetVO toVO(Pet pet) {
         PetVO vo = new PetVO();
         BeanUtils.copyProperties(pet, vo);
+        vo.setActive(pet.getActive() != null && pet.getActive() == 1);
         if (pet.getLevel() == null || pet.getLevel() >= PetLevelCalculator.MAX_LEVEL) {
             vo.setNextLevelExp(0L);
         } else {
