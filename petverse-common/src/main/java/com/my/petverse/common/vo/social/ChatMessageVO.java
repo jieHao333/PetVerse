@@ -22,8 +22,14 @@ public class ChatMessageVO implements Serializable {
     /** 接收者用户ID */
     private Long receiverId;
 
-    /** 消息内容 */
+    /** 消息内容：文本消息存文本，图片/文件消息存 OSS 地址 */
     private String content;
+
+    /** 消息类型 0-文本 1-图片 2-文件 */
+    private Integer msgType;
+
+    /** 文件原始名称（图片/文件消息时记录） */
+    private String fileName;
 
     /** 发送时间 */
     private LocalDateTime createTime;

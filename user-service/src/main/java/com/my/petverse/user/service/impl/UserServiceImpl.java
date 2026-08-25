@@ -52,6 +52,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     private static final DateTimeFormatter AVATAR_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
+    /** OSS存储路径中的日期目录格式 */
+    private static final DateTimeFormatter MEDIA_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+
     @Override
     public LoginVO register(UserRegisterDTO dto) {
         // 校验用户名唯一
@@ -134,9 +137,24 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         return updateById(user);
     }
 
+    /** 提取小写扩展名，无扩展名返回空串 */
+    private String getExtension(String filename) {
+        if (!StringUtils.hasText(filename)) {
+            return "";
+        }
+        int dotIndex = filename.lastIndexOf('.');
+        if (dotIndex < 0 || dotIndex == filename.length() - 1) {
+            return "";
+        }
+        return filename.substring(dotIndex + 1).toLowerCase();
+    }
+
     /** 上传头像：校验图片 -> 存入 OSS -> 更新用户头像地址 */
     @Override
     public UserVO uploadAvatar(Long userId, MultipartFile file) {
+
+        String extension = getExtension(file.getOriginalFilename());
+
         if (file == null || file.isEmpty()) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "请选择要上传的图片");
         }
@@ -152,8 +170,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
         }
         // 按日期分目录 + UUID 文件名，避免重名覆盖
-        String objectKey = "avatar/" + LocalDate.now().format(AVATAR_DATE_FORMAT) + "/"
-                + UUID.randomUUID().toString().replace("-", "") + getSuffix(file.getOriginalFilename());
+//        String objectKey = "avatar/" + LocalDate.now().format(AVATAR_DATE_FORMAT) + "/"
+//                + UUID.randomUUID().toString().replace("-", "") + getSuffix(file.getOriginalFilename());
+        String objectKey = "avatar/" + LocalDate.now().format(MEDIA_DATE_FORMAT) + "/"
+                + UUID.randomUUID().toString().replace("-", "") + "." + extension;
         user.setAvatar(ossService.upload(objectKey, file));
         updateById(user);
         return toVO(user);

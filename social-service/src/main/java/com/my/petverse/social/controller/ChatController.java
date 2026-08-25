@@ -2,11 +2,13 @@ package com.my.petverse.social.controller;
 
 import com.my.petverse.common.dto.social.ChatMessageSendDTO;
 import com.my.petverse.common.result.Result;
+import com.my.petverse.common.vo.social.ChatFileUploadVO;
 import com.my.petverse.common.vo.social.ChatMessageVO;
 import com.my.petverse.social.service.ChatService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
@@ -33,5 +35,11 @@ public class ChatController {
     public Result<List<ChatMessageVO>> messages(@RequestHeader("X-User-Id") Long userId,
                                                 @RequestParam("friendUserId") Long friendUserId) {
         return Result.success(chatService.listMessages(userId, friendUserId));
+    }
+
+    /** 上传聊天文件（图片/文档/压缩包等，上限 20MB），返回 OSS 地址与消息类型 */
+    @PostMapping("/file")
+    public Result<ChatFileUploadVO> uploadFile(@RequestParam("file") MultipartFile file) {
+        return Result.success(chatService.uploadChatFile(file));
     }
 }

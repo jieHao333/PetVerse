@@ -44,6 +44,12 @@ public class SpaceVO implements Serializable {
     /** 可见性：0-公开 1-仅好友 2-仅自己 */
     private Integer visibility;
 
+    /** 点赞数（聚合自点赞服务，服务不可用时降级为0） */
+    private Long likeCount;
+
+    /** 当前用户是否已点赞（聚合自点赞服务） */
+    private Boolean liked;
+
     /** 媒体列表，按排序字段升序 */
     private List<SpaceMediaItemVO> mediaList;
 

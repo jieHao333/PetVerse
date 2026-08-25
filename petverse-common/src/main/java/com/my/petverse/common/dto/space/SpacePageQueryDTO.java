@@ -35,4 +35,7 @@ public class SpacePageQueryDTO extends BasePageQuery {
     /** 发布时间止（含），格式 yyyy-MM-dd HH:mm:ss */
     @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime endTime;
+
+    /** 排序方式：latest-最新(默认) / hot-按点赞数热度 */
+    private String sort;
 }

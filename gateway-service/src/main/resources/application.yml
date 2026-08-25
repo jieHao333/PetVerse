@@ -37,6 +37,12 @@ spring:
             - Path=/api/social/**
           filters:
             - StripPrefix=1
+        - id: remark-service
+          uri: lb://remark-service
+          predicates:
+            - Path=/api/remark/**
+          filters:
+            - StripPrefix=1
 
 auth:
   # 免鉴权路径白名单，逗号分隔，支持前缀匹配

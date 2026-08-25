@@ -30,4 +30,7 @@ public class Space extends BaseEntity {
 
     /** 可见性：0-公开 1-仅好友 2-仅自己 */
     private Integer visibility;
+
+    /** 点赞数（由点赞服务定时同步，用于热度排序） */
+    private Integer likeCount;
 }

@@ -10,6 +10,7 @@ import com.my.petverse.common.dto.space.SpaceSaveDTO;
 import com.my.petverse.common.dto.space.SpaceUpdateDTO;
 import com.my.petverse.common.entity.space.Space;
 import com.my.petverse.common.entity.space.SpaceMedia;
+import com.my.petverse.common.enums.LikeTargetType;
 import com.my.petverse.common.enums.PetExpSource;
 import com.my.petverse.common.enums.SpaceVisibility;
 import com.my.petverse.common.exception.BusinessException;
@@ -18,12 +19,14 @@ import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.pet.PetExpGainVO;
+import com.my.petverse.common.vo.remark.LikeBatchVO;
 import com.my.petverse.common.vo.space.SpaceCreateVO;
 import com.my.petverse.common.vo.space.SpaceMediaItemVO;
 import com.my.petverse.common.vo.space.SpaceMediaUploadVO;
 import com.my.petverse.common.vo.space.SpaceVO;
 import com.my.petverse.common.vo.user.UserVO;
 import com.my.petverse.space.feign.PetFeignClient;
+import com.my.petverse.space.feign.RemarkFeignClient;
 import com.my.petverse.space.feign.SocialFeignClient;
 import com.my.petverse.space.feign.UserFeignClient;
 import com.my.petverse.space.mapper.SpaceMapper;
@@ -60,6 +63,8 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     private final SocialFeignClient socialFeignClient;
 
     private final UserFeignClient userFeignClient;
+
+    private final RemarkFeignClient remarkFeignClient;
 
     private final SpaceMediaMapper spaceMediaMapper;
 
@@ -106,6 +111,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         SpaceVO vo = toVO(space);
         fillAuthor(List.of(vo));
         fillMedia(List.of(vo));
+        fillLikeInfo(List.of(vo), callerId);
         return vo;
     }
 
@@ -117,6 +123,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         List<SpaceVO> vos = list(wrapper).stream().map(this::toVO).collect(Collectors.toList());
         fillAuthor(vos);
         fillMedia(vos);
+        fillLikeInfo(vos, callerId);
         return vos;
     }
 
@@ -129,13 +136,19 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
                 .eq(query.getPetId() != null, Space::getPetId, query.getPetId())
                 .eq(query.getUserId() != null, Space::getUserId, query.getUserId())
                 .ge(query.getStartTime() != null, Space::getCreateTime, query.getStartTime())
-                .le(query.getEndTime() != null, Space::getCreateTime, query.getEndTime())
-                .orderByDesc(Space::getCreateTime);
+                .le(query.getEndTime() != null, Space::getCreateTime, query.getEndTime());
+        // 热度排序按点赞数倒序，相同则按发布时间兜底；默认按最新排序
+        if ("hot".equalsIgnoreCase(query.getSort())) {
+            wrapper.orderByDesc(Space::getLikeCount).orderByDesc(Space::getCreateTime);
+        } else {
+            wrapper.orderByDesc(Space::getCreateTime);
+        }
         applyVisibility(wrapper, callerId);
         Page<Space> page = page(new Page<>(query.getPageNum(), query.getPageSize()), wrapper);
         List<SpaceVO> records = page.getRecords().stream().map(this::toVO).collect(Collectors.toList());
         fillAuthor(records);
         fillMedia(records);
+        fillLikeInfo(records, callerId);
         return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), records);
     }
 
@@ -240,6 +253,33 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         }
         for (SpaceVO vo : vos) {
             vo.setMediaList(mediaMap.getOrDefault(vo.getId(), List.of()));
+        }
+    }
+
+    /** 批量填充点赞数与当前用户点赞状态，调用点赞服务；失败时降级为 0/未点赞，不阻断列表 */
+    private void fillLikeInfo(List<SpaceVO> vos, Long callerId) {
+        if (vos.isEmpty()) {
+            return;
+        }
+        try {
+            String ids = vos.stream().map(SpaceVO::getId).map(String::valueOf)
+                    .collect(Collectors.joining(","));
+            Result<LikeBatchVO> result = remarkFeignClient.likeBatch(
+                    LikeTargetType.SPACE.getCode(), ids, callerId);
+            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
+                LikeBatchVO batch = result.getData();
+                for (SpaceVO vo : vos) {
+                    vo.setLikeCount(batch.getCounts().getOrDefault(vo.getId(), 0L));
+                    vo.setLiked(batch.getLikedIds().contains(vo.getId()));
+                }
+                return;
+            }
+        } catch (Exception e) {
+            log.warn("调用点赞服务获取点赞信息失败", e);
+        }
+        for (SpaceVO vo : vos) {
+            vo.setLikeCount(0L);
+            vo.setLiked(false);
         }
     }
 

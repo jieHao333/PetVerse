@@ -2,6 +2,10 @@
 -- 使用方式：先创建数据库，再执行本脚本
 -- CREATE DATABASE IF NOT EXISTS petverse_social DEFAULT CHARSET utf8mb4;
 
+-- 【存量库迁移】已存在 chat_message 表的环境，执行以下 SQL 支持文件消息：
+-- ALTER TABLE chat_message ADD COLUMN msg_type TINYINT DEFAULT 0 COMMENT '消息类型 0-文本 1-图片 2-文件' AFTER content;
+-- ALTER TABLE chat_message ADD COLUMN file_name VARCHAR(255) DEFAULT NULL COMMENT '文件原始名称' AFTER msg_type;
+
 CREATE TABLE IF NOT EXISTS friend_request
 (
     id           BIGINT   NOT NULL COMMENT '主键(雪花ID)',
@@ -36,7 +40,9 @@ CREATE TABLE IF NOT EXISTS chat_message
     id          BIGINT        NOT NULL COMMENT '主键(雪花ID)',
     sender_id   BIGINT        NOT NULL COMMENT '发送者用户ID',
     receiver_id BIGINT        NOT NULL COMMENT '接收者用户ID',
-    content     VARCHAR(500)  NOT NULL COMMENT '消息内容',
+    content     VARCHAR(500)  NOT NULL COMMENT '消息内容：文本存文本，图片/文件存OSS地址',
+    msg_type    TINYINT       DEFAULT 0 COMMENT '消息类型 0-文本 1-图片 2-文件',
+    file_name   VARCHAR(255)  DEFAULT NULL COMMENT '文件原始名称',
     create_time DATETIME      DEFAULT NULL COMMENT '创建时间',
     update_time DATETIME      DEFAULT NULL COMMENT '更新时间',
     deleted     TINYINT       DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',

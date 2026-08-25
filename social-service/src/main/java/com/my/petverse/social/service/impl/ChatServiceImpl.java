@@ -5,7 +5,9 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.my.petverse.common.dto.social.ChatMessageSendDTO;
 import com.my.petverse.common.entity.social.ChatMessage;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.oss.OssService;
 import com.my.petverse.common.result.ResultCode;
+import com.my.petverse.common.vo.social.ChatFileUploadVO;
 import com.my.petverse.common.vo.social.ChatMessageVO;
 import com.my.petverse.social.mapper.ChatMessageMapper;
 import com.my.petverse.social.service.ChatService;
@@ -13,9 +15,16 @@ import com.my.petverse.social.service.FriendService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -28,7 +37,20 @@ public class ChatServiceImpl extends ServiceImpl<ChatMessageMapper, ChatMessage>
     /** 单次返回的最大消息条数 */
     private static final int MAX_MESSAGE_COUNT = 200;
 
+    /** 消息类型：文本 / 图片 / 文件 */
+    private static final int MSG_TEXT = 0;
+    private static final int MSG_IMAGE = 1;
+    private static final int MSG_FILE = 2;
+
+    /** 图片类扩展名：命中则按图片消息内联展示，其余一律按文件消息 */
+    private static final Set<String> IMAGE_EXTENSIONS = Set.of("jpg", "jpeg", "png", "webp", "gif");
+
+    /** 单个聊天文件上限 20MB */
+    private static final long MAX_FILE_SIZE = 20L * 1024 * 1024;
+
     private final FriendService friendService;
+
+    private final OssService ossService;
 
     /** 发送消息，仅好友之间可发送 */
     @Override
@@ -43,6 +65,10 @@ public class ChatServiceImpl extends ServiceImpl<ChatMessageMapper, ChatMessage>
         message.setSenderId(senderId);
         message.setReceiverId(dto.getReceiverId());
         message.setContent(dto.getContent().trim());
+        // 不传消息类型时默认文本，兼容存量前端调用；文件名仅图片/文件消息记录
+        int msgType = dto.getMsgType() == null ? MSG_TEXT : dto.getMsgType();
+        message.setMsgType(msgType);
+        message.setFileName(msgType == MSG_TEXT ? null : dto.getFileName());
         save(message);
         return toVO(message);
     }
@@ -64,6 +90,39 @@ public class ChatServiceImpl extends ServiceImpl<ChatMessageMapper, ChatMessage>
                 .last("limit " + MAX_MESSAGE_COUNT));
         Collections.reverse(messages);
         return messages.stream().map(this::toVO).collect(Collectors.toList());
+    }
+
+    /** 上传聊天文件至 OSS：图片(jpg/jpeg/png/webp/gif)按图片消息处理，其余格式统一按文件消息，上限 20MB */
+    @Override
+    public ChatFileUploadVO uploadChatFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "上传文件不能为空");
+        }
+        if (file.getSize() > MAX_FILE_SIZE) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "文件大小不能超过20MB");
+        }
+        String extension = getExtension(file.getOriginalFilename());
+        int msgType = IMAGE_EXTENSIONS.contains(extension) ? MSG_IMAGE : MSG_FILE;
+        String objectKey = "chat/" + LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE)
+                + "/" + UUID.randomUUID() + "." + extension;
+        String url = ossService.upload(objectKey, file);
+        ChatFileUploadVO vo = new ChatFileUploadVO();
+        vo.setUrl(url);
+        vo.setMsgType(msgType);
+        vo.setFileName(file.getOriginalFilename());
+        return vo;
+    }
+
+    /** 取文件扩展名（小写），无扩展名时用 bin 兑底避免生成非法 objectKey */
+    private String getExtension(String filename) {
+        if (!StringUtils.hasText(filename)) {
+            return "bin";
+        }
+        int index = filename.lastIndexOf('.');
+        if (index < 0 || index == filename.length() - 1) {
+            return "bin";
+        }
+        return filename.substring(index + 1).toLowerCase(Locale.ROOT);
     }
 
     /** DO 转 VO */

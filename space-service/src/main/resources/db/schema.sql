@@ -8,6 +8,10 @@
 --
 -- 二、全新环境初始化：先创建数据库，再执行本脚本全部建表语句
 -- CREATE DATABASE IF NOT EXISTS petverse_space DEFAULT CHARSET utf8mb4;
+--
+-- 三、已有环境升级（点赞功能）：为 space 表补充点赞数冗余列，由点赞服务定时同步，用于热度排序：
+-- ALTER TABLE petverse_space.space ADD COLUMN like_count INT NOT NULL DEFAULT 0 COMMENT '点赞数(由remark-service定时同步，用于热度排序)';
+-- ALTER TABLE petverse_space.space ADD KEY idx_like_count (like_count);
 
 CREATE TABLE IF NOT EXISTS `space`
 (
@@ -18,13 +22,15 @@ CREATE TABLE IF NOT EXISTS `space`
     pet_id      BIGINT       DEFAULT NULL COMMENT '关联的宠物ID，可为空',
     user_id     BIGINT   NOT NULL COMMENT '所属用户ID',
     visibility  TINYINT  NOT NULL DEFAULT 0 COMMENT '可见性 0-公开 1-仅好友 2-仅自己',
+    like_count  INT      NOT NULL DEFAULT 0 COMMENT '点赞数(由remark-service定时同步，用于热度排序)',
     create_time DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted     TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
     PRIMARY KEY (id),
     KEY idx_user_id (user_id),
     KEY idx_pet_id (pet_id),
-    KEY idx_create_time (create_time)
+    KEY idx_create_time (create_time),
+    KEY idx_like_count (like_count)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='宠域空间动态';
 

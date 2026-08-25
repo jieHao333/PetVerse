@@ -9,6 +9,12 @@ spring:
     username: root
     password: 123456
     driver-class-name: com.mysql.cj.jdbc.Driver
+  servlet:
+    multipart:
+      # 单个聊天文件上限（20MB + 冗余）
+      max-file-size: 21MB
+      # 单次请求总上限（上传接口单文件，略大于文件上限即可）
+      max-request-size: 22MB
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
@@ -23,3 +29,11 @@ mybatis-plus:
 
 jwt:
   secret: petverse-jwt-secret-key-please-change-in-production-2026
+
+# 阿里云 OSS 存储配置（与其他服务共用同一个桶）
+aliyun:
+  oss:
+    endpoint: oss-cn-beijing.aliyuncs.com
+    access-key-id: LTAI5t7e17sduSC8q6dDJmvP
+    access-key-secret: dohM2Q5abNDOtAzSrqm0zig4WZwDY1
+    bucket-name: petverse-me

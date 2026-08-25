@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: remark-service
+  cloud:
+    nacos:
+      server-addr: localhost:8848
+      discovery:
+        enabled: true
+      config:
+        enabled: true
+        file-extension: yml
