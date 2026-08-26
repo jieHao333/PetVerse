@@ -43,6 +43,15 @@ spring:
             - Path=/api/remark/**
           filters:
             - StripPrefix=1
+        - id: ai-service
+          uri: lb://ai-service
+          predicates:
+            - Path=/api/ai/**
+          filters:
+            - StripPrefix=1
+          metadata:
+            response-timeout: 120000
+            connect-timeout: 3000
 
 auth:
   # 免鉴权路径白名单，逗号分隔，支持前缀匹配
