@@ -8,6 +8,7 @@ import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.space.feign.RemarkFeignClient;
 import com.my.petverse.space.mapper.SpaceMapper;
+import com.my.petverse.space.search.SpaceSearchService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -30,6 +31,8 @@ public class LikeCountSyncTask {
 
     private final RemarkFeignClient remarkFeignClient;
 
+    private final SpaceSearchService spaceSearchService;
+
     /** 单轮拉取的动态数量上限 */
     private static final int SYNC_LIMIT = 1000;
 
@@ -37,13 +40,11 @@ public class LikeCountSyncTask {
     @Scheduled(fixedDelay = 60_000, initialDelay = 10_000)
     public void syncLikeCounts() {
         try {
-            List<Long> ids = spaceMapper.selectList(new LambdaQueryWrapper<Space>()
-                            .select(Space::getId)
-                            .orderByDesc(Space::getCreateTime)
-                            .last("LIMIT " + SYNC_LIMIT))
-                    .stream()
-                    .map(Space::getId)
-                    .collect(Collectors.toList());
+            List<Space> spaces = spaceMapper.selectList(new LambdaQueryWrapper<Space>()
+                    .select(Space::getId, Space::getLikeCount)
+                    .orderByDesc(Space::getCreateTime)
+                    .last("LIMIT " + SYNC_LIMIT));
+            List<Long> ids = spaces.stream().map(Space::getId).collect(Collectors.toList());
             if (ids.isEmpty()) {
                 return;
             }
@@ -53,11 +54,16 @@ public class LikeCountSyncTask {
                 return;
             }
             Map<Long, Long> counts = result.getData();
-            for (Long id : ids) {
-                long count = counts.getOrDefault(id, 0L);
+            for (Space space : spaces) {
+                int count = counts.getOrDefault(space.getId(), 0L).intValue();
+                // 点赞数未变时跳过，避免每轮无谓刷库与刷索引
+                if (space.getLikeCount() != null && space.getLikeCount() == count) {
+                    continue;
+                }
                 spaceMapper.update(null, new LambdaUpdateWrapper<Space>()
-                        .eq(Space::getId, id)
-                        .set(Space::getLikeCount, (int) count));
+                        .eq(Space::getId, space.getId())
+                        .set(Space::getLikeCount, count));
+                spaceSearchService.updateLikeCount(space.getId(), count);
             }
         } catch (Exception e) {
             log.warn("同步点赞数到 space.like_count 失败，下一轮重试", e);

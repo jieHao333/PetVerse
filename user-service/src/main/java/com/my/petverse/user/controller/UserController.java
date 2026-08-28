@@ -70,4 +70,11 @@ public class UserController {
                                        @RequestParam("file") MultipartFile file) {
         return Result.success(userService.uploadAvatar(userId, file));
     }
+
+    /** 升级用户角色（内部接口，仅供 Feign 调用，网关已拦截外部 /internal 请求） */
+    @PutMapping("/internal/role")
+    public Result<Boolean> upgradeRole(@RequestParam("userId") Long userId,
+                                       @RequestParam("role") String role) {
+        return Result.success(userService.upgradeRole(userId, role));
+    }
 }

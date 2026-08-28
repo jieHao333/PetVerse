@@ -15,6 +15,16 @@ spring:
       max-file-size: 55MB
       # 单次请求总上限（上传接口单文件，略大于文件上限即可）
       max-request-size: 60MB
+  # Elasticsearch 8.15.5，用于动态全文检索；未启动时搜索自动降级为数据库模糊查询
+  elasticsearch:
+    uris: http://localhost:9200
+    connection-timeout: 2s
+    socket-timeout: 5s
+
+# 搜索开关，置为 false 则全部走数据库模糊查询
+petverse:
+  search:
+    enabled: true
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml

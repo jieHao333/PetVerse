@@ -28,6 +28,9 @@ public class UserVO implements Serializable {
     /** 账号状态：1-正常 0-禁用 */
     private Integer status;
 
+    /** 角色：USER-普通用户 MERCHANT-商家 ADMIN-管理员 */
+    private String role;
+
     /** 创建时间 */
     private LocalDateTime createTime;
 }

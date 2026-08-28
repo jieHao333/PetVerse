@@ -30,6 +30,9 @@ public class User extends BaseEntity {
     /** 账号状态：1-正常 0-禁用 */
     private Integer status;
 
+    /** 角色：USER-普通用户 MERCHANT-商家 ADMIN-管理员 */
+    private String role;
+
     /** 最近登录时间 */
     private LocalDateTime lastLoginTime;
 }

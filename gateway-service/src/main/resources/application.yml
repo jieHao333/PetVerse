@@ -43,6 +43,12 @@ spring:
             - Path=/api/remark/**
           filters:
             - StripPrefix=1
+        - id: shop-service
+          uri: lb://shop-service
+          predicates:
+            - Path=/api/shop/**
+          filters:
+            - StripPrefix=1
         - id: ai-service
           uri: lb://ai-service
           predicates:

@@ -65,4 +65,13 @@ public interface UserService extends IService<User> {
      * @return 更新后的用户信息
      */
     UserVO uploadAvatar(Long userId, MultipartFile file);
+
+    /**
+     * 升级用户角色（内部接口，供 shop-service 商家入驻审批通过后调用）
+     *
+     * @param userId 用户ID
+     * @param role   目标角色（仅允许 USER/MERCHANT，禁止升级为 ADMIN）
+     * @return 是否成功
+     */
+    boolean upgradeRole(Long userId, String role);
 }

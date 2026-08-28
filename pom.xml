@@ -19,6 +19,7 @@
         <module>user-service</module>
         <module>social-service</module>
         <module>remark-service</module>
+        <module>shop-service</module>
         <module>gateway-service</module>
     </modules>
 

@@ -16,7 +16,10 @@ public class SpacePageQueryDTO extends BasePageQuery {
 
     private static final long serialVersionUID = 1L;
 
-    /** 动态标题（模糊匹配） */
+    /** 搜索关键词，走 Elasticsearch 全文检索标题与正文；ES 不可用时降级为数据库模糊匹配 */
+    private String keyword;
+
+    /** 动态标题（模糊匹配），keyword 为空时生效，保留以兼容旧调用 */
     private String title;
 
     /** 动态分类（精确匹配） */

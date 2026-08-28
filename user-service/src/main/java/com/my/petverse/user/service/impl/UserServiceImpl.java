@@ -6,6 +6,7 @@ import com.my.petverse.common.dto.user.UserLoginDTO;
 import com.my.petverse.common.dto.user.UserRegisterDTO;
 import com.my.petverse.common.dto.user.UserUpdateDTO;
 import com.my.petverse.common.entity.user.User;
+import com.my.petverse.common.enums.UserRole;
 import com.my.petverse.common.exception.BusinessException;
 import com.my.petverse.common.oss.OssService;
 import com.my.petverse.common.result.ResultCode;
@@ -70,6 +71,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         user.setPassword(passwordEncoder.encode(dto.getPassword()));
         user.setNickname(nickname);
         user.setStatus(1);
+        user.setRole(UserRole.USER.name());
         save(user);
         return buildLoginResult(user);
     }
@@ -191,12 +193,30 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         return filename.substring(index).toLowerCase();
     }
 
+    /** 升级用户角色（内部接口，供 shop-service 商家入驻审批通过后调用） */
+    @Override
+    public boolean upgradeRole(Long userId, String role) {
+        User user = getById(userId);
+        if (user == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "用户不存在");
+        }
+        // 仅允许升级为合法角色，且禁止通过此接口提升为管理员
+        UserRole target = UserRole.of(role);
+        if (target == UserRole.ADMIN) {
+            throw new BusinessException(ResultCode.FORBIDDEN, "不允许升级为管理员");
+        }
+        user.setRole(target.name());
+        return updateById(user);
+    }
+
     /**
      * 组装登录结果：生成令牌 + 用户信息
      */
     private LoginVO buildLoginResult(User user) {
         LoginVO vo = new LoginVO();
-        vo.setToken(jwtUtil.createToken(user.getId(), user.getUsername()));
+        // 存量用户 role 可能为空，缺省按普通用户签发
+        String role = StringUtils.hasText(user.getRole()) ? user.getRole() : UserRole.USER.name();
+        vo.setToken(jwtUtil.createToken(user.getId(), user.getUsername(), role));
         vo.setUser(toVO(user));
         return vo;
     }

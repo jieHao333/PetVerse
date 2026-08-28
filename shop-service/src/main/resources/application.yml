@@ -1,0 +1,48 @@
+server:
+  port: 8087
+
+spring:
+  application:
+    name: shop-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/petverse_shop?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  servlet:
+    multipart:
+      # 单个图片文件上限（营业执照/商品主图 5MB + 余量）
+      max-file-size: 6MB
+      max-request-size: 10MB
+  # Elasticsearch 8.15.5，用于商品全文检索；未启动时搜索自动降级为数据库模糊查询
+  elasticsearch:
+    uris: http://localhost:9200
+    connection-timeout: 2s
+    socket-timeout: 5s
+
+# 搜索开关，置为 false 则全部走数据库模糊查询
+petverse:
+  search:
+    enabled: true
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+jwt:
+  secret: petverse-jwt-secret-key-please-change-in-production-2026
+
+# 阿里云 OSS 存储配置（与 user-service/space-service 共用同一个桶）
+aliyun:
+  oss:
+    endpoint: oss-cn-beijing.aliyuncs.com
+    access-key-id: LTAI5t7e17sduSC8q6dDJmvP
+    access-key-secret: dohM2Q5abNDOtAzSrqm0zig4WZwDY1
+    bucket-name: petverse-me

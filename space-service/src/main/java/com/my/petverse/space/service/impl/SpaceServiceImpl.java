@@ -31,6 +31,7 @@ import com.my.petverse.space.feign.SocialFeignClient;
 import com.my.petverse.space.feign.UserFeignClient;
 import com.my.petverse.space.mapper.SpaceMapper;
 import com.my.petverse.space.mapper.SpaceMediaMapper;
+import com.my.petverse.space.search.SpaceSearchService;
 import com.my.petverse.space.service.SpaceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -46,8 +47,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -67,6 +70,8 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     private final RemarkFeignClient remarkFeignClient;
 
     private final SpaceMediaMapper spaceMediaMapper;
+
+    private final SpaceSearchService spaceSearchService;
 
     private final OssService ossService;
 
@@ -127,16 +132,27 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         return vos;
     }
 
-    /** 分页查询当前用户可见的动态 */
+    /** 分页查询当前用户可见的动态：关键词搜索优先走 Elasticsearch，不可用时降级为数据库模糊查询 */
     @Override
     public PageResult<SpaceVO> pageSpaces(SpacePageQueryDTO query, Long callerId) {
+        // keyword 为新的全文检索入口，title 保留兼容旧调用
+        String keyword = StringUtils.hasText(query.getKeyword()) ? query.getKeyword() : query.getTitle();
+        if (StringUtils.hasText(keyword)) {
+            PageResult<SpaceVO> searched = pageSpacesByKeyword(query, keyword, callerId);
+            if (searched != null) {
+                return searched;
+            }
+        }
         LambdaQueryWrapper<Space> wrapper = new LambdaQueryWrapper<Space>()
-                .like(StringUtils.hasText(query.getTitle()), Space::getTitle, query.getTitle())
                 .eq(StringUtils.hasText(query.getCategory()), Space::getCategory, query.getCategory())
                 .eq(query.getPetId() != null, Space::getPetId, query.getPetId())
                 .eq(query.getUserId() != null, Space::getUserId, query.getUserId())
                 .ge(query.getStartTime() != null, Space::getCreateTime, query.getStartTime())
                 .le(query.getEndTime() != null, Space::getCreateTime, query.getEndTime());
+        // 降级路径同时匹配标题与正文，尽量贴近全文检索的召回范围
+        if (StringUtils.hasText(keyword)) {
+            wrapper.and(w -> w.like(Space::getTitle, keyword).or().like(Space::getContent, keyword));
+        }
         // 热度排序按点赞数倒序，相同则按发布时间兜底；默认按最新排序
         if ("hot".equalsIgnoreCase(query.getSort())) {
             wrapper.orderByDesc(Space::getLikeCount).orderByDesc(Space::getCreateTime);
@@ -150,6 +166,37 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         fillMedia(records);
         fillLikeInfo(records, callerId);
         return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), records);
+    }
+
+    /**
+     * 走 Elasticsearch 检索关键词：ES 只返回按相关度排序的动态ID，
+     * 再以 MySQL 为准回表并复用原有聚合逻辑；检索不可用时返回 null 交由调用方降级。
+     */
+    private PageResult<SpaceVO> pageSpacesByKeyword(SpacePageQueryDTO query, String keyword, Long callerId) {
+        if (!spaceSearchService.isAvailable()) {
+            return null;
+        }
+        List<Long> friendIds = listFriendIdsQuietly(callerId);
+        PageResult<Long> idPage = spaceSearchService.searchIds(query, keyword, friendIds, callerId);
+        if (idPage == null) {
+            return null;
+        }
+        List<Long> ids = idPage.getRecords();
+        if (ids.isEmpty()) {
+            return PageResult.of(idPage.getTotal(), query.getPageNum(), query.getPageSize(), List.of());
+        }
+        Map<Long, Space> spaceMap = listByIds(ids).stream()
+                .collect(Collectors.toMap(Space::getId, Function.identity()));
+        // 按 ES 返回的顺序组装，保证相关度排序不被回表打乱
+        List<SpaceVO> records = ids.stream()
+                .map(spaceMap::get)
+                .filter(Objects::nonNull)
+                .map(this::toVO)
+                .collect(Collectors.toList());
+        fillAuthor(records);
+        fillMedia(records);
+        fillLikeInfo(records, callerId);
+        return PageResult.of(idPage.getTotal(), query.getPageNum(), query.getPageSize(), records);
     }
 
     /**
@@ -294,6 +341,8 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         space.setVisibility(visibility == null ? SpaceVisibility.PUBLIC.getCode() : visibility);
         save(space);
         saveMediaList(space.getId(), dto.getMediaList());
+        // 双写检索索引，失败仅记日志，不影响动态发布
+        spaceSearchService.indexSpace(space);
 
         // 发布动态奖励宠物经验，经验发放失败仅记录日志，不影响动态保存
         PetExpGainVO petExp = null;
@@ -337,6 +386,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
                     .eq(SpaceMedia::getSpaceId, dto.getId()));
             saveMediaList(dto.getId(), dto.getMediaList());
         }
+        spaceSearchService.indexSpace(space);
         return updated;
     }
 
@@ -346,7 +396,9 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     public boolean deleteSpace(Long id) {
         spaceMediaMapper.delete(new LambdaQueryWrapper<SpaceMedia>()
                 .eq(SpaceMedia::getSpaceId, id));
-        return removeById(id);
+        boolean removed = removeById(id);
+        spaceSearchService.removeSpace(id);
+        return removed;
     }
 
     /** 批量保存媒体条目，按提交顺序写入排序字段 */
