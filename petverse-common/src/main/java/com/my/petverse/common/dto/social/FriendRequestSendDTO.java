@@ -6,7 +6,7 @@ import lombok.Data;
 import java.io.Serializable;
 
 /**
- * 发起好友申请请求参数（发起人ID由网关注入的 X-User-Id 请求头提供）
+ * 发起好友申请请求参数（发起人ID由服务端从登录令牌解析，经 UserContext 提供）
  */
 @Data
 public class FriendRequestSendDTO implements Serializable {

@@ -1,6 +1,5 @@
 package com.my.petverse.common.dto.pet;
 
-import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
 import java.io.Serializable;
@@ -13,7 +12,6 @@ public class PetSignInDTO implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** 用户ID */
-    @NotNull(message = "用户ID不能为空")
+    /** 用户ID，由服务端从登录令牌解析写入，客户端无需传入 */
     private Long userId;
 }

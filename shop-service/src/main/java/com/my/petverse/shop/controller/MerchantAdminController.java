@@ -1,5 +1,6 @@
 package com.my.petverse.shop.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.shop.MerchantApplyAuditDTO;
 import com.my.petverse.common.dto.shop.MerchantApplyPageQueryDTO;
 import com.my.petverse.common.result.PageResult;
@@ -28,9 +29,8 @@ public class MerchantAdminController {
 
     /** 审批入驻申请：通过则创建店铺并升级用户角色，驳回需填写原因 */
     @PostMapping("/apply/audit")
-    public Result<Void> audit(@RequestHeader("X-User-Id") Long adminId,
-                              @RequestBody @Valid MerchantApplyAuditDTO dto) {
-        merchantApplyService.audit(adminId, dto);
+    public Result<Void> audit(@RequestBody @Valid MerchantApplyAuditDTO dto) {
+        merchantApplyService.audit(UserContext.getUserId(), dto);
         return Result.success();
     }
 }

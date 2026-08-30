@@ -1,5 +1,6 @@
 package com.my.petverse.social.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.social.ChatMessageSendDTO;
 import com.my.petverse.common.result.Result;
 import com.my.petverse.common.vo.social.ChatFileUploadVO;
@@ -13,7 +14,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.List;
 
 /**
- * 聊天接口控制器（当前用户ID由网关注入的 X-User-Id 请求头提供）
+ * 聊天接口控制器（当前用户ID由登录令牌解析写入的 UserContext 提供）
  * 路径以 /social 开头，与网关 /api/social/** 路由剥离 /api 后的路径对应
  */
 @RestController
@@ -25,16 +26,14 @@ public class ChatController {
 
     /** 发送消息 */
     @PostMapping("/message")
-    public Result<ChatMessageVO> sendMessage(@RequestHeader("X-User-Id") Long userId,
-                                             @RequestBody @Valid ChatMessageSendDTO dto) {
-        return Result.success(chatService.sendMessage(userId, dto));
+    public Result<ChatMessageVO> sendMessage(@RequestBody @Valid ChatMessageSendDTO dto) {
+        return Result.success(chatService.sendMessage(UserContext.getUserId(), dto));
     }
 
     /** 查询与某好友的最近聊天记录 */
     @GetMapping("/messages")
-    public Result<List<ChatMessageVO>> messages(@RequestHeader("X-User-Id") Long userId,
-                                                @RequestParam("friendUserId") Long friendUserId) {
-        return Result.success(chatService.listMessages(userId, friendUserId));
+    public Result<List<ChatMessageVO>> messages(@RequestParam("friendUserId") Long friendUserId) {
+        return Result.success(chatService.listMessages(UserContext.getUserId(), friendUserId));
     }
 
     /** 上传聊天文件（图片/文档/压缩包等，上限 20MB），返回 OSS 地址与消息类型 */

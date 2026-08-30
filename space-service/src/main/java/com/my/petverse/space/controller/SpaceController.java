@@ -1,5 +1,6 @@
 package com.my.petverse.space.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.space.SpacePageQueryDTO;
 import com.my.petverse.common.dto.space.SpaceSaveDTO;
 import com.my.petverse.common.dto.space.SpaceUpdateDTO;
@@ -30,43 +31,40 @@ public class SpaceController {
 
     /** 根据ID查询动态，按当前用户可见性过滤，无权查看时视为不存在 */
     @GetMapping("/{id}")
-    public Result<SpaceVO> getById(@PathVariable("id") Long id,
-                                   @RequestHeader("X-User-Id") Long userId) {
-        return Result.success(spaceService.getVisibleSpace(id, userId));
+    public Result<SpaceVO> getById(@PathVariable("id") Long id) {
+        return Result.success(spaceService.getVisibleSpace(id, UserContext.getUserId()));
     }
 
     /** 查询当前用户可见的动态列表 */
     @GetMapping("/list")
-    public Result<List<SpaceVO>> list(@RequestHeader("X-User-Id") Long userId) {
-        return Result.success(spaceService.listSpaces(userId));
+    public Result<List<SpaceVO>> list() {
+        return Result.success(spaceService.listSpaces(UserContext.getUserId()));
     }
 
     /** 分页查询当前用户可见的动态 */
     @GetMapping("/page")
-    public Result<PageResult<SpaceVO>> page(SpacePageQueryDTO query,
-                                            @RequestHeader("X-User-Id") Long userId) {
-        return Result.success(spaceService.pageSpaces(query, userId));
+    public Result<PageResult<SpaceVO>> page(SpacePageQueryDTO query) {
+        return Result.success(spaceService.pageSpaces(query, UserContext.getUserId()));
     }
 
-    /** 发布动态，同时为宠物发放经验奖励 */
+    /** 发布动态，同时为宠物发放经验奖励（作者ID取自登录令牌，不接受客户端传入） */
     @PostMapping
     public Result<SpaceCreateVO> save(@RequestBody @Valid SpaceSaveDTO dto) {
+        dto.setUserId(UserContext.getUserId());
         return Result.success(spaceService.saveSpace(dto));
     }
 
     /** 修改动态，仅作者本人可操作 */
     @PutMapping
-    public Result<Boolean> update(@RequestHeader("X-User-Id") Long userId,
-                                  @RequestBody @Valid SpaceUpdateDTO dto) {
-        checkOwnership(dto.getId(), userId);
+    public Result<Boolean> update(@RequestBody @Valid SpaceUpdateDTO dto) {
+        checkOwnership(dto.getId(), UserContext.getUserId());
         return Result.success(spaceService.updateSpace(dto));
     }
 
     /** 删除动态，仅作者本人可操作 */
     @DeleteMapping("/{id}")
-    public Result<Boolean> delete(@PathVariable("id") Long id,
-                                  @RequestHeader("X-User-Id") Long userId) {
-        checkOwnership(id, userId);
+    public Result<Boolean> delete(@PathVariable("id") Long id) {
+        checkOwnership(id, UserContext.getUserId());
         return Result.success(spaceService.deleteSpace(id));
     }
 

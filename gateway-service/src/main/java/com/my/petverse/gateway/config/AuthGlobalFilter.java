@@ -29,7 +29,8 @@ import java.util.stream.Collectors;
 /**
  * 网关 JWT 鉴权过滤器
  * 除白名单路径外，所有请求必须携带有效令牌；
- * 校验通过后把用户ID以 X-User-Id、角色以 X-User-Role 请求头透传给下游服务；
+ * 先剥离客户端携带的 X-User-Id/X-User-Role 请求头防止伪造，
+ * 校验令牌后再把解析出的用户ID与角色注入请求头透传给下游服务；
  * 同时拦截外部对内部接口（/internal/）的访问，并对管理端/商家端路径做角色校验
  */
 @Component
@@ -66,12 +67,21 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
         if (path.contains("/internal/")) {
             return forbidden(exchange, "禁止访问内部接口");
         }
+        // 剥离客户端自带的身份头防止伪造，下游只认网关注入或服务间透传的值
+        ServerWebExchange sanitized = exchange.mutate()
+                .request(exchange.getRequest().mutate()
+                        .headers(headers -> {
+                            headers.remove(HEADER_USER_ID);
+                            headers.remove(HEADER_USER_ROLE);
+                        })
+                        .build())
+                .build();
         // 白名单路径直接放行
         if (isWhitelist(path)) {
-            return chain.filter(exchange);
+            return chain.filter(sanitized);
         }
         // 校验 Authorization: Bearer <token>
-        String token = resolveToken(exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION));
+        String token = resolveToken(sanitized.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION));
         if (!StringUtils.hasText(token)) {
             return unauthorized(exchange, "未登录");
         }
@@ -95,11 +105,11 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             return forbidden(exchange, "无商家权限，若刚通过入驻审批请退出后重新登录");
         }
         // 透传用户ID与角色给下游服务
-        ServerHttpRequest request = exchange.getRequest().mutate()
+        ServerHttpRequest request = sanitized.getRequest().mutate()
                 .header(HEADER_USER_ID, String.valueOf(userId))
                 .header(HEADER_USER_ROLE, role)
                 .build();
-        return chain.filter(exchange.mutate().request(request).build());
+        return chain.filter(sanitized.mutate().request(request).build());
     }
 
     /** 从请求头中解析 Bearer 令牌 */

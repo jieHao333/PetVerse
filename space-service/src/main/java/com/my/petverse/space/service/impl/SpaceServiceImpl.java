@@ -116,7 +116,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         SpaceVO vo = toVO(space);
         fillAuthor(List.of(vo));
         fillMedia(List.of(vo));
-        fillLikeInfo(List.of(vo), callerId);
+        fillLikeInfo(List.of(vo));
         return vo;
     }
 
@@ -128,7 +128,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         List<SpaceVO> vos = list(wrapper).stream().map(this::toVO).collect(Collectors.toList());
         fillAuthor(vos);
         fillMedia(vos);
-        fillLikeInfo(vos, callerId);
+        fillLikeInfo(vos);
         return vos;
     }
 
@@ -164,7 +164,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         List<SpaceVO> records = page.getRecords().stream().map(this::toVO).collect(Collectors.toList());
         fillAuthor(records);
         fillMedia(records);
-        fillLikeInfo(records, callerId);
+        fillLikeInfo(records);
         return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), records);
     }
 
@@ -195,7 +195,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
                 .collect(Collectors.toList());
         fillAuthor(records);
         fillMedia(records);
-        fillLikeInfo(records, callerId);
+        fillLikeInfo(records);
         return PageResult.of(idPage.getTotal(), query.getPageNum(), query.getPageSize(), records);
     }
 
@@ -303,8 +303,9 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         }
     }
 
-    /** 批量填充点赞数与当前用户点赞状态，调用点赞服务；失败时降级为 0/未点赞，不阻断列表 */
-    private void fillLikeInfo(List<SpaceVO> vos, Long callerId) {
+    /** 批量填充点赞数与当前用户点赞状态，调用点赞服务；失败时降级为 0/未点赞，不阻断列表。
+     * 当前用户身份由 Feign 拦截器从 UserContext 自动透传 */
+    private void fillLikeInfo(List<SpaceVO> vos) {
         if (vos.isEmpty()) {
             return;
         }
@@ -312,7 +313,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
             String ids = vos.stream().map(SpaceVO::getId).map(String::valueOf)
                     .collect(Collectors.joining(","));
             Result<LikeBatchVO> result = remarkFeignClient.likeBatch(
-                    LikeTargetType.SPACE.getCode(), ids, callerId);
+                    LikeTargetType.SPACE.getCode(), ids);
             if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
                 LikeBatchVO batch = result.getData();
                 for (SpaceVO vo : vos) {

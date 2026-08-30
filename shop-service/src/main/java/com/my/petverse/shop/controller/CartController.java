@@ -1,5 +1,6 @@
 package com.my.petverse.shop.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.shop.CartAddDTO;
 import com.my.petverse.common.dto.shop.CartUpdateDTO;
 import com.my.petverse.common.result.Result;
@@ -13,7 +14,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -31,28 +31,25 @@ public class CartController {
 
     /** 加入购物车（同一商品重复加购累加数量） */
     @PostMapping
-    public Result<CartItemVO> add(@RequestHeader("X-User-Id") Long userId,
-                                  @RequestBody @Valid CartAddDTO dto) {
-        return Result.success(cartService.addItem(userId, dto));
+    public Result<CartItemVO> add(@RequestBody @Valid CartAddDTO dto) {
+        return Result.success(cartService.addItem(UserContext.getUserId(), dto));
     }
 
     /** 查询我的购物车列表（前端按店铺分组展示） */
     @GetMapping
-    public Result<List<CartItemVO>> list(@RequestHeader("X-User-Id") Long userId) {
-        return Result.success(cartService.listMine(userId));
+    public Result<List<CartItemVO>> list() {
+        return Result.success(cartService.listMine(UserContext.getUserId()));
     }
 
     /** 修改购物车条目数量 */
     @PutMapping
-    public Result<Boolean> update(@RequestHeader("X-User-Id") Long userId,
-                                  @RequestBody @Valid CartUpdateDTO dto) {
-        return Result.success(cartService.updateQuantity(userId, dto));
+    public Result<Boolean> update(@RequestBody @Valid CartUpdateDTO dto) {
+        return Result.success(cartService.updateQuantity(UserContext.getUserId(), dto));
     }
 
     /** 删除购物车条目 */
     @DeleteMapping("/{id}")
-    public Result<Boolean> remove(@RequestHeader("X-User-Id") Long userId,
-                                  @PathVariable("id") Long id) {
-        return Result.success(cartService.removeItem(userId, id));
+    public Result<Boolean> remove(@PathVariable("id") Long id) {
+        return Result.success(cartService.removeItem(UserContext.getUserId(), id));
     }
 }

@@ -13,8 +13,7 @@ public class PetSetActiveDTO implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** 用户ID */
-    @NotNull(message = "用户ID不能为空")
+    /** 用户ID，由服务端从登录令牌解析写入，客户端无需传入 */
     private Long userId;
 
     /** 要设置为出场的宠物ID */

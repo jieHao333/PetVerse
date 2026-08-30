@@ -1,5 +1,6 @@
 package com.my.petverse.pet.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
@@ -64,39 +65,44 @@ public class PetController {
         return Result.success(petCatalogService.randomCatalog());
     }
 
-    /** 查询当前用户的出场宠物 */
+    /** 查询出场宠物：不传 userId 时查当前登录用户，传 userId 用于用户主页展示他人宠物 */
     @GetMapping("/me")
-    public Result<PetVO> me(@RequestParam("userId") Long userId) {
-        return Result.success(petService.getMyPet(userId));
+    public Result<PetVO> me(@RequestParam(value = "userId", required = false) Long userId) {
+        Long targetUserId = userId != null ? userId : UserContext.getUserId();
+        return Result.success(petService.getMyPet(targetUserId));
     }
 
     /** 查询当前用户的全部宠物 */
     @GetMapping("/my-list")
-    public Result<List<PetVO>> myList(@RequestParam("userId") Long userId) {
-        return Result.success(petService.listMyPets(userId));
+    public Result<List<PetVO>> myList() {
+        return Result.success(petService.listMyPets(UserContext.getUserId()));
     }
 
-    /** 领取宠物（随机抽取或自选），支持领养多只 */
+    /** 领取宠物（随机抽取或自选），支持领养多只，用户ID取自登录令牌 */
     @PostMapping("/claim")
     public Result<PetVO> claim(@RequestBody @Valid PetClaimDTO dto) {
+        dto.setUserId(UserContext.getUserId());
         return Result.success(petService.claimPet(dto));
     }
 
-    /** 修改宠物名称 */
+    /** 修改宠物名称，用户ID取自登录令牌 */
     @PutMapping("/rename")
     public Result<PetVO> rename(@RequestBody @Valid PetRenameDTO dto) {
+        dto.setUserId(UserContext.getUserId());
         return Result.success(petService.renamePet(dto));
     }
 
-    /** 设置出场宠物 */
+    /** 设置出场宠物，用户ID取自登录令牌 */
     @PutMapping("/active")
     public Result<PetVO> setActive(@RequestBody @Valid PetSetActiveDTO dto) {
+        dto.setUserId(UserContext.getUserId());
         return Result.success(petService.setActivePet(dto));
     }
 
-    /** 每日签到，为用户所有宠物发放经验值 */
+    /** 每日签到，为用户所有宠物发放经验值，用户ID取自登录令牌 */
     @PostMapping("/sign-in")
     public Result<PetSignInVO> signIn(@RequestBody @Valid PetSignInDTO dto) {
+        dto.setUserId(UserContext.getUserId());
         return Result.success(petService.signIn(dto));
     }
 

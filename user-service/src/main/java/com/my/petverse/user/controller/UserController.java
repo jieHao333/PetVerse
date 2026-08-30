@@ -1,5 +1,6 @@
 package com.my.petverse.user.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.user.UserLoginDTO;
 import com.my.petverse.common.dto.user.UserRegisterDTO;
 import com.my.petverse.common.dto.user.UserUpdateDTO;
@@ -36,10 +37,10 @@ public class UserController {
         return Result.success(userService.login(dto));
     }
 
-    /** 当前登录用户信息（用户ID由网关注入的 X-User-Id 请求头提供） */
+    /** 当前登录用户信息（用户ID取自登录令牌） */
     @GetMapping("/me")
-    public Result<UserVO> me(@RequestHeader("X-User-Id") Long userId) {
-        return Result.success(userService.getUserById(userId));
+    public Result<UserVO> me() {
+        return Result.success(userService.getUserById(UserContext.getUserId()));
     }
 
     /** 根据ID查询用户信息 */
@@ -50,25 +51,22 @@ public class UserController {
 
     /** 按用户名或昵称搜索用户（加好友场景），排除当前登录用户 */
     @GetMapping("/search")
-    public Result<List<UserVO>> search(@RequestHeader("X-User-Id") Long userId,
-                                       @RequestParam("keyword") String keyword) {
-        return Result.success(userService.searchUsers(keyword, userId));
+    public Result<List<UserVO>> search(@RequestParam("keyword") String keyword) {
+        return Result.success(userService.searchUsers(keyword, UserContext.getUserId()));
     }
 
     /** 修改用户资料（昵称/头像/密码） */
     @PutMapping
-    public Result<Boolean> update(@RequestHeader("X-User-Id") Long userId,
-                                  @RequestBody @Valid UserUpdateDTO dto) {
+    public Result<Boolean> update(@RequestBody @Valid UserUpdateDTO dto) {
         // 服务端以令牌中的用户ID为准，不允许修改他人资料
-        dto.setId(userId);
+        dto.setId(UserContext.getUserId());
         return Result.success(userService.updateUser(dto));
     }
 
     /** 上传用户头像（存储到阿里云OSS），返回最新用户信息 */
     @PostMapping("/avatar")
-    public Result<UserVO> uploadAvatar(@RequestHeader("X-User-Id") Long userId,
-                                       @RequestParam("file") MultipartFile file) {
-        return Result.success(userService.uploadAvatar(userId, file));
+    public Result<UserVO> uploadAvatar(@RequestParam("file") MultipartFile file) {
+        return Result.success(userService.uploadAvatar(UserContext.getUserId(), file));
     }
 
     /** 升级用户角色（内部接口，仅供 Feign 调用，网关已拦截外部 /internal 请求） */

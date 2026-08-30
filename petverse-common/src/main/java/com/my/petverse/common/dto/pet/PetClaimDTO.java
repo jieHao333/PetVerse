@@ -16,8 +16,7 @@ public class PetClaimDTO implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    /** 用户ID */
-    @NotNull(message = "用户ID不能为空")
+    /** 用户ID，由服务端从登录令牌解析写入，客户端无需传入 */
     private Long userId;
 
     /** 领取方式：RANDOM-随机抽取 CHOOSE-自选 */

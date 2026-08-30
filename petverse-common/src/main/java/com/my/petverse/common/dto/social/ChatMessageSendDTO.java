@@ -8,7 +8,7 @@ import lombok.Data;
 import java.io.Serializable;
 
 /**
- * 发送聊天消息请求参数（发送者ID由网关注入的 X-User-Id 请求头提供）
+ * 发送聊天消息请求参数（发送者ID由服务端从登录令牌解析，经 UserContext 提供）
  */
 @Data
 public class ChatMessageSendDTO implements Serializable {

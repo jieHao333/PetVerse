@@ -2,7 +2,6 @@ package com.my.petverse.common.dto.space;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
 
@@ -32,8 +31,7 @@ public class SpaceSaveDTO implements Serializable {
     /** 关联的宠物ID，可为空 */
     private Long petId;
 
-    /** 所属用户ID */
-    @NotNull(message = "用户ID不能为空")
+    /** 所属用户ID，由服务端从登录令牌解析写入，客户端无需传入 */
     private Long userId;
 
     /** 可见性：0-公开 1-仅好友 2-仅自己，缺省为公开 */

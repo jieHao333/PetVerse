@@ -1,5 +1,6 @@
 package com.my.petverse.shop.controller;
 
+import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.shop.MerchantUpdateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductPageQueryDTO;
@@ -33,57 +34,50 @@ public class MerchantController {
 
     /** 查询我的店铺信息 */
     @GetMapping("/info")
-    public Result<MerchantVO> info(@RequestHeader("X-User-Id") Long userId) {
-        return Result.success(merchantService.getByUserId(userId));
+    public Result<MerchantVO> info() {
+        return Result.success(merchantService.getByUserId(UserContext.getUserId()));
     }
 
     /** 修改我的店铺信息（名称/LOGO/简介/联系电话） */
     @PutMapping("/info")
-    public Result<MerchantVO> updateInfo(@RequestHeader("X-User-Id") Long userId,
-                                         @RequestBody @Valid MerchantUpdateDTO dto) {
-        return Result.success(merchantService.updateInfo(userId, dto));
+    public Result<MerchantVO> updateInfo(@RequestBody @Valid MerchantUpdateDTO dto) {
+        return Result.success(merchantService.updateInfo(UserContext.getUserId(), dto));
     }
 
     /** 新增商品（默认下架，编辑完成后手动上架） */
     @PostMapping("/product")
-    public Result<ProductVO> saveProduct(@RequestHeader("X-User-Id") Long userId,
-                                         @RequestBody @Valid ProductSaveDTO dto) {
-        return Result.success(productService.saveProduct(userId, dto));
+    public Result<ProductVO> saveProduct(@RequestBody @Valid ProductSaveDTO dto) {
+        return Result.success(productService.saveProduct(UserContext.getUserId(), dto));
     }
 
     /** 修改商品（含上下架） */
     @PutMapping("/product")
-    public Result<ProductVO> updateProduct(@RequestHeader("X-User-Id") Long userId,
-                                           @RequestBody @Valid ProductUpdateDTO dto) {
-        return Result.success(productService.updateProduct(userId, dto));
+    public Result<ProductVO> updateProduct(@RequestBody @Valid ProductUpdateDTO dto) {
+        return Result.success(productService.updateProduct(UserContext.getUserId(), dto));
     }
 
     /** 删除商品（逻辑删除） */
     @DeleteMapping("/product/{id}")
-    public Result<Boolean> deleteProduct(@RequestHeader("X-User-Id") Long userId,
-                                         @PathVariable("id") Long id) {
-        return Result.success(productService.deleteProduct(userId, id));
+    public Result<Boolean> deleteProduct(@PathVariable("id") Long id) {
+        return Result.success(productService.deleteProduct(UserContext.getUserId(), id));
     }
 
     /** 分页查询我的商品（含下架商品） */
     @GetMapping("/product/page")
-    public Result<PageResult<ProductVO>> pageMine(@RequestHeader("X-User-Id") Long userId,
-                                                  @Valid ProductPageQueryDTO dto) {
-        return Result.success(productService.pageMine(userId, dto));
+    public Result<PageResult<ProductVO>> pageMine(@Valid ProductPageQueryDTO dto) {
+        return Result.success(productService.pageMine(UserContext.getUserId(), dto));
     }
 
     /** 分页查询店铺订单（支持状态筛选） */
     @GetMapping("/order/page")
-    public Result<PageResult<OrderVO>> pageOrders(@RequestHeader("X-User-Id") Long userId,
-                                                  @Valid OrderPageQueryDTO dto) {
-        return Result.success(orderService.pageMerchant(userId, dto));
+    public Result<PageResult<OrderVO>> pageOrders(@Valid OrderPageQueryDTO dto) {
+        return Result.success(orderService.pageMerchant(UserContext.getUserId(), dto));
     }
 
     /** 到店核销完成订单（买家凭取货码取货） */
     @PostMapping("/order/{id}/complete")
-    public Result<OrderVO> completeOrder(@RequestHeader("X-User-Id") Long userId,
-                                         @PathVariable("id") Long id,
+    public Result<OrderVO> completeOrder(@PathVariable("id") Long id,
                                          @RequestParam(value = "pickupCode", required = false) String pickupCode) {
-        return Result.success(orderService.completeOrder(userId, id, pickupCode));
+        return Result.success(orderService.completeOrder(UserContext.getUserId(), id, pickupCode));
     }
 }
