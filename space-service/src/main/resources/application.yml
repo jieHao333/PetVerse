@@ -26,6 +26,13 @@ petverse:
   search:
     enabled: true
 
+# RocketMQ：发布动态事件（宠物经验/索引）与点赞变更事件的生产与消费；
+# 未启动 Broker 时发送自动降级为记日志，不影响主流程
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: space-producer
+
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
   configuration:

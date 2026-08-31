@@ -3,7 +3,6 @@ package com.my.petverse.space.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.space.SpaceMediaItemDTO;
 import com.my.petverse.common.dto.space.SpacePageQueryDTO;
 import com.my.petverse.common.dto.space.SpaceSaveDTO;
@@ -11,21 +10,22 @@ import com.my.petverse.common.dto.space.SpaceUpdateDTO;
 import com.my.petverse.common.entity.space.Space;
 import com.my.petverse.common.entity.space.SpaceMedia;
 import com.my.petverse.common.enums.LikeTargetType;
-import com.my.petverse.common.enums.PetExpSource;
 import com.my.petverse.common.enums.SpaceVisibility;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.SpaceCreatedMessage;
+import com.my.petverse.common.mq.message.SpaceIndexMessage;
 import com.my.petverse.common.oss.OssService;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
-import com.my.petverse.common.vo.pet.PetExpGainVO;
 import com.my.petverse.common.vo.remark.LikeBatchVO;
 import com.my.petverse.common.vo.space.SpaceCreateVO;
 import com.my.petverse.common.vo.space.SpaceMediaItemVO;
 import com.my.petverse.common.vo.space.SpaceMediaUploadVO;
 import com.my.petverse.common.vo.space.SpaceVO;
 import com.my.petverse.common.vo.user.UserVO;
-import com.my.petverse.space.feign.PetFeignClient;
 import com.my.petverse.space.feign.RemarkFeignClient;
 import com.my.petverse.space.feign.SocialFeignClient;
 import com.my.petverse.space.feign.UserFeignClient;
@@ -61,8 +61,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements SpaceService {
 
-    private final PetFeignClient petFeignClient;
-
     private final SocialFeignClient socialFeignClient;
 
     private final UserFeignClient userFeignClient;
@@ -74,6 +72,8 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     private final SpaceSearchService spaceSearchService;
 
     private final OssService ossService;
+
+    private final MqEventPublisher mqEventPublisher;
 
     /** 媒体类型：图片 */
     private static final int MEDIA_IMAGE = 0;
@@ -331,7 +331,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         }
     }
 
-    /** 发布动态，保存成功后为宠物发放经验奖励 */
+    /** 发布动态：落库后以事件驱动异步发放宠物经验与维护检索索引 */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public SpaceCreateVO saveSpace(SpaceSaveDTO dto) {
@@ -342,26 +342,16 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         space.setVisibility(visibility == null ? SpaceVisibility.PUBLIC.getCode() : visibility);
         save(space);
         saveMediaList(space.getId(), dto.getMediaList());
-        // 双写检索索引，失败仅记日志，不影响动态发布
-        spaceSearchService.indexSpace(space);
-
-        // 发布动态奖励宠物经验，经验发放失败仅记录日志，不影响动态保存
-        PetExpGainVO petExp = null;
-        try {
-            PetExpGrantDTO grantDTO = new PetExpGrantDTO();
-            grantDTO.setUserId(dto.getUserId());
-            grantDTO.setSource(PetExpSource.NOTE.name());
-            Result<PetExpGainVO> result = petFeignClient.grantExp(grantDTO);
-            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode()) {
-                petExp = result.getData();
-            }
-        } catch (Exception e) {
-            log.warn("发布动态后为宠物发放经验失败，userId={}", dto.getUserId(), e);
-        }
+        // 事务提交后发布事件：pet-service 消费发放宠物经验，索引消费者维护 ES 检索索引，
+        // 下游失败由 RocketMQ 重试兼容，不阻断发布主流程（经验奖励改为异步，不再同步返回）
+        mqEventPublisher.publishAfterCommit(MqTopics.SPACE_EVENT, MqTopics.TAG_SPACE_CREATED,
+                new SpaceCreatedMessage(space.getId(), dto.getUserId()),
+                "space-created:" + space.getId());
+        mqEventPublisher.publishAfterCommit(MqTopics.SPACE_EVENT, MqTopics.TAG_SPACE_INDEX_UPSERT,
+                new SpaceIndexMessage(space.getId()), "space-index:" + space.getId());
 
         SpaceCreateVO vo = new SpaceCreateVO();
         vo.setSpaceId(space.getId());
-        vo.setPetExp(petExp);
         return vo;
     }
 
@@ -387,7 +377,9 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
                     .eq(SpaceMedia::getSpaceId, dto.getId()));
             saveMediaList(dto.getId(), dto.getMediaList());
         }
-        spaceSearchService.indexSpace(space);
+        // 事务提交后发事件，由索引消费者异步刷新 ES 检索索引（回表读取最新数据）
+        mqEventPublisher.publishAfterCommit(MqTopics.SPACE_EVENT, MqTopics.TAG_SPACE_INDEX_UPSERT,
+                new SpaceIndexMessage(space.getId()), "space-index:" + space.getId());
         return updated;
     }
 
@@ -398,7 +390,9 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         spaceMediaMapper.delete(new LambdaQueryWrapper<SpaceMedia>()
                 .eq(SpaceMedia::getSpaceId, id));
         boolean removed = removeById(id);
-        spaceSearchService.removeSpace(id);
+        // 事务提交后发事件，由索引消费者异步删除 ES 检索索引
+        mqEventPublisher.publishAfterCommit(MqTopics.SPACE_EVENT, MqTopics.TAG_SPACE_INDEX_REMOVE,
+                new SpaceIndexMessage(id), "space-index:" + id);
         return removed;
     }
 

@@ -60,6 +60,9 @@ public class OrderVO implements Serializable {
     /** 下单时间 */
     private LocalDateTime createTime;
 
+    /** 支付截止时间（仅待支付订单返回，超时未支付将自动取消并回补库存，前端据此倒计时） */
+    private LocalDateTime payDeadline;
+
     /** 订单明细列表 */
     private List<OrderItemVO> items;
 }

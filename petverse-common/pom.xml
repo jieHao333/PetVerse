@@ -67,6 +67,12 @@
             <groupId>com.aliyun.oss</groupId>
             <artifactId>aliyun-sdk-oss</artifactId>
         </dependency>
+        <!-- RocketMQ：消息发布与消费的公共基础设施（Topic 契约、发布器、幂等工具），
+             生产者仅在配置了 rocketmq.name-server 时生效，未启用时无副作用 -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

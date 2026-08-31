@@ -10,6 +10,9 @@ import com.my.petverse.common.entity.shop.Merchant;
 import com.my.petverse.common.entity.shop.Product;
 import com.my.petverse.common.enums.ProductCategory;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.ProductIndexMessage;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.shop.ProductVO;
@@ -43,6 +46,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
 
     private final ProductSearchService productSearchService;
 
+    private final MqEventPublisher mqEventPublisher;
+
     @Override
     public ProductVO saveProduct(Long userId, ProductSaveDTO dto) {
         Merchant merchant = merchantService.getActiveMerchant(userId);
@@ -55,8 +60,10 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 新增商品默认下架，商家确认信息后手动上架
         product.setStatus(0);
         save(product);
-        // 双写检索索引，失败仅记日志，不影响商品保存
-        productSearchService.indexProduct(product, merchant.getShopName());
+        // 事务提交后发事件，由索引消费者异步双写检索索引，失败由 RocketMQ 重试兼容，不影响商品保存
+        mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_UPSERT,
+                new ProductIndexMessage(product.getId(), merchant.getId()),
+                "product-index:" + product.getId());
         return toVO(product, merchant.getShopName());
     }
 
@@ -90,7 +97,10 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             product.setStatus(dto.getStatus());
         }
         updateById(product);
-        productSearchService.indexProduct(product, merchant.getShopName());
+        // 事务提交后发事件，由索引消费者异步刷新检索索引（回表读取最新数据）
+        mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_UPSERT,
+                new ProductIndexMessage(product.getId(), merchant.getId()),
+                "product-index:" + product.getId());
         return toVO(product, merchant.getShopName());
     }
 
@@ -99,7 +109,10 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         Merchant merchant = merchantService.getActiveMerchant(userId);
         Product product = getOwnProduct(merchant, productId);
         boolean removed = removeById(product.getId());
-        productSearchService.removeProduct(product.getId());
+        // 事务提交后发事件，由索引消费者异步删除检索索引（重复删除幂等）
+        mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_REMOVE,
+                new ProductIndexMessage(product.getId(), merchant.getId()),
+                "product-index:" + product.getId());
         return removed;
     }
 

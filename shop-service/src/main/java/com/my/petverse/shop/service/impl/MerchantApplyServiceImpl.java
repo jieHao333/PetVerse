@@ -10,8 +10,10 @@ import com.my.petverse.common.dto.shop.MerchantApplyUpdateDTO;
 import com.my.petverse.common.entity.shop.Merchant;
 import com.my.petverse.common.entity.shop.MerchantApply;
 import com.my.petverse.common.enums.MerchantApplyStatus;
-import com.my.petverse.common.enums.UserRole;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.MerchantApprovedMessage;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
@@ -47,6 +49,8 @@ public class MerchantApplyServiceImpl extends ServiceImpl<MerchantApplyMapper, M
     private final MerchantMapper merchantMapper;
 
     private final UserFeignClient userFeignClient;
+
+    private final MqEventPublisher mqEventPublisher;
 
     @Override
     public MerchantApplyVO submit(Long userId, MerchantApplySaveDTO dto) {
@@ -149,12 +153,11 @@ public class MerchantApplyServiceImpl extends ServiceImpl<MerchantApplyMapper, M
             merchant.setContactPhone(apply.getContactPhone());
             merchant.setStatus(1);
             merchantMapper.insert(merchant);
-            // 跨服务升级用户角色，失败抛异常回滚本地事务，保证审批结果与角色一致
-            Result<Boolean> result = userFeignClient.upgradeRole(apply.getUserId(), UserRole.MERCHANT.name());
-            if (result == null || result.getCode() != ResultCode.SUCCESS.getCode()
-                    || !Boolean.TRUE.equals(result.getData())) {
-                throw new BusinessException(ResultCode.INTERNAL_ERROR, "升级商家角色失败，请稍后重试");
-            }
+            // 跨服务升级用户角色改为事件驱动：事务提交后发消息，user-service 消费升级角色，
+            // 失败由 RocketMQ 重试直至成功，避免同步 Feign 失败导致审批整体回滚（最终一致）
+            mqEventPublisher.publishAfterCommit(MqTopics.MERCHANT_EVENT, MqTopics.TAG_MERCHANT_APPROVED,
+                    new MerchantApprovedMessage(apply.getId(), apply.getUserId()),
+                    "merchant-approved:" + apply.getId());
         }
     }
 

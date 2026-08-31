@@ -5,10 +5,12 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.my.petverse.common.dto.shop.MerchantUpdateDTO;
 import com.my.petverse.common.entity.shop.Merchant;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.ProductIndexMessage;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.shop.MerchantVO;
 import com.my.petverse.shop.mapper.MerchantMapper;
-import com.my.petverse.shop.search.ProductSearchService;
 import com.my.petverse.shop.service.MerchantService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
@@ -24,7 +26,7 @@ import java.util.Objects;
 @RequiredArgsConstructor
 public class MerchantServiceImpl extends ServiceImpl<MerchantMapper, Merchant> implements MerchantService {
 
-    private final ProductSearchService productSearchService;
+    private final MqEventPublisher mqEventPublisher;
 
     @Override
     public MerchantVO getByUserId(Long userId) {
@@ -53,9 +55,11 @@ public class MerchantServiceImpl extends ServiceImpl<MerchantMapper, Merchant> i
             merchant.setContactPhone(dto.getContactPhone());
         }
         updateById(merchant);
-        // 店铺改名后重刷商品索引，保证按店铺名搜商品仍然准确
+        // 店铺改名后发事件，由索引消费者异步重刷商品索引，保证按店铺名搜商品仍然准确（重复执行幂等）
         if (!Objects.equals(originalShopName, merchant.getShopName())) {
-            productSearchService.refreshShopName(merchant.getId(), merchant.getShopName());
+            mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_SHOP_RENAMED,
+                    new ProductIndexMessage(null, merchant.getId()),
+                    "shop-renamed:" + merchant.getId());
         }
         return toVO(merchant);
     }

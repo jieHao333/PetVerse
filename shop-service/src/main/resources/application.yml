@@ -24,6 +24,17 @@ spring:
 petverse:
   search:
     enabled: true
+  order:
+    # 支付超时时长（分钟），超时未支付自动取消并回补库存；
+    # 内部映射为 RocketMQ 延迟档位（支持 1~10/20/30/60/120，其他值向上取最近档位），前端倒计时与实际取消时间一致
+    pay-timeout-minutes: 5
+
+# RocketMQ：订单超时延迟消息、商户审批事件、商品索引事件的生产与消费；
+# 未启动 Broker 时发送自动降级为记日志，不影响下单主流程（仅失去超时自动取消能力）
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: shop-producer
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml

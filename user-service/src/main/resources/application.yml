@@ -25,6 +25,12 @@ jwt:
   secret: petverse-jwt-secret-key-please-change-in-production-2026
   expire-seconds: 86400
 
+# RocketMQ：消费商户入驻审批通过事件，异步升级用户角色；未启动 Broker 时消费不可用，不影响其他功能
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: user-producer
+
 # 阿里云 OSS 存储配置
 aliyun:
   oss:

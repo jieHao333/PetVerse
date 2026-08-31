@@ -4,6 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.my.petverse.common.entity.remark.LikeRecord;
 import com.my.petverse.common.enums.LikeTargetType;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.LikeChangedMessage;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.remark.LikeBatchVO;
 import com.my.petverse.remark.mapper.LikeRecordMapper;
@@ -33,6 +36,8 @@ public class LikeServiceImpl implements LikeService {
 
     private final LikeRecordMapper likeRecordMapper;
 
+    private final MqEventPublisher mqEventPublisher;
+
     /** 点赞用户集合 Key：like:{targetType}:{targetId}，成员为 userId */
     private static final String SET_KEY = "like:%d:%d";
 
@@ -45,9 +50,11 @@ public class LikeServiceImpl implements LikeService {
         ensureLoaded(targetType, targetId);
         String setKey = setKey(targetType, targetId);
         Long added = redis.opsForSet().add(setKey, String.valueOf(userId));
-        // 新增成功才标记脏数据，重复点赞无需同步
+        // 新增成功才标记脏数据并发布变更事件，重复点赞无需同步；
+        // 事件携带变更后的最新计数，业务侧据此近实时刷新热度冗余列（定时任务仍作全量兜底）
         if (added != null && added == 1L) {
             redis.opsForSet().add(dirtyKey(targetType), String.valueOf(targetId));
+            publishLikeChanged(targetType, targetId, setKey);
         }
     }
 
@@ -59,7 +66,15 @@ public class LikeServiceImpl implements LikeService {
         Long removed = redis.opsForSet().remove(setKey, String.valueOf(userId));
         if (removed != null && removed == 1L) {
             redis.opsForSet().add(dirtyKey(targetType), String.valueOf(targetId));
+            publishLikeChanged(targetType, targetId, setKey);
         }
+    }
+
+    /** 发布点赞变更事件（携带最新点赞数），发送失败由发布器内部降级记日志 */
+    private void publishLikeChanged(Integer targetType, Long targetId, String setKey) {
+        Long size = redis.opsForSet().size(setKey);
+        mqEventPublisher.publish(MqTopics.LIKE_CHANGED, MqTopics.TAG_LIKE_CHANGED,
+                new LikeChangedMessage(targetType, targetId, size == null ? 0L : size));
     }
 
     @Override

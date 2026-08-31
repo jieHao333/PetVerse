@@ -34,6 +34,7 @@
         <lombok.version>1.18.36</lombok.version>
         <jjwt.version>0.12.7</jjwt.version>
         <aliyun-oss.version>3.18.1</aliyun-oss.version>
+        <rocketmq-spring.version>2.3.3</rocketmq-spring.version>
     </properties>
 
     <dependencyManagement>
@@ -100,6 +101,11 @@
                 <groupId>com.aliyun.oss</groupId>
                 <artifactId>aliyun-sdk-oss</artifactId>
                 <version>${aliyun-oss.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-spring-boot-starter</artifactId>
+                <version>${rocketmq-spring.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

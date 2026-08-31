@@ -40,6 +40,15 @@ public interface OrderService extends IService<ShopOrder> {
     boolean cancelOrder(Long userId, Long orderId);
 
     /**
+     * 超时自动取消（由延迟消息消费者调用）：仅待支付订单会被取消并回补库存，
+     * 已支付/已取消/已核销订单一律跳过，天然幂等，可安全重复消费
+     *
+     * @param orderId 订单ID
+     * @return 是否执行了取消（非待支付状态返回 false）
+     */
+    boolean timeoutCancelOrder(Long orderId);
+
+    /**
      * 分页查询我的订单（买家端）
      *
      * @param userId 买家用户ID

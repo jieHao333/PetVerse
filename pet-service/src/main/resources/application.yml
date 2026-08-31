@@ -23,3 +23,9 @@ mybatis-plus:
 
 jwt:
   secret: petverse-jwt-secret-key-please-change-in-production-2026
+
+# RocketMQ：消费动态发布事件，异步为宠物发放经验奖励；未启动 Broker 时消费不可用，不影响其他功能
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: pet-producer

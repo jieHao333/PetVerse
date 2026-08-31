@@ -29,3 +29,10 @@ mybatis-plus:
 
 jwt:
   secret: petverse-jwt-secret-key-please-change-in-production-2026
+
+# RocketMQ：点赞/取消点赞时发布变更事件，业务侧据此近实时刷新热度；
+# 未启动 Broker 时发送自动降级为记日志，点赞功能本身不受影响（定时任务仍会同步计数）
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: remark-producer

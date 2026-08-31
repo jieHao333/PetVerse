@@ -14,6 +14,9 @@ import com.my.petverse.common.entity.shop.ShopOrderItem;
 import com.my.petverse.common.enums.OrderStatus;
 import com.my.petverse.common.enums.PickupType;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.OrderTimeoutMessage;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.shop.OrderItemVO;
@@ -27,6 +30,7 @@ import com.my.petverse.shop.service.MerchantService;
 import com.my.petverse.shop.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -57,6 +61,32 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     private final ShopOrderItemMapper orderItemMapper;
 
     private final MerchantService merchantService;
+
+    private final MqEventPublisher mqEventPublisher;
+
+    /** 支付超时时长（分钟），默认 10 分钟；超出开源版延迟档位支持范围时向上取最近档位 */
+    @Value("${petverse.order.pay-timeout-minutes:10}")
+    private int payTimeoutMinutes;
+
+    /** 开源版 RocketMQ 延迟档位 → 分钟数映射（档位 5~18 为固定档位） */
+    private static final int[][] DELAY_LEVEL_MINUTES = {
+            {5, 1}, {6, 2}, {7, 3}, {8, 4}, {9, 5}, {10, 6}, {11, 7},
+            {12, 8}, {13, 9}, {14, 10}, {15, 20}, {16, 30}, {17, 60}, {18, 120}
+    };
+
+    /**
+     * 将配置的支付超时分钟数解析为延迟档位与实际分钟数：
+     * 取分钟数 ≥ 配置值的第一个档位（开源版仅支持固定档位）；
+     * 前端倒计时与实际自动取消均以档位真实分钟数为准，保证两者一致
+     */
+    private int[] resolvePayTimeoutDelay() {
+        for (int[] item : DELAY_LEVEL_MINUTES) {
+            if (item[1] >= payTimeoutMinutes) {
+                return item;
+            }
+        }
+        return DELAY_LEVEL_MINUTES[DELAY_LEVEL_MINUTES.length - 1];
+    }
 
     /** 订单号时间前缀格式 */
     private static final DateTimeFormatter ORDER_NO_FORMAT = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
@@ -136,21 +166,39 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         }
         // 已结算条目移出购物车
         cartItemMapper.deleteBatchIds(dto.getCartItemIds());
+        // 事务提交后发送超时延迟消息，到期后若仍未支付由消费者自动取消并回补库存，防止库存被永久占用；
+        // 消费端按订单状态幂等处理，消息重复投递或下单后已支付/取消均安全（发送失败仅记日志，不影响下单）
+        int[] delay = resolvePayTimeoutDelay();
+        mqEventPublisher.publishDelayedAfterCommit(MqTopics.ORDER_TIMEOUT, MqTopics.TAG_ORDER_TIMEOUT,
+                new OrderTimeoutMessage(order.getId()), "order-timeout:" + order.getId(),
+                delay[0]);
         return toVO(order, merchant.getShopName(), listItems(order.getId()));
     }
 
     @Override
     public OrderVO payOrder(Long userId, Long orderId) {
         ShopOrder order = getOwnOrder(userId, orderId);
+        // 支付超时：当场取消订单并拒绝支付（惰性取消），即使延迟消息延迟或丢失也不会让超时订单支付成功；
+        // 支付成功后再次超时取消会被乐观锁拦截（状态已非待支付），两者不会冲突
+        if (Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode()) && isPayExpired(order)) {
+            doCancelOrder(order);
+            throw new BusinessException(ResultCode.BAD_REQUEST, "订单支付已超时，已自动取消，请重新下单");
+        }
         if (!Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode())) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "订单不是待支付状态，无法支付");
         }
-        // 模拟支付成功，生成取货码作为到店核销凭证
-        order.setStatus(OrderStatus.PENDING_PICKUP.getCode());
-        order.setPickupCode(generatePickupCode());
-        order.setPayTime(LocalDateTime.now());
-        updateById(order);
-        return toVO(order, loadShopName(order.getMerchantId()), listItems(order.getId()));
+        // 模拟支付成功，生成取货码作为到店核销凭证；
+        // 乐观锁限制仅待支付状态可支付，并发下与超时取消互斥，不会出现支付后又被取消
+        int updated = baseMapper.update(null, new LambdaUpdateWrapper<ShopOrder>()
+                .eq(ShopOrder::getId, order.getId())
+                .eq(ShopOrder::getStatus, OrderStatus.PENDING_PAYMENT.getCode())
+                .set(ShopOrder::getStatus, OrderStatus.PENDING_PICKUP.getCode())
+                .set(ShopOrder::getPickupCode, generatePickupCode())
+                .set(ShopOrder::getPayTime, LocalDateTime.now()));
+        if (updated == 0) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "订单状态已变化，请刷新后重试");
+        }
+        return toVO(getById(orderId), loadShopName(order.getMerchantId()), listItems(orderId));
     }
 
     @Override
@@ -160,15 +208,54 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         if (!Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode())) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "仅待支付订单可以取消");
         }
-        // 回补扣减的库存
-        for (ShopOrderItem item : listOrderItems(orderId)) {
+        if (!doCancelOrder(order)) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "订单已被取消，请刷新后重试");
+        }
+        return true;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean timeoutCancelOrder(Long orderId) {
+        ShopOrder order = getById(orderId);
+        // 订单不存在或已非待支付状态（已支付/已取消/已核销），无需处理，重复消费安全；
+        // 支付超时后由支付接口惰性取消的订单同样会被这里幂等跳过（乐观锁双保险）
+        if (order == null || !Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode())) {
+            return false;
+        }
+        return doCancelOrder(order);
+    }
+
+    /**
+     * 取消待支付订单并回补库存（用户主动取消、超时延迟消息、支付接口惰性取消共用）。
+     * 状态变更采用乐观锁（仅待支付可改已取消），并发下只有一个调用者成功，
+     * 成功者才回补库存，保证不重复回补；返回 false 表示订单已被其他路径处理
+     */
+    private boolean doCancelOrder(ShopOrder order) {
+        int updated = baseMapper.update(null, new LambdaUpdateWrapper<ShopOrder>()
+                .eq(ShopOrder::getId, order.getId())
+                .eq(ShopOrder::getStatus, OrderStatus.PENDING_PAYMENT.getCode())
+                .set(ShopOrder::getStatus, OrderStatus.CANCELLED.getCode())
+                .set(ShopOrder::getCancelTime, LocalDateTime.now()));
+        if (updated == 0) {
+            return false;
+        }
+        // 回补扣减的库存（仅乐观锁抢占成功的一方执行，不会重复回补）
+        for (ShopOrderItem item : listOrderItems(order.getId())) {
             productMapper.update(null, new LambdaUpdateWrapper<Product>()
                     .eq(Product::getId, item.getProductId())
                     .setSql("stock = stock + {0}", item.getQuantity()));
         }
-        order.setStatus(OrderStatus.CANCELLED.getCode());
-        order.setCancelTime(LocalDateTime.now());
-        return updateById(order);
+        return true;
+    }
+
+    /** 判断待支付订单是否已超过支付截止时间（下单时间 + 支付超时时长） */
+    private boolean isPayExpired(ShopOrder order) {
+        if (order.getCreateTime() == null) {
+            return false;
+        }
+        LocalDateTime deadline = order.getCreateTime().plusMinutes(resolvePayTimeoutDelay()[1]);
+        return !LocalDateTime.now().isBefore(deadline);
     }
 
     @Override
@@ -285,6 +372,26 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         vo.setStatusName(status == null ? null : status.getDesc());
         PickupType pickupType = PickupType.of(order.getPickupType());
         vo.setPickupTypeName(pickupType == null ? null : pickupType.getDesc());
+        // 待支付订单：已超时的当场惰性取消（回补库存）并按已取消返回，保证任何查询出口展示的状态与实际一致；
+        // 未超时的返回支付截止时间，供前端倒计时展示（时长与实际延迟取消档位保持一致）
+        if (status == OrderStatus.PENDING_PAYMENT && order.getCreateTime() != null) {
+            if (isPayExpired(order)) {
+                if (doCancelOrder(order)) {
+                    vo.setStatus(OrderStatus.CANCELLED.getCode());
+                    vo.setStatusName(OrderStatus.CANCELLED.getDesc());
+                } else {
+                    // 乐观锁未抢到（并发下已被其他路径取消或支付），回读真实状态展示，避免展示滞后
+                    ShopOrder fresh = getById(order.getId());
+                    OrderStatus actual = fresh == null ? null : OrderStatus.of(fresh.getStatus());
+                    if (fresh != null) {
+                        vo.setStatus(fresh.getStatus());
+                        vo.setStatusName(actual == null ? null : actual.getDesc());
+                    }
+                }
+            } else {
+                vo.setPayDeadline(order.getCreateTime().plusMinutes(resolvePayTimeoutDelay()[1]));
+            }
+        }
         vo.setItems(items);
         return vo;
     }
