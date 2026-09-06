@@ -63,4 +63,7 @@ public class Pet extends BaseEntity {
 
     /** 是否绝育 0-否 1-是（真实宠物） */
     private Integer sterilized;
+
+    /** 身份卡签发日期，非空表示已发放宠物身份证 */
+    private LocalDate cardIssueDate;
 }

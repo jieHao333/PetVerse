@@ -11,6 +11,11 @@
 -- ALTER TABLE pet ADD COLUMN sterilized TINYINT DEFAULT 0 COMMENT '是否绝育 0-否 1-是(真实宠物)' AFTER birthday;
 -- UPDATE pet SET type = 'VIRTUAL' WHERE type IS NULL;
 -- ALTER TABLE pet DROP COLUMN active;
+-- 3) 宠物身份卡签发日期：
+-- ALTER TABLE pet ADD COLUMN card_issue_date DATE DEFAULT NULL COMMENT '身份卡签发日期' AFTER sterilized;
+-- 存量数据补发：虚拟宠物按创建日期补发，档案已完善的真实宠物按更新日期补发
+-- UPDATE pet SET card_issue_date = DATE(create_time) WHERE type = 'VIRTUAL' AND card_issue_date IS NULL;
+-- UPDATE pet SET card_issue_date = DATE(update_time) WHERE type = 'REAL' AND species IS NOT NULL AND gender IS NOT NULL AND birthday IS NOT NULL AND card_issue_date IS NULL;
 
 CREATE TABLE IF NOT EXISTS pet
 (
@@ -31,6 +36,7 @@ CREATE TABLE IF NOT EXISTS pet
     gender         TINYINT      DEFAULT NULL COMMENT '性别 1-弟弟 2-妹妹(真实宠物)',
     birthday       DATE         DEFAULT NULL COMMENT '生日(真实宠物)',
     sterilized     TINYINT      DEFAULT 0 COMMENT '是否绝育 0-否 1-是(真实宠物)',
+    card_issue_date DATE      DEFAULT NULL COMMENT '身份卡签发日期',
     create_time    DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time    DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted        TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',

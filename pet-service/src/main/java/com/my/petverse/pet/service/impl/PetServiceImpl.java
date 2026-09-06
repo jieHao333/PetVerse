@@ -156,6 +156,8 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         pet.setLevel(1);
         pet.setExp(0L);
         pet.setSignStreak(0);
+        // 虚拟宠物领养完成即自动签发身份卡
+        pet.setCardIssueDate(LocalDate.now());
         save(pet);
         return toVO(pet);
     }
@@ -192,6 +194,13 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         pet.setGender(dto.getGender());
         pet.setBirthday(dto.getBirthday());
         pet.setSterilized(dto.getSterilized());
+        // 档案完善（种类/性别/生日齐备）后签发身份卡，仅首次签发不覆盖
+        if (pet.getCardIssueDate() == null
+                && StringUtils.hasText(pet.getSpecies())
+                && pet.getGender() != null
+                && pet.getBirthday() != null) {
+            pet.setCardIssueDate(LocalDate.now());
+        }
         updateById(pet);
         return toVO(pet);
     }

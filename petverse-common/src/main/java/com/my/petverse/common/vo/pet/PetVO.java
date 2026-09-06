@@ -74,6 +74,9 @@ public class PetVO implements Serializable {
     /** 收养时间（真实宠物） */
     private LocalDate adoptionDate;
 
+    /** 身份卡签发日期，非空表示已签发宠物身份证 */
+    private LocalDate cardIssueDate;
+
     /** 创建时间 */
     private LocalDateTime createTime;
 }
