@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.my.petverse.common.dto.shop.OrderBuyNowDTO;
 import com.my.petverse.common.dto.shop.OrderCreateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
 import com.my.petverse.common.entity.shop.CartItem;
@@ -39,6 +40,7 @@ import java.math.BigDecimal;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -125,13 +127,49 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         if (merchant == null || merchant.getStatus() == null || merchant.getStatus() != 1) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法下单");
         }
-        // 原子扣减库存（stock >= quantity 才更新），并发下防止超卖
+        // 购物车条目转购买清单后走统一下单流程
+        List<long[]> buyItems = new ArrayList<>();
         for (CartItem item : cartItems) {
-            Product product = products.get(item.getProductId());
+            buyItems.add(new long[]{item.getProductId(), item.getQuantity()});
+        }
+        OrderVO vo = buildOrder(userId, merchant, products, buyItems, dto.getRemark());
+        // 已结算条目移出购物车
+        cartItemMapper.deleteBatchIds(dto.getCartItemIds());
+        return vo;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public OrderVO buyNow(Long userId, OrderBuyNowDTO dto) {
+        // 校验商品有效性与店铺营业状态（与购物车结算同一套规则）
+        Product product = productMapper.selectById(dto.getProductId());
+        if (product == null || product.getStatus() == null || product.getStatus() != 1) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "商品已下架或不存在，无法购买");
+        }
+        Merchant merchant = merchantMapper.selectById(product.getMerchantId());
+        if (merchant == null || merchant.getStatus() == null || merchant.getStatus() != 1) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法下单");
+        }
+        // 直接购买不经过购物车，单商品成单
+        return buildOrder(userId, merchant, Map.of(product.getId(), product),
+                List.of(new long[]{product.getId(), dto.getQuantity()}), dto.getRemark());
+    }
+
+    /**
+     * 统一下单流程（购物车结算与直接购买共用）：
+     * 原子扣减库存 → 生成待支付订单与商品快照明细 → 事务提交后发送支付超时延迟消息
+     *
+     * @param buyItems 购买清单，每项为 {商品ID, 数量}
+     */
+    private OrderVO buildOrder(Long userId, Merchant merchant, Map<Long, Product> products,
+                               List<long[]> buyItems, String remark) {
+        // 原子扣减库存（stock >= quantity 才更新），并发下防止超卖
+        for (long[] buyItem : buyItems) {
+            Product product = products.get(buyItem[0]);
             int updated = productMapper.update(null, new LambdaUpdateWrapper<Product>()
                     .eq(Product::getId, product.getId())
-                    .ge(Product::getStock, item.getQuantity())
-                    .setSql("stock = stock - {0}", item.getQuantity()));
+                    .ge(Product::getStock, (int) buyItem[1])
+                    .setSql("stock = stock - {0}", (int) buyItem[1]));
             if (updated == 0) {
                 throw new BusinessException(ResultCode.BAD_REQUEST,
                         "商品「" + product.getName() + "」库存不足，请调整数量");
@@ -141,31 +179,29 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         ShopOrder order = new ShopOrder();
         order.setOrderNo(generateOrderNo());
         order.setUserId(userId);
-        order.setMerchantId(merchantId);
+        order.setMerchantId(merchant.getId());
         order.setStatus(OrderStatus.PENDING_PAYMENT.getCode());
         order.setPickupType(PickupType.SELF_PICKUP.getCode());
-        order.setRemark(dto.getRemark());
+        order.setRemark(remark);
         BigDecimal totalAmount = BigDecimal.ZERO;
-        for (CartItem item : cartItems) {
-            Product product = products.get(item.getProductId());
-            totalAmount = totalAmount.add(product.getPrice().multiply(BigDecimal.valueOf(item.getQuantity())));
+        for (long[] buyItem : buyItems) {
+            Product product = products.get(buyItem[0]);
+            totalAmount = totalAmount.add(product.getPrice().multiply(BigDecimal.valueOf(buyItem[1])));
         }
         order.setTotalAmount(totalAmount);
         save(order);
-        for (CartItem item : cartItems) {
-            Product product = products.get(item.getProductId());
+        for (long[] buyItem : buyItems) {
+            Product product = products.get(buyItem[0]);
             ShopOrderItem orderItem = new ShopOrderItem();
             orderItem.setOrderId(order.getId());
             orderItem.setProductId(product.getId());
             orderItem.setProductName(product.getName());
             orderItem.setProductImage(product.getImageUrl());
             orderItem.setPrice(product.getPrice());
-            orderItem.setQuantity(item.getQuantity());
-            orderItem.setAmount(product.getPrice().multiply(BigDecimal.valueOf(item.getQuantity())));
+            orderItem.setQuantity((int) buyItem[1]);
+            orderItem.setAmount(product.getPrice().multiply(BigDecimal.valueOf(buyItem[1])));
             orderItemMapper.insert(orderItem);
         }
-        // 已结算条目移出购物车
-        cartItemMapper.deleteBatchIds(dto.getCartItemIds());
         // 事务提交后发送超时延迟消息，到期后若仍未支付由消费者自动取消并回补库存，防止库存被永久占用；
         // 消费端按订单状态幂等处理，消息重复投递或下单后已支付/取消均安全（发送失败仅记日志，不影响下单）
         int[] delay = resolvePayTimeoutDelay();

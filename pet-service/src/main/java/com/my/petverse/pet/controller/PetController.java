@@ -86,14 +86,14 @@ public class PetController {
         return Result.success(petService.claimPet(dto));
     }
 
-    /** 登记真实宠物（名称 + 收养时间），用户ID取自登录令牌 */
+    /** 登记真实宠物（名称 + 种类 + 收养时间），用户ID取自登录令牌 */
     @PostMapping("/register")
     public Result<PetVO> register(@RequestBody @Valid PetRegisterDTO dto) {
         dto.setUserId(UserContext.getUserId());
         return Result.success(petService.registerPet(dto));
     }
 
-    /** 完善真实宠物档案（种类/性别/生日/绝育），用户ID取自登录令牌 */
+    /** 完善真实宠物档案（种类/品种/性别/生日/绝育），用户ID取自登录令牌 */
     @PutMapping("/profile")
     public Result<PetVO> updateProfile(@RequestBody @Valid PetProfileUpdateDTO dto) {
         dto.setUserId(UserContext.getUserId());

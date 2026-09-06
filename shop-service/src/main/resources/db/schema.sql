@@ -105,6 +105,43 @@ CREATE TABLE IF NOT EXISTS shop_order
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='订单';
 
+-- 商品评价（仅已完成订单的买家可评价，同一用户对同一商品仅能评价一次；支持图片/视频晒单）
+CREATE TABLE IF NOT EXISTS product_review
+(
+    id          BIGINT        NOT NULL COMMENT '主键(雪花ID)',
+    product_id  BIGINT        NOT NULL COMMENT '商品ID',
+    merchant_id BIGINT        NOT NULL COMMENT '商家ID（冗余，支持按店铺维度统计）',
+    user_id     BIGINT        NOT NULL COMMENT '评价人用户ID',
+    order_id    BIGINT        NOT NULL COMMENT '来源订单ID（已完成订单，评价资格凭证）',
+    rating      TINYINT       NOT NULL COMMENT '评分 1~5 星',
+    content     VARCHAR(500)  DEFAULT NULL COMMENT '评价内容',
+    image_urls  VARCHAR(1500) DEFAULT NULL COMMENT '评价图片OSS地址，逗号分隔（最多9张）',
+    video_url   VARCHAR(255)  DEFAULT NULL COMMENT '评价视频OSS地址（最多1个）',
+    create_time DATETIME      DEFAULT NULL COMMENT '创建时间',
+    update_time DATETIME      DEFAULT NULL COMMENT '更新时间',
+    deleted     TINYINT       DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_product_user (product_id, user_id),
+    KEY idx_product_rating (product_id, rating)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='商品评价';
+
+-- 商品评价回复（所有登录用户可在评价下自由互动，支持回复某条回复）
+CREATE TABLE IF NOT EXISTS product_review_reply
+(
+    id            BIGINT       NOT NULL COMMENT '主键(雪花ID)',
+    review_id     BIGINT       NOT NULL COMMENT '评价ID',
+    user_id       BIGINT       NOT NULL COMMENT '回复人用户ID',
+    reply_user_id BIGINT       DEFAULT NULL COMMENT '被回复人用户ID（回复某条回复时记录，平铺展示）',
+    content       VARCHAR(500) NOT NULL COMMENT '回复内容',
+    create_time   DATETIME     DEFAULT NULL COMMENT '创建时间',
+    update_time   DATETIME     DEFAULT NULL COMMENT '更新时间',
+    deleted       TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
+    PRIMARY KEY (id),
+    KEY idx_review_id (review_id)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='商品评价回复';
+
 -- 订单明细（下单时商品快照，不随商品修改变化）
 CREATE TABLE IF NOT EXISTS shop_order_item
 (

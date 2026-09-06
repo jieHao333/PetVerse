@@ -50,10 +50,10 @@ public interface PetService extends IService<Pet> {
     /** 领取虚拟宠物（随机抽取或自选），支持领养多只 */
     PetVO claimPet(PetClaimDTO dto);
 
-    /** 登记真实宠物（名称 + 收养时间） */
+    /** 登记真实宠物（名称 + 种类 + 收养时间） */
     PetVO registerPet(PetRegisterDTO dto);
 
-    /** 完善真实宠物档案（种类/性别/生日/绝育） */
+    /** 完善真实宠物档案（种类/品种/性别/生日/绝育） */
     PetVO updatePetProfile(PetProfileUpdateDTO dto);
 
     /** 修改宠物名称 */

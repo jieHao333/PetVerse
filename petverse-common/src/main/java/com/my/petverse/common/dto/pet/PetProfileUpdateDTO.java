@@ -8,8 +8,8 @@ import java.io.Serializable;
 import java.time.LocalDate;
 
 /**
- * 完善真实宠物档案请求参数
- * 首页「完善宠物信息」入口提交：种类、性别、生日、是否绝育
+ * 完善/修改真实宠物档案请求参数
+ * 首页「完善/修改宠物信息」入口提交：种类、品种、性别、生日、是否绝育、收养时间
  */
 @Data
 public class PetProfileUpdateDTO implements Serializable {
@@ -27,6 +27,10 @@ public class PetProfileUpdateDTO implements Serializable {
     @Size(max = 50, message = "宠物种类不能超过50个字符")
     private String species;
 
+    /** 宠物品种，如：布偶猫、金毛寻回犬 */
+    @Size(max = 50, message = "宠物品种不能超过50个字符")
+    private String breed;
+
     /** 性别 1-弟弟 2-妹妹 */
     private Integer gender;
 
@@ -35,4 +39,7 @@ public class PetProfileUpdateDTO implements Serializable {
 
     /** 是否绝育 0-否 1-是 */
     private Integer sterilized;
+
+    /** 收养时间 */
+    private LocalDate adoptionDate;
 }

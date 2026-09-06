@@ -162,13 +162,14 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         return toVO(pet);
     }
 
-    /** 登记真实宠物：仅需名称与可选收养时间，纯档案不参与等级/经验/签到 */
+    /** 登记真实宠物：名称与种类必填，收养时间可选，纯档案不参与等级/经验/签到 */
     @Override
     public PetVO registerPet(PetRegisterDTO dto) {
         Pet pet = new Pet();
         pet.setUserId(dto.getUserId());
         pet.setType(PetType.REAL.name());
         pet.setName(dto.getName().trim());
+        pet.setSpecies(dto.getSpecies().trim());
         pet.setAdoptionDate(dto.getAdoptionDate());
         // 真实宠物不参与游戏化，等级/经验/连续签到保持初始默认值
         pet.setAge(0);
@@ -191,9 +192,11 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             throw new BusinessException(ResultCode.BAD_REQUEST, "仅真实宠物支持完善档案信息");
         }
         pet.setSpecies(dto.getSpecies());
+        pet.setBreed(dto.getBreed());
         pet.setGender(dto.getGender());
         pet.setBirthday(dto.getBirthday());
         pet.setSterilized(dto.getSterilized());
+        pet.setAdoptionDate(dto.getAdoptionDate());
         // 档案完善（种类/性别/生日齐备）后签发身份卡，仅首次签发不覆盖
         if (pet.getCardIssueDate() == null
                 && StringUtils.hasText(pet.getSpecies())

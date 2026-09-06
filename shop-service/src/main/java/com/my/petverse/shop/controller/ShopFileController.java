@@ -18,7 +18,7 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * 商城图片上传接口控制器（营业执照/商品主图，存储到阿里云OSS）
+ * 商城文件上传接口控制器（营业执照/商品主图/评价晒单图/视频，存储到阿里云OSS）
  */
 @RestController
 @RequestMapping("/shop/file")
@@ -30,6 +30,12 @@ public class ShopFileController {
 
     /** 图片大小上限：5MB */
     private static final long MAX_IMAGE_SIZE = 5 * 1024 * 1024L;
+
+    /** 支持的视频扩展名 */
+    private static final Set<String> VIDEO_EXTENSIONS = Set.of("mp4", "mov", "m4v", "webm");
+
+    /** 视频大小上限：50MB（评价晒单视频） */
+    private static final long MAX_VIDEO_SIZE = 50 * 1024 * 1024L;
 
     /** 存储路径日期目录格式 */
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
@@ -50,6 +56,24 @@ public class ShopFileController {
             throw new BusinessException(ResultCode.BAD_REQUEST, "图片大小不能超过5MB");
         }
         String objectKey = "shop/" + LocalDate.now().format(DATE_FORMAT) + "/"
+                + UUID.randomUUID().toString().replace("-", "") + "." + extension;
+        return Result.success(ossService.upload(objectKey, file));
+    }
+
+    /** 上传视频（mp4/mov/m4v/webm，≤50MB），返回OSS公网地址 */
+    @PostMapping("/video")
+    public Result<String> uploadVideo(@RequestParam("file") MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "上传文件不能为空");
+        }
+        String extension = getExtension(file.getOriginalFilename());
+        if (!VIDEO_EXTENSIONS.contains(extension)) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "仅支持 mp4/mov/m4v/webm 视频");
+        }
+        if (file.getSize() > MAX_VIDEO_SIZE) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "视频大小不能超过50MB");
+        }
+        String objectKey = "shop/video/" + LocalDate.now().format(DATE_FORMAT) + "/"
                 + UUID.randomUUID().toString().replace("-", "") + "." + extension;
         return Result.success(ossService.upload(objectKey, file));
     }

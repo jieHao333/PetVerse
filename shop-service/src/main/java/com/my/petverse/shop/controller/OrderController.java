@@ -1,6 +1,7 @@
 package com.my.petverse.shop.controller;
 
 import com.my.petverse.common.context.UserContext;
+import com.my.petverse.common.dto.shop.OrderBuyNowDTO;
 import com.my.petverse.common.dto.shop.OrderCreateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
 import com.my.petverse.common.result.PageResult;
@@ -31,6 +32,12 @@ public class OrderController {
     @PostMapping
     public Result<OrderVO> create(@RequestBody @Valid OrderCreateDTO dto) {
         return Result.success(orderService.createOrder(UserContext.getUserId(), dto));
+    }
+
+    /** 直接购买下单（商品详情页立即购买，不经过购物车，扣库存，待支付） */
+    @PostMapping("/buy-now")
+    public Result<OrderVO> buyNow(@RequestBody @Valid OrderBuyNowDTO dto) {
+        return Result.success(orderService.buyNow(UserContext.getUserId(), dto));
     }
 
     /** 支付订单（模拟支付，成功后生成取货码） */

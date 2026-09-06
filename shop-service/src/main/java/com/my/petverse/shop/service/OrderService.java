@@ -1,6 +1,7 @@
 package com.my.petverse.shop.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.my.petverse.common.dto.shop.OrderBuyNowDTO;
 import com.my.petverse.common.dto.shop.OrderCreateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
 import com.my.petverse.common.entity.shop.ShopOrder;
@@ -20,6 +21,15 @@ public interface OrderService extends IService<ShopOrder> {
      * @return 订单信息（待支付）
      */
     OrderVO createOrder(Long userId, OrderCreateDTO dto);
+
+    /**
+     * 直接购买下单（商品详情页立即购买，不经过购物车，扣减库存，生成待支付订单）
+     *
+     * @param userId 买家用户ID
+     * @param dto    下单参数
+     * @return 订单信息（待支付）
+     */
+    OrderVO buyNow(Long userId, OrderBuyNowDTO dto);
 
     /**
      * 支付订单（模拟支付，成功后生成取货码，订单进入待取货状态）
