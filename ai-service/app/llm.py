@@ -1,7 +1,7 @@
 """LLM 客户端封装
 
 - 真实模式：langchain-openai 接 DeepSeek（OpenAI 兼容 API），流式逐 token 输出
-- mock 模式：不依赖任何外部服务，按打字机节奏输出内置可爱回复
+- mock 模式：不依赖任何外部服务，按打字机节奏输出内置的养宠咨询回复
 """
 import asyncio
 from typing import AsyncIterator
@@ -48,24 +48,24 @@ async def stream_chat(messages: list) -> AsyncIterator[str]:
 
 # ---------- mock 模式 ----------
 
-# 内置候选回复池：{name} 会被替换为宠物名字
+# 内置候选回复池：{name} 会被替换为宠物名字（养宠顾问口吻的中立回复，供联调使用）
 _MOCK_REPLIES = [
-    "喵呜~{name}在这里呀！蹭蹭你的手心，最喜欢你陪我玩啦 (≧▽≦)",
-    "汪汪！{name}今天精神满满，要不要一起去院子里晒太阳呀？",
-    "{name}歪着头想了想……主人说的话好深奥，但是蹭蹭你准没错！(=^･ω･^=)",
-    "呼噜呼噜~被主人摸头的{name}最幸福了，我们永远是好朋友哦！",
-    "{name}的等级又悄悄涨了一点点！都是托主人的福，继续加油鸭~ (๑•̀ㅂ•́)و",
-    "唔……{name}有点困了，主人不忙的时候要多陪陪我嘛，呜呜~",
+    "收到你的问题。当前是本地模拟回复模式：关于{name}的健康与习性咨询，建议在 .env 中配置 DEEPSEEK_API_KEY 后获取真实解答。",
+    "这是模拟回复。一般来说，宠物出现食欲下降、精神萎靡等异常时，建议先记录症状持续时间，必要时尽快就医排查。",
+    "模拟回复：关于{name}的喂养问题，建议按年龄阶段选择对应粮，定时定量，并保证充足饮水。",
+    "当前为本地模拟模式，未接入大模型。请配置 DEEPSEEK_API_KEY 后重试，即可获得针对性的养宠建议。",
+    "模拟回复：宠物行为习惯的养成需要耐心，建议采用正向引导（奖励为主），避免惩罚式训练。",
+    "这是模拟回复。若{name}出现呕吐、腹泻等症状，可先禁食观察半天，症状加重请及时咨询宠物医生。",
 ]
 
 
 async def mock_stream(message: str, pet_name: str = "") -> AsyncIterator[str]:
-    """mock 模式：按 2-4 字符为块逐段输出，模拟打字机效果的可爱回复
+    """mock 模式：按 2-4 字符为块逐段输出，模拟打字机效果的咨询回复
 
     :param message: 用户消息（仅用来做简单分流，让不同输入得到不同回复）
     :param pet_name: 宠物名字，会嵌入回复内容中
     """
-    name = (pet_name or "").strip() or "小宠物"
+    name = (pet_name or "").strip() or "你的宠物"
     # 依据消息长度取模挑选回复：同一输入稳定复现，不同输入有差异
     reply = _MOCK_REPLIES[len(message.strip()) % len(_MOCK_REPLIES)].format(name=name)
 

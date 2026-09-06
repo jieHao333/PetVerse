@@ -9,13 +9,13 @@ from pydantic import BaseModel, Field
 
 
 class PetInfo(BaseModel):
-    """宠物信息（对话人设输入）
+    """宠物信息（咨询上下文输入）
 
     字段全部可选容错：前端少传 / 漏传任何字段都不影响对话主流程，
-    人设构建时会用默认值兜底。
+    咨询上下文构建时会省略缺失的档案行。
     """
 
-    id: Optional[int] = None          # 宠物 ID（Redis 历史 key 的一部分）
+    id: Optional[int] = None          # 宠物 ID（会话按用户 + 宠物隔离的依据）
     name: Optional[str] = None        # 宠物名字
     species: Optional[str] = None     # 物种（猫 / 狗 / ...）
     breed: Optional[str] = None       # 品种
@@ -29,7 +29,24 @@ class ChatRequest(BaseModel):
     """POST /ai/chat/stream 请求体"""
 
     message: str = Field(..., description="用户本轮输入的消息")
-    pet: PetInfo = Field(default_factory=PetInfo, description="当前对话的宠物信息（缺省时用兜底人设）")
+    pet: PetInfo = Field(default_factory=PetInfo, description="当前咨询的宠物信息（缺省时不拼宠物档案）")
+    sessionId: Optional[int] = Field(default=None, description="会话 ID；缺省时后端自动新建会话并通过 meta 事件回传")
+
+
+class SessionItem(BaseModel):
+    """单个会话条目"""
+
+    id: int                    # 会话 ID
+    title: str                 # 会话标题
+    createTime: int = 0        # 创建时间（秒级时间戳）
+    updateTime: int = 0        # 最近活跃时间（秒级时间戳）
+
+
+class SessionListData(BaseModel):
+    """GET /ai/chat/sessions 返回的 data 结构"""
+
+    petId: int
+    sessions: List[SessionItem] = []
 
 
 class HistoryMessage(BaseModel):
@@ -43,7 +60,7 @@ class HistoryMessage(BaseModel):
 class HistoryData(BaseModel):
     """GET /ai/chat/history 返回的 data 结构"""
 
-    petId: int
+    sessionId: int
     messages: List[HistoryMessage] = []
 
 

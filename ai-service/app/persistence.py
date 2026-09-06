@@ -1,15 +1,18 @@
-"""MySQL 对话消息持久化（aiomysql 连接池）
+"""MySQL 会话与对话消息持久化（aiomysql 连接池）
 
-存储表：petverse_ai.chat_message
-  id BIGINT AUTO_INCREMENT / user_id / pet_id / role / content / create_time
+存储表：
+  - petverse_ai.chat_session：会话表（user_id + pet_id 隔离，一只宠物可建多个会话）
+  - petverse_ai.chat_message：消息表（session_id 关联会话）
 
 设计要点：
-  1. Redis 仍是 LLM 短窗口上下文缓存（滚动 N 条 + TTL），MySQL 才是持久层，
+  1. Redis 仍是 LLM 短窗口上下文缓存（按会话滚动 N 条 + TTL），MySQL 才是持久层，
      GET /chat/history 从 MySQL 读取，服务重启 / Redis 过期都不丢历史；
-  2. 所有对外方法均做异常降级：MySQL 故障时绝不让对话主流程报错，
+  2. 会话管理方法（create/list/delete_session、get_session）失败时抛出异常，
+     由路由层转换为业务错误响应——会话是对话的前提，不允许静默降级；
+  3. 消息读写方法均做异常降级：MySQL 故障时绝不让对话主流程报错，
      save_* 静默失败仅记日志，read_history 返回空列表；
-  3. save_turn_if_exists 用于流式对话客户端中途断开的兜底保存——
-     若用户此刻已「清空对话」（表中该 user_id/pet_id 无行），跳过写入避免复活历史，
+  4. save_turn_if_exists 用于流式对话客户端中途断开的兜底保存——
+     若用户此刻已删除该会话（表中该 session_id 无行），跳过写入避免复活历史，
      与 memory.append_if_exists 的 Redis Lua 原子语义保持一致。
 """
 import logging
@@ -20,6 +23,9 @@ import aiomysql
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# 会话标题最大长度（与 chat_session.title VARCHAR(64) 对齐）
+TITLE_MAX_LEN = 30
 
 # 连接池单例（由 main.py 的 lifespan 在启动 / 停机时初始化与关闭）
 _pool: Optional[aiomysql.Pool] = None
@@ -49,7 +55,7 @@ async def init() -> None:
                     settings.MYSQL_USER, settings.MYSQL_HOST,
                     settings.MYSQL_PORT, settings.MYSQL_DB)
     except Exception:
-        logger.warning("MySQL 连接池初始化失败，对话持久化将降级（不影响对话主流程）", exc_info=True)
+        logger.warning("MySQL 连接池初始化失败，会话与对话持久化将不可用", exc_info=True)
         _pool = None
 
 
@@ -65,23 +71,95 @@ async def close() -> None:
         _pool = None
 
 
-async def save_turn(user_id: int, pet_id: int, user_msg: str, reply: str) -> None:
+# ---------- 会话管理（失败抛异常，由路由层统一转业务错误） ----------
+
+async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
+    """为指定宠物创建一个新会话，返回自增会话 ID
+
+    title 为空时使用默认标题「新会话」；首轮对话落库时会自动
+    用首条用户消息刷新标题（见 save_turn 的自动命名逻辑）。
+    """
+    if _pool is None:
+        raise RuntimeError("MySQL 未就绪，无法创建会话")
+    clean_title = (title or "").strip()[:TITLE_MAX_LEN] or "新会话"
+    sql = ("INSERT INTO chat_session (user_id, pet_id, title) VALUES (%s, %s, %s)")
+    async with _pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (user_id, pet_id, clean_title))
+            return cur.lastrowid
+
+
+async def list_sessions(user_id: int, pet_id: int) -> List[dict]:
+    """查询指定宠物的全部会话（最近活跃在前）"""
+    if _pool is None:
+        raise RuntimeError("MySQL 未就绪，无法查询会话列表")
+    sql = ("SELECT id, title, UNIX_TIMESTAMP(create_time), UNIX_TIMESTAMP(update_time) "
+           "FROM chat_session WHERE user_id=%s AND pet_id=%s "
+           "ORDER BY update_time DESC, id DESC")
+    async with _pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (user_id, pet_id))
+            rows = await cur.fetchall()
+    return [{"id": r[0], "title": r[1], "createTime": int(r[2]), "updateTime": int(r[3])}
+            for r in rows]
+
+
+async def get_session(user_id: int, session_id: int) -> Optional[dict]:
+    """按 ID 查询会话（仅限本人），不存在返回 None
+
+    对话前用它做归属校验，防止跨用户 / 跨宠物串会话。
+    """
+    if _pool is None:
+        raise RuntimeError("MySQL 未就绪，无法查询会话")
+    sql = "SELECT id, pet_id, title FROM chat_session WHERE id=%s AND user_id=%s"
+    async with _pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (session_id, user_id))
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "petId": row[1], "title": row[2]}
+
+
+async def delete_session(user_id: int, session_id: int) -> None:
+    """删除会话及其全部消息（仅限本人）；单条 DELETE 失败仅记日志"""
+    if _pool is None:
+        raise RuntimeError("MySQL 未就绪，无法删除会话")
+    async with _pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM chat_message WHERE session_id=%s AND user_id=%s",
+                (session_id, user_id))
+            await cur.execute(
+                "DELETE FROM chat_session WHERE id=%s AND user_id=%s",
+                (session_id, user_id))
+
+
+# ---------- 消息读写（异常降级，不影响对话主流程） ----------
+
+async def save_turn(user_id: int, pet_id: int, session_id: int,
+                    user_msg: str, reply: str) -> None:
     """持久化一轮对话（用户消息 + 助手回复）到 MySQL
 
-    一次事务写入两条，保证顺序与原子性；任何异常仅记日志，不影响对话主流程。
+    一次事务写入两条，保证顺序与原子性；若会话标题仍是默认「新会话」，
+    顺带用首条用户消息自动命名会话；任何异常仅记日志，不影响对话主流程。
     """
     if _pool is None:
         return
-    sql = ("INSERT INTO chat_message (user_id, pet_id, role, content, create_time) "
-           "VALUES (%s, %s, %s, %s, NOW())")
+    sql = ("INSERT INTO chat_message (user_id, pet_id, session_id, role, content, create_time) "
+           "VALUES (%s, %s, %s, %s, %s, NOW())")
+    title_sql = ("UPDATE chat_session SET title=%s WHERE id=%s AND user_id=%s AND title='新会话'")
     try:
         async with _pool.acquire() as conn:
             async with conn.cursor() as cur:
                 # 关闭 autocommit 后用事务写入，确保两条消息要么都成功要么都失败
                 await conn.begin()
                 try:
-                    await cur.execute(sql, (user_id, pet_id, "user", user_msg))
-                    await cur.execute(sql, (user_id, pet_id, "assistant", reply))
+                    await cur.execute(sql, (user_id, pet_id, session_id, "user", user_msg))
+                    await cur.execute(sql, (user_id, pet_id, session_id, "assistant", reply))
+                    # 首轮对话自动命名会话（截断为 TITLE_MAX_LEN 字符）
+                    await cur.execute(title_sql,
+                                      (user_msg.strip()[:TITLE_MAX_LEN], session_id, user_id))
                     await conn.commit()
                 except Exception:
                     await conn.rollback()
@@ -90,29 +168,30 @@ async def save_turn(user_id: int, pet_id: int, user_msg: str, reply: str) -> Non
         logger.warning("写入 MySQL 对话历史失败（不影响本次对话）", exc_info=True)
 
 
-async def save_turn_if_exists(user_id: int, pet_id: int, user_msg: str, reply: str) -> None:
-    """条件持久化一轮对话：仅当 (user_id, pet_id) 已有历史行时才写入
+async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
+                              user_msg: str, reply: str) -> None:
+    """条件持久化一轮对话：仅当该会话已有历史消息时才写入
 
     语义与 memory.append_if_exists 对齐：客户端中途断开的兜底保存走这里，
-    若用户此刻已「清空对话」（表中该组合无行），跳过写入避免把刚删掉的历史复活。
+    若用户此刻已删除该会话（表中该会话无消息行），跳过写入避免把刚删掉的历史复活。
     任何异常仅记日志，不影响对话主流程。
     """
     if _pool is None:
         return
-    exists_sql = "SELECT 1 FROM chat_message WHERE user_id=%s AND pet_id=%s LIMIT 1"
-    insert_sql = ("INSERT INTO chat_message (user_id, pet_id, role, content, create_time) "
-                  "VALUES (%s, %s, %s, %s, NOW())")
+    exists_sql = ("SELECT 1 FROM chat_message WHERE user_id=%s AND session_id=%s LIMIT 1")
+    insert_sql = ("INSERT INTO chat_message (user_id, pet_id, session_id, role, content, create_time) "
+                  "VALUES (%s, %s, %s, %s, %s, NOW())")
     try:
         async with _pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(exists_sql, (user_id, pet_id))
+                await cur.execute(exists_sql, (user_id, session_id))
                 if await cur.fetchone() is None:
-                    # 已被清空：跳过写入，避免复活历史
+                    # 会话已被删除：跳过写入，避免复活历史
                     return
                 await conn.begin()
                 try:
-                    await cur.execute(insert_sql, (user_id, pet_id, "user", user_msg))
-                    await cur.execute(insert_sql, (user_id, pet_id, "assistant", reply))
+                    await cur.execute(insert_sql, (user_id, pet_id, session_id, "user", user_msg))
+                    await cur.execute(insert_sql, (user_id, pet_id, session_id, "assistant", reply))
                     await conn.commit()
                 except Exception:
                     await conn.rollback()
@@ -121,8 +200,8 @@ async def save_turn_if_exists(user_id: int, pet_id: int, user_msg: str, reply: s
         logger.warning("条件写入 MySQL 对话历史失败（不影响本次对话）", exc_info=True)
 
 
-async def read_history(user_id: int, pet_id: int, limit: Optional[int] = None) -> List[dict]:
-    """读取指定宠物的对话历史（时间正序：旧 → 新）
+async def read_history(user_id: int, session_id: int, limit: Optional[int] = None) -> List[dict]:
+    """读取指定会话的对话历史（时间正序：旧 → 新）
 
     - limit=None：返回全部历史（GET /chat/history 场景，前端展示完整对话）；
     - limit=N：仅返回最近 N 条（LLM 上下文回落场景，Redis 缺失时用 MySQL 补齐）。
@@ -135,13 +214,13 @@ async def read_history(user_id: int, pet_id: int, limit: Optional[int] = None) -
     if limit is not None and limit > 0:
         sql = ("SELECT role, content, UNIX_TIMESTAMP(create_time) AS ts FROM ("
                "  SELECT id, role, content, create_time FROM chat_message "
-               "  WHERE user_id=%s AND pet_id=%s ORDER BY create_time DESC, id DESC LIMIT %s"
+               "  WHERE user_id=%s AND session_id=%s ORDER BY create_time DESC, id DESC LIMIT %s"
                ") t ORDER BY create_time ASC, id ASC")
-        params = (user_id, pet_id, limit)
+        params = (user_id, session_id, limit)
     else:
         sql = ("SELECT role, content, UNIX_TIMESTAMP(create_time) AS ts FROM chat_message "
-               "WHERE user_id=%s AND pet_id=%s ORDER BY create_time ASC, id ASC")
-        params = (user_id, pet_id)
+               "WHERE user_id=%s AND session_id=%s ORDER BY create_time ASC, id ASC")
+        params = (user_id, session_id)
     try:
         async with _pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -151,16 +230,3 @@ async def read_history(user_id: int, pet_id: int, limit: Optional[int] = None) -
     except Exception:
         logger.warning("读取 MySQL 对话历史失败，降级为空历史", exc_info=True)
         return []
-
-
-async def clear_history(user_id: int, pet_id: int) -> None:
-    """清空指定宠物的所有对话消息；任何异常仅记日志"""
-    if _pool is None:
-        return
-    sql = "DELETE FROM chat_message WHERE user_id=%s AND pet_id=%s"
-    try:
-        async with _pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, (user_id, pet_id))
-    except Exception:
-        logger.warning("清空 MySQL 对话历史失败（忽略）", exc_info=True)

@@ -1,14 +1,20 @@
 """对话路由（APIRouter prefix="/ai"）
 
 网关 StripPrefix=1：前端请求 /api/ai/chat/stream，本服务实际收到 /ai/chat/stream。
-三个接口：
-  1. POST   /ai/chat/stream   SSE 流式对话
-  2. GET    /ai/chat/history  查询对话历史（时间正序：旧 → 新）
-  3. DELETE /ai/chat/history  清空对话记忆
+
+会话模型：对话按「用户 + 宠物 + 会话」三级隔离——
+一只宠物可拥有多个会话；切换宠物 / 新建对话均进入待创建态，会话在用户发出首条消息时才落库
+（避免频繁切换堆积空会话），历史会话可手动选择恢复；会话支持删除。
+
+接口一览：
+  1. POST   /ai/chat/stream             SSE 流式对话（sessionId 缺省时自动建会话，首帧 meta 回传）
+  2. GET    /ai/chat/history            查询指定会话的对话历史（时间正序：旧 → 新）
+  3. GET    /ai/chat/sessions           查询指定宠物的会话列表（最近活跃在前）
+  4. DELETE /ai/chat/sessions/{sid}     删除会话（连带消息与 Redis 缓存）
 
 存储分层：
-  - Redis（memory.py）：LLM 短窗口上下文缓存，滚动保留最近 N 条 + TTL，追求写入延迟；
-  - MySQL（persistence.py）：对话消息持久层，服务重启 / Redis 过期都不丢历史；
+  - Redis（memory.py）：LLM 短窗口上下文缓存（按会话隔离），滚动保留最近 N 条 + TTL，追求写入延迟；
+  - MySQL（persistence.py）：会话与消息持久层，服务重启 / Redis 过期都不丢历史；
   - 写入时两者并行，读取时：GET /chat/history 走 MySQL（持久），
     LLM 上下文优先 Redis，Redis 为空时回落 MySQL 最近 N 条。
 """
@@ -17,12 +23,19 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, Path, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import llm, memory, persistence, persona
 from app.config import settings
-from app.schemas import ChatRequest, HistoryData, PetInfo, fail, ok
+from app.schemas import (
+    ChatRequest,
+    HistoryData,
+    PetInfo,
+    SessionListData,
+    fail,
+    ok,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +67,29 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
     return user_id if user_id > 0 else None
 
 
+async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int], Optional[JSONResponse]]:
+    """解析本轮对话使用的会话 ID
+
+    返回 (session_id, None) 表示解析成功；(None, response) 表示失败，直接返回业务错误：
+    - 请求带 sessionId：校验会话存在且属于当前用户（防止跨用户 / 跨宠物串会话）；
+    - 请求不带 sessionId：按 pet.id 自动新建会话（切换宠物后首次发消息即落入新会话）；
+    - 会话创建 / 校验依赖 MySQL，故障时返回「稍后再试」错误。
+    """
+    pet: PetInfo = req.pet if req.pet is not None else PetInfo()
+    pet_id = pet.id if pet.id is not None else 0
+    try:
+        if req.sessionId is not None:
+            session = await persistence.get_session(user_id, req.sessionId)
+            if session is None:
+                return None, JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
+            return session["id"], None
+        session_id = await persistence.create_session(user_id, pet_id)
+        return session_id, None
+    except Exception:
+        logger.warning("解析对话会话失败: user_id=%s sessionId=%s", user_id, req.sessionId, exc_info=True)
+        return None, JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+
+
 async def _pump(stream, queue: asyncio.Queue) -> None:
     """生产者协程：消费 LLM / mock 流，把片段与结束信号统一搬进队列
 
@@ -68,11 +104,9 @@ async def _pump(stream, queue: asyncio.Queue) -> None:
         await queue.put(("error", exc))
 
 
-async def _stream_generator(req: ChatRequest, user_id: int):
+async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet_id: int):
     """SSE 流式对话生成器（核心逻辑）"""
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
-    # 宠物 ID 缺失时用 0 兜底（历史将落在 petId=0 的 key 上）
-    pet_id = pet.id if pet.id is not None else 0
 
     # 1. 并发闸：超时拿不到信号量说明服务过载
     try:
@@ -81,17 +115,20 @@ async def _stream_generator(req: ChatRequest, user_id: int):
         yield _sse({"type": "error", "msg": _ERROR_MSG})
         return
 
+    # 2. 首帧回传会话元信息：前端据此绑定 sessionId（自动新建会话场景）并刷新会话列表
+    yield _sse({"type": "meta", "sessionId": session_id})
+
     collected = []          # 已累计的回复片段
     appended = False        # 本轮对话是否已成功写入历史（防止取消分支重复兜底写入）
     producer: Optional[asyncio.Task] = None
     try:
-        # 2. 组装 LLM 消息：人设 + 历史上下文 + 本轮用户输入
+        # 3. 组装 LLM 消息：养宠顾问上下文 + 本会话历史 + 本轮用户输入
         # 上下文来源：优先 Redis（短窗口快），Redis 为空时回落 MySQL 最近 N 条
         # （服务重启、Redis TTL 过期、Redis 被清空等场景下仍能拿到历史）
-        history = await memory.read(user_id, pet_id)
+        history = await memory.read(user_id, session_id)
         if not history:
             history = await persistence.read_history(
-                user_id, pet_id, limit=settings.HISTORY_MAX_MESSAGES)
+                user_id, session_id, limit=settings.HISTORY_MAX_MESSAGES)
         messages = [{"role": "system", "content": persona.build_system_prompt(pet)}]
         for item in history:
             role, content = item.get("role"), item.get("content")
@@ -99,13 +136,13 @@ async def _stream_generator(req: ChatRequest, user_id: int):
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": req.message})
 
-        # 3. 按模式选择数据源：mock 流或真实 DeepSeek 流
+        # 4. 按模式选择数据源：mock 流或真实 DeepSeek 流
         if settings.is_mock:
             stream = llm.mock_stream(req.message, pet.name or "")
         else:
             stream = llm.stream_chat(messages)
 
-        # 4. 生产者-消费者消费流：消费端带 15 秒心跳超时
+        # 5. 生产者-消费者消费流：消费端带 15 秒心跳超时
         queue: asyncio.Queue = asyncio.Queue()
         producer = asyncio.create_task(_pump(stream, queue))
         while True:
@@ -125,14 +162,14 @@ async def _stream_generator(req: ChatRequest, user_id: int):
             collected.append(payload)
             yield _sse({"type": "delta", "content": payload})
 
-        # 5. 流正常结束：Redis + MySQL 并行写入，随后发出 done
+        # 6. 流正常结束：Redis + MySQL 并行写入，随后发出 done
         # 两者均为 best-effort（内部已捕获异常仅记日志），任何一个失败都不影响另一个；
         # 写入完成后才置 appended=True，避免取消分支重复兜底保存。
         reply = "".join(collected)
         if reply.strip():
             await asyncio.gather(
-                memory.append(user_id, pet_id, req.message, reply),
-                persistence.save_turn(user_id, pet_id, req.message, reply),
+                memory.append(user_id, session_id, req.message, reply),
+                persistence.save_turn(user_id, pet_id, session_id, req.message, reply),
             )
             appended = True   # 已成功写入：后续若被取消，兜底分支不再重复保存
         yield _sse({"type": "done"})
@@ -140,9 +177,9 @@ async def _stream_generator(req: ChatRequest, user_id: int):
         # 客户端中途断开：把已累计的部分回复写入历史后安静退出
         #
         # 竞态说明：
-        # 1) 若用户此刻已「清空对话」（Redis key 被 DELETE / MySQL 行被 DELETE），
+        # 1) 若用户此刻已删除会话（Redis key 被 DELETE / MySQL 行被 DELETE），
         #    无条件写入会把刚删掉的历史“复活”，故 Redis 用 append_if_exists、MySQL 用 save_turn_if_exists，
-        #    两者均在不存时原子跳过，不复活已清空的记忆；
+        #    两者均在不存时原子跳过，不复活已删除的记忆；
         # 2) 若正常路径的写入已成功执行（appended=True），此处再写一次会造成双写，
         #    因此仅在本轮尚未成功写入时才做兜底保存；
         # 3) 取消路径中裸 await 可能再次被取消导致写入中途夭折，用 shield 包住保证写入落地。
@@ -150,8 +187,8 @@ async def _stream_generator(req: ChatRequest, user_id: int):
             if collected and not appended:
                 partial = "".join(collected)
                 await asyncio.shield(asyncio.gather(
-                    memory.append_if_exists(user_id, pet_id, req.message, partial),
-                    persistence.save_turn_if_exists(user_id, pet_id, req.message, partial),
+                    memory.append_if_exists(user_id, session_id, req.message, partial),
+                    persistence.save_turn_if_exists(user_id, pet_id, session_id, req.message, partial),
                 ))
         except BaseException:
             pass
@@ -175,7 +212,8 @@ async def chat_stream(
 
     - 网关注入的 X-User-Id 缺失 / 非法：HTTP 200 + {"code":401,"msg":"未登录"}
     - 消息为空或纯空白：HTTP 200 + {"code":400,"msg":"参数错误"}
-    - 正常：text/event-stream 流，delta * n → done（异常时发 error 后结束）
+    - sessionId 非法 / 不属于当前用户：HTTP 200 + {"code":404,"msg":"会话不存在或已删除"}
+    - 正常：text/event-stream 流，meta → delta * n → done（异常时发 error 后结束）
     """
     # 1. 登录校验（网关统一鉴权后注入 X-User-Id）
     user_id = _parse_user_id(x_user_id)
@@ -186,9 +224,16 @@ async def chat_stream(
     if not req.message or not req.message.strip():
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
 
-    # 3. 返回 SSE 流式响应
+    # 3. 会话解析：校验已有会话归属，或按宠物自动新建会话
+    pet: PetInfo = req.pet if req.pet is not None else PetInfo()
+    pet_id = pet.id if pet.id is not None else 0
+    session_id, err = await _resolve_session(user_id, req)
+    if err is not None:
+        return err
+
+    # 4. 返回 SSE 流式响应
     return StreamingResponse(
-        _stream_generator(req, user_id),
+        _stream_generator(req, user_id, session_id, pet_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",        # 禁止各级缓存
@@ -200,40 +245,74 @@ async def chat_stream(
 
 @router.get("/chat/history")
 async def get_history(
-    petId: Optional[int] = Query(default=None),
+    sessionId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询指定宠物的对话历史（时间正序：旧 → 新）
+    """查询指定会话的对话历史（时间正序：旧 → 新）
 
     从 MySQL 读取持久化的完整历史（服务重启、Redis TTL 过期都不丢）；
-    MySQL 异常时内部已降级为 []，前端看到空历史不会报错。
+    查询前校验会话归属，防止越权读取他人会话；
+    MySQL 读取异常时内部已降级为 []，前端看到空历史不会报错。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
-    if petId is None:
+    if sessionId is None:
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
+    try:
+        session = await persistence.get_session(user_id, sessionId)
+    except Exception:
+        logger.warning("查询会话归属失败: user_id=%s sessionId=%s", user_id, sessionId, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    if session is None:
+        return JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
 
-    messages = await persistence.read_history(user_id, petId)
-    data = HistoryData(petId=petId, messages=messages).model_dump()
+    messages = await persistence.read_history(user_id, sessionId)
+    data = HistoryData(sessionId=sessionId, messages=messages).model_dump()
     return JSONResponse(status_code=200, content=ok(data))
 
 
-@router.delete("/chat/history")
-async def clear_history(
+@router.get("/chat/sessions")
+async def list_sessions(
     petId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """清空指定宠物的对话记忆（Redis + MySQL 同步删除）"""
+    """查询指定宠物的会话列表（最近活跃在前）"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
     if petId is None:
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
+    try:
+        sessions = await persistence.list_sessions(user_id, petId)
+    except Exception:
+        logger.warning("查询会话列表失败: user_id=%s petId=%s", user_id, petId, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    data = SessionListData(petId=petId, sessions=sessions).model_dump()
+    return JSONResponse(status_code=200, content=ok(data))
 
-    # 并行删除：Redis 上下文缓存 + MySQL 持久层；两者异常均已内部降级仅记日志
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_session(
+    session_id: int = Path(...),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """删除会话：连带删除会话下全部消息（MySQL）与上下文缓存（Redis）"""
+    user_id = _parse_user_id(x_user_id)
+    if user_id is None:
+        return JSONResponse(status_code=200, content=fail(401, "未登录"))
+    # 归属校验：仅允许删除本人会话
+    try:
+        session = await persistence.get_session(user_id, session_id)
+    except Exception:
+        logger.warning("查询会话归属失败: user_id=%s sessionId=%s", user_id, session_id, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    if session is None:
+        return JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
+
+    # 并行删除：Redis 上下文缓存 + MySQL 会话与消息；Redis 异常已内部降级仅记日志
     await asyncio.gather(
-        memory.clear(user_id, petId),
-        persistence.clear_history(user_id, petId),
+        memory.clear(user_id, session_id),
+        persistence.delete_session(user_id, session_id),
     )
     return JSONResponse(status_code=200, content=ok(None))
