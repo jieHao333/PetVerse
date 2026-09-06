@@ -17,6 +17,12 @@ public class PetVO implements Serializable {
     /** 宠物ID */
     private Long id;
 
+    /** 类型 REAL-真实 VIRTUAL-虚拟 */
+    private String type;
+
+    /** 类型中文名（真实宠物/虚拟宠物） */
+    private String typeName;
+
     /** 宠物名称 */
     private String name;
 
@@ -53,8 +59,20 @@ public class PetVO implements Serializable {
     /** 最近签到日期 */
     private LocalDate lastSignDate;
 
-    /** 是否当前出场宠物 */
-    private Boolean active;
+    /** 性别编码 1-弟弟 2-妹妹（真实宠物） */
+    private Integer gender;
+
+    /** 性别中文名（弟弟/妹妹） */
+    private String genderName;
+
+    /** 生日（真实宠物） */
+    private LocalDate birthday;
+
+    /** 是否绝育（真实宠物） */
+    private Boolean sterilized;
+
+    /** 收养时间（真实宠物） */
+    private LocalDate adoptionDate;
 
     /** 创建时间 */
     private LocalDateTime createTime;

@@ -3,6 +3,7 @@ uvicorn[standard]>=0.32
 langchain>=0.3
 langchain-openai>=0.2
 redis>=5.0,<6  # 本机 Redis 5.0 不支持 RESP3 协议，redis-py 8.x 默认 HELLO 握手会失败，锁定 5.x 系列
+aiomysql>=0.2  # 异步 MySQL 驱动，用于对话消息持久化存储
 pydantic-settings>=2.6
 nacos-sdk-python==1.0.0
 httpx>=0.27

@@ -4,9 +4,10 @@ import com.baomidou.mybatisplus.extension.service.IService;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
+import com.my.petverse.common.dto.pet.PetProfileUpdateDTO;
+import com.my.petverse.common.dto.pet.PetRegisterDTO;
 import com.my.petverse.common.dto.pet.PetRenameDTO;
 import com.my.petverse.common.dto.pet.PetSaveDTO;
-import com.my.petverse.common.dto.pet.PetSetActiveDTO;
 import com.my.petverse.common.dto.pet.PetSignInDTO;
 import com.my.petverse.common.dto.pet.PetUpdateDTO;
 import com.my.petverse.common.entity.pet.Pet;
@@ -37,27 +38,30 @@ public interface PetService extends IService<Pet> {
     /** 修改宠物 */
     boolean updatePet(PetUpdateDTO dto);
 
-    /** 删除宠物 */
-    boolean deletePet(Long id);
+    /** 删除宠物，仅允许删除本人宠物 */
+    boolean deletePet(Long petId, Long userId);
 
-    /** 查询当前用户的出场宠物 */
+    /** 查询当前用户的代表宠物：优先第一只虚拟宠物，无则第一只真实宠物 */
     PetVO getMyPet(Long userId);
 
     /** 查询当前用户的全部宠物 */
     List<PetVO> listMyPets(Long userId);
 
-    /** 设置出场宠物 */
-    PetVO setActivePet(PetSetActiveDTO dto);
-
-    /** 领取宠物（随机抽取或自选），支持领养多只 */
+    /** 领取虚拟宠物（随机抽取或自选），支持领养多只 */
     PetVO claimPet(PetClaimDTO dto);
+
+    /** 登记真实宠物（名称 + 收养时间） */
+    PetVO registerPet(PetRegisterDTO dto);
+
+    /** 完善真实宠物档案（种类/性别/生日/绝育） */
+    PetVO updatePetProfile(PetProfileUpdateDTO dto);
 
     /** 修改宠物名称 */
     PetVO renamePet(PetRenameDTO dto);
 
-    /** 每日签到，为用户所有宠物发放经验 */
+    /** 每日签到，为用户所有虚拟宠物发放经验 */
     PetSignInVO signIn(PetSignInDTO dto);
 
-    /** 按来源为出场宠物发放经验值（如发布动态），用户无宠物时返回 null */
+    /** 按来源为用户所有虚拟宠物发放经验值（如发布动态），无虚拟宠物时返回 null */
     PetExpGainVO grantExp(PetExpGrantDTO dto);
 }

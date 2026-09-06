@@ -17,7 +17,7 @@ import org.springframework.stereotype.Component;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 动态发布事件消费者：异步为发布人的出场宠物发放经验奖励。
+ * 动态发布事件消费者：异步为发布人的虚拟宠物发放经验奖励。
  * 替代原 space-service 事务内同步 Feign 调用，解耦发布主流程；
  * 消费失败（如 pet-service 瞬时异常）由 RocketMQ 自动重试，按动态ID去重保证不重复发放
  */
@@ -56,7 +56,7 @@ public class SpaceExpConsumer implements RocketMQListener<MessageExt> {
             PetExpGrantDTO dto = new PetExpGrantDTO();
             dto.setUserId(msg.getUserId());
             dto.setSource(PetExpSource.NOTE.name());
-            // 用户无出场宠物时返回 null，属正常情况
+            // 用户无虚拟宠物时返回 null，属正常情况
             petService.grantExp(dto);
         } catch (Exception e) {
             // 释放去重键并抛出异常，交由 RocketMQ 重试，避免重试消息被去重器拦截

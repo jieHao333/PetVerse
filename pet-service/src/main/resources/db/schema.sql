@@ -1,14 +1,22 @@
 -- petverse_pet 数据库初始化脚本
--- 存量库多宠物改造迁移脚本（仅需执行一次）：
+-- 存量库迁移脚本（仅需执行一次）：
+-- 1) 多宠物改造：
 -- ALTER TABLE pet DROP INDEX uk_user_id;
 -- ALTER TABLE pet ADD INDEX idx_user_id (user_id);
--- ALTER TABLE pet ADD COLUMN active TINYINT DEFAULT 0 COMMENT '是否出场 0-否 1-是' AFTER sign_streak;
--- UPDATE pet SET active = 1 WHERE deleted = 0;
+-- 2) 宠物分类（真实/虚拟）与真实档案字段，并移除出场机制：
+-- ALTER TABLE pet ADD COLUMN type VARCHAR(10) DEFAULT 'VIRTUAL' COMMENT '类型 REAL-真实 VIRTUAL-虚拟' AFTER user_id;
+-- ALTER TABLE pet ADD COLUMN adoption_date DATE DEFAULT NULL COMMENT '收养时间(真实宠物)' AFTER sign_streak;
+-- ALTER TABLE pet ADD COLUMN gender TINYINT DEFAULT NULL COMMENT '性别 1-弟弟 2-妹妹(真实宠物)' AFTER adoption_date;
+-- ALTER TABLE pet ADD COLUMN birthday DATE DEFAULT NULL COMMENT '生日(真实宠物)' AFTER gender;
+-- ALTER TABLE pet ADD COLUMN sterilized TINYINT DEFAULT 0 COMMENT '是否绝育 0-否 1-是(真实宠物)' AFTER birthday;
+-- UPDATE pet SET type = 'VIRTUAL' WHERE type IS NULL;
+-- ALTER TABLE pet DROP COLUMN active;
 
 CREATE TABLE IF NOT EXISTS pet
 (
     id             BIGINT       NOT NULL COMMENT '主键(雪花ID)',
     user_id        BIGINT       NOT NULL COMMENT '所属用户ID',
+    type           VARCHAR(10)  DEFAULT 'VIRTUAL' COMMENT '类型 REAL-真实 VIRTUAL-虚拟',
     name           VARCHAR(50)  NOT NULL COMMENT '宠物名称',
     species        VARCHAR(50)  DEFAULT NULL COMMENT '物种',
     breed          VARCHAR(50)  DEFAULT NULL COMMENT '品种',
@@ -19,7 +27,10 @@ CREATE TABLE IF NOT EXISTS pet
     exp            BIGINT       DEFAULT 0 COMMENT '当前等级经验值',
     last_sign_date DATE         DEFAULT NULL COMMENT '最近签到日期',
     sign_streak    INT          DEFAULT 0 COMMENT '连续签到天数',
-    active         TINYINT      DEFAULT 0 COMMENT '是否出场 0-否 1-是',
+    adoption_date  DATE         DEFAULT NULL COMMENT '收养时间(真实宠物)',
+    gender         TINYINT      DEFAULT NULL COMMENT '性别 1-弟弟 2-妹妹(真实宠物)',
+    birthday       DATE         DEFAULT NULL COMMENT '生日(真实宠物)',
+    sterilized     TINYINT      DEFAULT 0 COMMENT '是否绝育 0-否 1-是(真实宠物)',
     create_time    DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time    DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted        TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',

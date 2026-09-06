@@ -4,9 +4,10 @@ import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
+import com.my.petverse.common.dto.pet.PetProfileUpdateDTO;
+import com.my.petverse.common.dto.pet.PetRegisterDTO;
 import com.my.petverse.common.dto.pet.PetRenameDTO;
 import com.my.petverse.common.dto.pet.PetSaveDTO;
-import com.my.petverse.common.dto.pet.PetSetActiveDTO;
 import com.my.petverse.common.dto.pet.PetSignInDTO;
 import com.my.petverse.common.dto.pet.PetUpdateDTO;
 import com.my.petverse.common.result.PageResult;
@@ -65,7 +66,7 @@ public class PetController {
         return Result.success(petCatalogService.randomCatalog());
     }
 
-    /** 查询出场宠物：不传 userId 时查当前登录用户，传 userId 用于用户主页展示他人宠物 */
+    /** 查询代表宠物（优先虚拟宠物）：不传 userId 时查当前登录用户，传 userId 用于用户主页展示他人宠物 */
     @GetMapping("/me")
     public Result<PetVO> me(@RequestParam(value = "userId", required = false) Long userId) {
         Long targetUserId = userId != null ? userId : UserContext.getUserId();
@@ -78,11 +79,25 @@ public class PetController {
         return Result.success(petService.listMyPets(UserContext.getUserId()));
     }
 
-    /** 领取宠物（随机抽取或自选），支持领养多只，用户ID取自登录令牌 */
+    /** 领取虚拟宠物（随机抽取或自选），支持领养多只，用户ID取自登录令牌 */
     @PostMapping("/claim")
     public Result<PetVO> claim(@RequestBody @Valid PetClaimDTO dto) {
         dto.setUserId(UserContext.getUserId());
         return Result.success(petService.claimPet(dto));
+    }
+
+    /** 登记真实宠物（名称 + 收养时间），用户ID取自登录令牌 */
+    @PostMapping("/register")
+    public Result<PetVO> register(@RequestBody @Valid PetRegisterDTO dto) {
+        dto.setUserId(UserContext.getUserId());
+        return Result.success(petService.registerPet(dto));
+    }
+
+    /** 完善真实宠物档案（种类/性别/生日/绝育），用户ID取自登录令牌 */
+    @PutMapping("/profile")
+    public Result<PetVO> updateProfile(@RequestBody @Valid PetProfileUpdateDTO dto) {
+        dto.setUserId(UserContext.getUserId());
+        return Result.success(petService.updatePetProfile(dto));
     }
 
     /** 修改宠物名称，用户ID取自登录令牌 */
@@ -92,21 +107,14 @@ public class PetController {
         return Result.success(petService.renamePet(dto));
     }
 
-    /** 设置出场宠物，用户ID取自登录令牌 */
-    @PutMapping("/active")
-    public Result<PetVO> setActive(@RequestBody @Valid PetSetActiveDTO dto) {
-        dto.setUserId(UserContext.getUserId());
-        return Result.success(petService.setActivePet(dto));
-    }
-
-    /** 每日签到，为用户所有宠物发放经验值，用户ID取自登录令牌 */
+    /** 每日签到，为用户所有虚拟宠物发放经验值，用户ID取自登录令牌 */
     @PostMapping("/sign-in")
     public Result<PetSignInVO> signIn(@RequestBody @Valid PetSignInDTO dto) {
         dto.setUserId(UserContext.getUserId());
         return Result.success(petService.signIn(dto));
     }
 
-    /** 按来源为出场宠物发放经验值（供其他服务调用，如发布动态奖励） */
+    /** 按来源为用户所有虚拟宠物发放经验值（供动态发布事件消费者调用） */
     @PostMapping("/exp/grant")
     public Result<PetExpGainVO> grantExp(@RequestBody @Valid PetExpGrantDTO dto) {
         return Result.success(petService.grantExp(dto));
@@ -124,9 +132,9 @@ public class PetController {
         return Result.success(petService.updatePet(dto));
     }
 
-    /** 删除宠物 */
+    /** 删除宠物，仅允许删除本人宠物，用户ID取自登录令牌 */
     @DeleteMapping("/{id}")
     public Result<Boolean> delete(@PathVariable("id") Long id) {
-        return Result.success(petService.deletePet(id));
+        return Result.success(petService.deletePet(id, UserContext.getUserId()));
     }
 }

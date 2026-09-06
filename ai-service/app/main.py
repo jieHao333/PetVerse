@@ -1,8 +1,8 @@
 """ai-service 启动入口
 
 FastAPI 实例 + lifespan 生命周期：
-- 启动：初始化 Redis 连接池（redis.asyncio）+ Nacos 注册（同步 SDK 放后台线程，不阻塞事件循环）
-- 停机：Nacos 反注册 + 关闭 Redis 连接池
+- 启动：初始化 Redis 连接池（redis.asyncio）+ MySQL 连接池（aiomysql）+ Nacos 注册（同步 SDK 放后台线程，不阻塞事件循环）
+- 停机：Nacos 反注册 + 关闭 MySQL 连接池 + 关闭 Redis 连接池
 
 服务绑定 127.0.0.1:8086（与 .env 中 AI_SERVICE_IP / AI_SERVICE_PORT 保持一致）。
 """
@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app import memory, nacos_client
+from app import memory, nacos_client, persistence
 from app.chat import router as chat_router
 from app.config import settings
 from app.schemas import fail
@@ -39,6 +39,8 @@ async def lifespan(app: FastAPI):
         )
     # Redis 连接池：创建连接池本身不发网络请求，真正连接在首次命令时惰性建立
     memory.init()
+    # MySQL 连接池：对话消息持久化存储，aiomysql.create_pool 是异步的需 await
+    await persistence.init()
     # Nacos 注册：SDK 是同步库，用 to_thread 丢进后台线程，避免阻塞事件循环
     await asyncio.to_thread(nacos_client.register)
     logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s）",
@@ -47,6 +49,7 @@ async def lifespan(app: FastAPI):
     yield
     # ---------- 停机阶段 ----------
     await asyncio.to_thread(nacos_client.deregister)
+    await persistence.close()
     await memory.close()
     logger.info("ai-service 已停止，资源已释放")
 

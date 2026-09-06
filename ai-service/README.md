@@ -1,13 +1,24 @@
 # PetVerse AI 服务（ai-service）
 
-宠物 AI 伙伴对话微服务：基于 FastAPI 构建，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供宠物拟人化**流式对话（SSE）**、对话历史查询与清空能力。对话由 DeepSeek（OpenAI 兼容 API）驱动，未配置 Key 或开启 `MOCK_CHAT` 时自动切换为内置 mock 回复；多轮对话记忆存储在 Redis（db=3），按 `userId + petId` 隔离。
+宠物 AI 伙伴对话微服务：基于 FastAPI 构建，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供宠物拟人化**流式对话（SSE）**、对话历史查询与清空能力。对话由 DeepSeek（OpenAI 兼容 API）驱动，未配置 Key 或开启 `MOCK_CHAT` 时自动切换为内置 mock 回复；多轮对话采用**双层存储**：Redis（db=3）作为 LLM 短窗口上下文缓存（滚动保留最近 N 条 + TTL），MySQL（`petverse_ai.chat_message`）作为消息持久层（服务重启 / Redis 过期都不丢历史），两者写入时并行、清空时同步删除，历史查询以 MySQL 为准。
 
 ## 环境要求
 
 - Python 3.12（本机使用固定解释器 `C:\Users\37442\python\Python3.12.6\python.exe`）
 - 可访问的 Nacos（默认 `localhost:8848`，server 2.4.3）
 - 可访问的 Redis（默认 `localhost:6379`，密码 `123456`，db=3）
+- 可访问的 MySQL（默认 `localhost:3306`，用户 `root`，密码 `123456`，库 `petverse_ai`）
 - DeepSeek API Key（可选，mock 模式下不需要）
+
+## 初始化数据库
+
+首次使用需创建 `petverse_ai` 库与 `chat_message` 表（对话消息持久化存储）：
+
+```powershell
+mysql -uroot -p123456 < db/schema.sql
+```
+
+或在 MySQL 客户端中直接执行 `db/schema.sql` 内的 SQL。
 
 ## 创建虚拟环境（PowerShell）
 
@@ -41,9 +52,11 @@ cd d:\Java\PetVerse_qiuzhao\PetVerse\ai-service
 | `DEEPSEEK_BASE_URL` | DeepSeek 的 OpenAI 兼容接口地址 |
 | `DEEPSEEK_MODEL` | 对话模型名（默认 `deepseek-chat`） |
 | `MOCK_CHAT` | mock 开关：`true` 时强制使用内置模拟回复，无论是否配置了 Key |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` / `REDIS_DB` | Redis 连接信息（对话记忆存 db=3） |
-| `HISTORY_MAX_MESSAGES` | 每个宠物最多保留的历史消息条数（默认 40，超出裁剪最旧的） |
-| `HISTORY_TTL_SECONDS` | 历史过期时间（默认 604800 秒 = 7 天，每次写入滚动续期） |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` / `REDIS_DB` | Redis 连接信息（对话记忆缓存存 db=3） |
+| `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DB` | MySQL 连接信息（对话消息持久化存储，默认库 `petverse_ai`） |
+| `MYSQL_POOL_MIN` / `MYSQL_POOL_MAX` | aiomysql 连接池最小 / 最大连接数（默认 1 / 10） |
+| `HISTORY_MAX_MESSAGES` | 每个宠物最多保留的历史消息条数（默认 40，仅作用于 Redis LLM 上下文；MySQL 持久层不裁剪） |
+| `HISTORY_TTL_SECONDS` | Redis 历史过期时间（默认 604800 秒 = 7 天，每次写入滚动续期；MySQL 持久层不受此限制） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | LLM 生成参数 |
 
 ### MOCK_CHAT 开关与真实模式切换

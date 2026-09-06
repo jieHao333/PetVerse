@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     REDIS_DB: int = 3                           # 对话记忆专用 db
 
+    # ---------- MySQL（对话消息持久化） ----------
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = "123456"
+    MYSQL_DB: str = "petverse_ai"
+    MYSQL_POOL_MIN: int = 1                     # 连接池最小连接数
+    MYSQL_POOL_MAX: int = 10                    # 连接池最大连接数
+
     # ---------- 对话记忆 ----------
     HISTORY_MAX_MESSAGES: int = 40              # 每个宠物最多保留的历史消息条数
     HISTORY_TTL_SECONDS: int = 604800           # 历史过期时间（默认 7 天）

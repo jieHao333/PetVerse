@@ -9,12 +9,15 @@ import java.time.LocalDate;
 
 /**
  * 用户宠物实体，对应数据库表 pet
- * 一个用户可拥有多只宠物，其中一只为出场宠物，作为社交形象
+ * 一个用户可拥有多只宠物，分真实宠物（用户登记的实际饲养宠物）与虚拟宠物（图鉴抽卡领养）两类
  */
 @Data
 @EqualsAndHashCode(callSuper = true)
 @TableName("pet")
 public class Pet extends BaseEntity {
+
+    /** 类型 REAL-真实 VIRTUAL-虚拟，取值见 PetType */
+    private String type;
 
     /** 宠物名称 */
     private String name;
@@ -49,6 +52,15 @@ public class Pet extends BaseEntity {
     /** 连续签到天数 */
     private Integer signStreak;
 
-    /** 是否出场 0-否 1-是，同一用户仅一只出场 */
-    private Integer active;
+    /** 收养时间（真实宠物） */
+    private LocalDate adoptionDate;
+
+    /** 性别 1-弟弟 2-妹妹（真实宠物），取值见 PetGender */
+    private Integer gender;
+
+    /** 生日（真实宠物） */
+    private LocalDate birthday;
+
+    /** 是否绝育 0-否 1-是（真实宠物） */
+    private Integer sterilized;
 }
