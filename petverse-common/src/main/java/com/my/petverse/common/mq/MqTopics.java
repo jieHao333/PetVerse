@@ -45,4 +45,9 @@ public final class MqTopics {
     public static final String LIKE_CHANGED = "like-changed-topic";
 
     public static final String TAG_LIKE_CHANGED = "changed";
+
+    /** 站内通知事件（评论回复/评价回复/点赞统一驱动通知落库） */
+    public static final String NOTIFY = "notify-topic";
+
+    public static final String TAG_NOTIFY_CREATED = "created";
 }

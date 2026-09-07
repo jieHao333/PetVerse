@@ -5,25 +5,35 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.my.petverse.common.dto.base.BasePageQuery;
 import com.my.petverse.common.dto.shop.ProductReviewPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplyPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplySaveDTO;
 import com.my.petverse.common.dto.shop.ProductReviewSaveDTO;
 import com.my.petverse.common.dto.shop.ProductReviewUpdateDTO;
+import com.my.petverse.common.entity.shop.Merchant;
 import com.my.petverse.common.entity.shop.Product;
 import com.my.petverse.common.entity.shop.ProductReview;
 import com.my.petverse.common.entity.shop.ProductReviewReply;
 import com.my.petverse.common.entity.shop.ShopOrder;
+import com.my.petverse.common.enums.NotificationSource;
+import com.my.petverse.common.enums.NotificationType;
 import com.my.petverse.common.enums.OrderStatus;
+import com.my.petverse.common.enums.ProductCategory;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.mq.MqEventPublisher;
+import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.message.NotifyMessage;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
+import com.my.petverse.common.vo.shop.MyReviewVO;
 import com.my.petverse.common.vo.shop.ProductReviewReplyVO;
 import com.my.petverse.common.vo.shop.ProductReviewSummaryVO;
 import com.my.petverse.common.vo.shop.ProductReviewVO;
 import com.my.petverse.common.vo.user.UserVO;
 import com.my.petverse.shop.feign.UserFeignClient;
+import com.my.petverse.shop.mapper.MerchantMapper;
 import com.my.petverse.shop.mapper.ProductMapper;
 import com.my.petverse.shop.mapper.ProductReviewMapper;
 import com.my.petverse.shop.mapper.ProductReviewReplyMapper;
@@ -61,11 +71,15 @@ public class ProductReviewServiceImpl extends ServiceImpl<ProductReviewMapper, P
 
     private final ProductMapper productMapper;
 
+    private final MerchantMapper merchantMapper;
+
     private final ShopOrderMapper shopOrderMapper;
 
     private final ProductReviewReplyMapper replyMapper;
 
     private final UserFeignClient userFeignClient;
+
+    private final MqEventPublisher mqEventPublisher;
 
     @Override
     public ProductReviewVO saveReview(Long userId, ProductReviewSaveDTO dto) {
@@ -159,6 +173,62 @@ public class ProductReviewServiceImpl extends ServiceImpl<ProductReviewMapper, P
     }
 
     @Override
+    public PageResult<MyReviewVO> pageMyReviews(Long userId, BasePageQuery dto) {
+        Page<ProductReview> page = page(new Page<>(dto.getPageNum(), dto.getPageSize()),
+                new LambdaQueryWrapper<ProductReview>()
+                        .eq(ProductReview::getUserId, userId)
+                        .orderByDesc(ProductReview::getCreateTime));
+        List<ProductReview> reviews = page.getRecords();
+        if (reviews.isEmpty()) {
+            return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), List.of());
+        }
+        // 批量聚合商品信息（商品可能已下架/删除，逻辑删除后查不到，前端降级展示）
+        Set<Long> productIds = reviews.stream().map(ProductReview::getProductId).collect(Collectors.toSet());
+        Map<Long, Product> products = productMapper.selectBatchIds(productIds).stream()
+                .collect(Collectors.toMap(Product::getId, product -> product));
+        // 批量聚合店铺名称
+        Set<Long> merchantIds = reviews.stream().map(ProductReview::getMerchantId)
+                .filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<Long, Merchant> merchants = merchantIds.isEmpty() ? Map.of()
+                : merchantMapper.selectBatchIds(merchantIds).stream()
+                        .collect(Collectors.toMap(Merchant::getId, merchant -> merchant));
+        // 批量统计每条评价的回复互动数（一条 group by SQL，避免逐条 count）
+        Set<Long> reviewIds = reviews.stream().map(ProductReview::getId).collect(Collectors.toSet());
+        Map<Long, Long> replyCounts = replyMapper.selectMaps(new QueryWrapper<ProductReviewReply>()
+                        .select("review_id AS reviewId", "COUNT(*) AS cnt")
+                        .in("review_id", reviewIds)
+                        .groupBy("review_id"))
+                .stream().collect(Collectors.toMap(
+                        row -> Long.valueOf(row.get("reviewId").toString()),
+                        row -> ((Number) row.get("cnt")).longValue()));
+        List<MyReviewVO> vos = reviews.stream().map(review -> {
+            MyReviewVO vo = new MyReviewVO();
+            vo.setReviewId(review.getId());
+            vo.setProductId(review.getProductId());
+            Product product = products.get(review.getProductId());
+            if (product != null) {
+                vo.setProductName(product.getName());
+                vo.setProductImage(product.getImageUrl());
+                vo.setCategory(product.getCategory());
+                ProductCategory category = ProductCategory.of(product.getCategory());
+                vo.setCategoryName(category == null ? null : category.getDesc());
+            }
+            Merchant merchant = review.getMerchantId() == null ? null : merchants.get(review.getMerchantId());
+            vo.setShopName(merchant == null ? null : merchant.getShopName());
+            vo.setRating(review.getRating());
+            vo.setContent(review.getContent());
+            if (StringUtils.hasText(review.getImageUrls())) {
+                vo.setImageUrls(Arrays.asList(review.getImageUrls().split(",")));
+            }
+            vo.setVideoUrl(review.getVideoUrl());
+            vo.setReplyCount(replyCounts.getOrDefault(review.getId(), 0L));
+            vo.setCreateTime(review.getCreateTime());
+            return vo;
+        }).collect(Collectors.toList());
+        return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), vos);
+    }
+
+    @Override
     public ProductReviewSummaryVO getSummary(Long productId, Long userId) {
         // 单条聚合 SQL 同时取总数与平均分，避免加载全量评价
         Map<String, Object> stats = baseMapper.selectMaps(new QueryWrapper<ProductReview>()
@@ -200,6 +270,14 @@ public class ProductReviewServiceImpl extends ServiceImpl<ProductReviewMapper, P
         reply.setReplyUserId(dto.getReplyUserId());
         reply.setContent(dto.getContent());
         replyMapper.insert(reply);
+        // 回复他人评价时通知被回复人（自己回复自己不通知），跳转目标为商品，去重键用回复ID
+        if (dto.getReplyUserId() != null && !dto.getReplyUserId().equals(userId)) {
+            NotifyMessage notify = new NotifyMessage(dto.getReplyUserId(), userId,
+                    NotificationType.REPLY.getCode(), NotificationSource.SHOP_REVIEW.getCode(),
+                    review.getProductId(), dto.getContent());
+            mqEventPublisher.publish(MqTopics.NOTIFY, MqTopics.TAG_NOTIFY_CREATED,
+                    notify, String.valueOf(reply.getId()));
+        }
         // 一次查询同时覆盖回复人与被回复人的昵称头像
         Set<Long> userIds = new HashSet<>();
         userIds.add(userId);

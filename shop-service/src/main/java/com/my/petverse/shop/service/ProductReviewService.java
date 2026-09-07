@@ -1,6 +1,7 @@
 package com.my.petverse.shop.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.my.petverse.common.dto.base.BasePageQuery;
 import com.my.petverse.common.dto.shop.ProductReviewPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplyPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplySaveDTO;
@@ -8,6 +9,7 @@ import com.my.petverse.common.dto.shop.ProductReviewSaveDTO;
 import com.my.petverse.common.dto.shop.ProductReviewUpdateDTO;
 import com.my.petverse.common.entity.shop.ProductReview;
 import com.my.petverse.common.result.PageResult;
+import com.my.petverse.common.vo.shop.MyReviewVO;
 import com.my.petverse.common.vo.shop.ProductReviewReplyVO;
 import com.my.petverse.common.vo.shop.ProductReviewSummaryVO;
 import com.my.petverse.common.vo.shop.ProductReviewVO;
@@ -51,6 +53,15 @@ public interface ProductReviewService extends IService<ProductReview> {
      * @return 评价分页结果
      */
     PageResult<ProductReviewVO> pageReviews(ProductReviewPageQueryDTO dto);
+
+    /**
+     * 分页查询我的评价（按评价时间倒序，聚合商品信息、店铺名称与回复互动数）
+     *
+     * @param userId 当前登录用户ID
+     * @param dto    分页查询参数
+     * @return 我的评价分页结果
+     */
+    PageResult<MyReviewVO> pageMyReviews(Long userId, BasePageQuery dto);
 
     /**
      * 查询商品评价汇总（平均分、总数与当前用户评价资格）

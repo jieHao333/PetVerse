@@ -1,6 +1,7 @@
 package com.my.petverse.shop.controller;
 
 import com.my.petverse.common.context.UserContext;
+import com.my.petverse.common.dto.base.BasePageQuery;
 import com.my.petverse.common.dto.shop.ProductReviewPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplyPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductReviewReplySaveDTO;
@@ -8,6 +9,7 @@ import com.my.petverse.common.dto.shop.ProductReviewSaveDTO;
 import com.my.petverse.common.dto.shop.ProductReviewUpdateDTO;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.Result;
+import com.my.petverse.common.vo.shop.MyReviewVO;
 import com.my.petverse.common.vo.shop.ProductReviewReplyVO;
 import com.my.petverse.common.vo.shop.ProductReviewSummaryVO;
 import com.my.petverse.common.vo.shop.ProductReviewVO;
@@ -56,6 +58,12 @@ public class ProductReviewController {
     @GetMapping("/page")
     public Result<PageResult<ProductReviewVO>> page(@Valid ProductReviewPageQueryDTO dto) {
         return Result.success(productReviewService.pageReviews(dto));
+    }
+
+    /** 分页查询我的评价（聚合商品信息、店铺名称与回复互动数） */
+    @GetMapping("/my/page")
+    public Result<PageResult<MyReviewVO>> myPage(@Valid BasePageQuery dto) {
+        return Result.success(productReviewService.pageMyReviews(UserContext.getUserId(), dto));
     }
 
     /** 查询商品评价汇总（平均分、总数与当前用户评价资格） */

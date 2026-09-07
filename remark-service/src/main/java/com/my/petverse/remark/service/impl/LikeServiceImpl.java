@@ -54,7 +54,7 @@ public class LikeServiceImpl implements LikeService {
         // 事件携带变更后的最新计数，业务侧据此近实时刷新热度冗余列（定时任务仍作全量兜底）
         if (added != null && added == 1L) {
             redis.opsForSet().add(dirtyKey(targetType), String.valueOf(targetId));
-            publishLikeChanged(targetType, targetId, setKey);
+            publishLikeChanged(targetType, targetId, setKey, userId, true);
         }
     }
 
@@ -66,15 +66,15 @@ public class LikeServiceImpl implements LikeService {
         Long removed = redis.opsForSet().remove(setKey, String.valueOf(userId));
         if (removed != null && removed == 1L) {
             redis.opsForSet().add(dirtyKey(targetType), String.valueOf(targetId));
-            publishLikeChanged(targetType, targetId, setKey);
+            publishLikeChanged(targetType, targetId, setKey, userId, false);
         }
     }
 
-    /** 发布点赞变更事件（携带最新点赞数），发送失败由发布器内部降级记日志 */
-    private void publishLikeChanged(Integer targetType, Long targetId, String setKey) {
+    /** 发布点赞变更事件（携带最新点赞数与触发人、是否新增），发送失败由发布器内部降级记日志 */
+    private void publishLikeChanged(Integer targetType, Long targetId, String setKey, Long actorUserId, boolean added) {
         Long size = redis.opsForSet().size(setKey);
         mqEventPublisher.publish(MqTopics.LIKE_CHANGED, MqTopics.TAG_LIKE_CHANGED,
-                new LikeChangedMessage(targetType, targetId, size == null ? 0L : size));
+                new LikeChangedMessage(targetType, targetId, size == null ? 0L : size, actorUserId, added));
     }
 
     @Override

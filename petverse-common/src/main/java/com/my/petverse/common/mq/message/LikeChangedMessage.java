@@ -25,4 +25,16 @@ public class LikeChangedMessage implements Serializable {
 
     /** 变更后的最新点赞数 */
     private Long count;
+
+    /** 触发本次变更的用户ID（点赞人），供点赞通知解析 */
+    private Long actorUserId;
+
+    /** true-新增点赞 false-取消点赞，仅新增点赞需要生成通知 */
+    private Boolean added;
+
+    public LikeChangedMessage(Integer targetType, Long targetId, Long count) {
+        this.targetType = targetType;
+        this.targetId = targetId;
+        this.count = count;
+    }
 }
