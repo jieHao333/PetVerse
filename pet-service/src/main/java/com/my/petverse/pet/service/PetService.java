@@ -16,6 +16,8 @@ import com.my.petverse.common.vo.pet.PetExpGainVO;
 import com.my.petverse.common.vo.pet.PetSignInVO;
 import com.my.petverse.common.vo.pet.PetVO;
 
+import org.springframework.web.multipart.MultipartFile;
+
 import java.util.List;
 
 /**
@@ -58,6 +60,9 @@ public interface PetService extends IService<Pet> {
 
     /** 修改宠物名称 */
     PetVO renamePet(PetRenameDTO dto);
+
+    /** 上传宠物头像（真实/虚拟宠物均可），返回更新后的宠物信息 */
+    PetVO uploadAvatar(Long petId, Long userId, MultipartFile file);
 
     /** 每日签到，为用户所有虚拟宠物发放经验 */
     PetSignInVO signIn(PetSignInDTO dto);

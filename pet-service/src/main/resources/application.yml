@@ -9,6 +9,11 @@ spring:
     username: root
     password: 123456
     driver-class-name: com.mysql.cj.jdbc.Driver
+  servlet:
+    multipart:
+      # 单个头像文件上限（2MB + 冗余）
+      max-file-size: 3MB
+      max-request-size: 4MB
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
@@ -29,3 +34,11 @@ rocketmq:
   name-server: localhost:9876
   producer:
     group: pet-producer
+
+# 阿里云 OSS 存储配置（与其他服务共用同一个桶），宠物头像上传用
+aliyun:
+  oss:
+    endpoint: oss-cn-beijing.aliyuncs.com
+    access-key-id: LTAI5t7e17sduSC8q6dDJmvP
+    access-key-secret: dohM2Q5abNDOtAzSrqm0zig4WZwDY1
+    bucket-name: petverse-me

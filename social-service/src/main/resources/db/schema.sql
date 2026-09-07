@@ -51,3 +51,18 @@ CREATE TABLE IF NOT EXISTS chat_message
     KEY idx_receiver (receiver_id, create_time)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='聊天消息';
+
+CREATE TABLE IF NOT EXISTS chat_conversation
+(
+    id             BIGINT   NOT NULL COMMENT '主键(雪花ID)',
+    user_id        BIGINT   NOT NULL COMMENT '会话所属用户ID(查看者)',
+    friend_user_id BIGINT   NOT NULL COMMENT '对方(好友)用户ID',
+    last_read_time DATETIME DEFAULT NULL COMMENT '最后已读时间',
+    clear_time     DATETIME DEFAULT NULL COMMENT '清空(删除)会话时间',
+    create_time    DATETIME DEFAULT NULL COMMENT '创建时间',
+    update_time    DATETIME DEFAULT NULL COMMENT '更新时间',
+    deleted        TINYINT  DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_user_friend (user_id, friend_user_id)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4 COMMENT ='聊天会话(按查看者维度记录已读/清空时间)';

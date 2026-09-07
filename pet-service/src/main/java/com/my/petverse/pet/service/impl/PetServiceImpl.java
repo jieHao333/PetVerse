@@ -19,6 +19,7 @@ import com.my.petverse.common.enums.PetExpSource;
 import com.my.petverse.common.enums.PetGender;
 import com.my.petverse.common.enums.PetType;
 import com.my.petverse.common.exception.BusinessException;
+import com.my.petverse.common.oss.OssService;
 import com.my.petverse.common.result.PageResult;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.util.PetLevelCalculator;
@@ -33,10 +34,15 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -52,7 +58,19 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
     /** 连续签到每日额外经验值 */
     private static final long SIGN_IN_STREAK_EXP = 5L;
 
+    /** 头像大小上限：2MB */
+    private static final long MAX_AVATAR_SIZE = 2 * 1024 * 1024;
+
+    /** 允许的头像内容类型，与用户头像保持一致 */
+    private static final Set<String> AVATAR_CONTENT_TYPES = Set.of(
+            "image/png", "image/jpeg", "image/jpg", "image/webp");
+
+    /** OSS 存储路径中的日期目录格式 */
+    private static final DateTimeFormatter AVATAR_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+
     private final PetCatalogService petCatalogService;
+
+    private final OssService ossService;
 
     /** 根据ID查询宠物 */
     @Override
@@ -218,6 +236,44 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         pet.setName(dto.getName().trim());
         updateById(pet);
         return toVO(pet);
+    }
+
+    /** 上传宠物头像：真实/虚拟宠物均可，校验归属与图片格式后存 OSS 并更新 imageUrl */
+    @Override
+    public PetVO uploadAvatar(Long petId, Long userId, MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "请选择要上传的图片");
+        }
+        if (file.getSize() > MAX_AVATAR_SIZE) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "头像图片不能超过 2MB");
+        }
+        String contentType = file.getContentType();
+        if (contentType == null || !AVATAR_CONTENT_TYPES.contains(contentType.toLowerCase(Locale.ROOT))) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "仅支持 PNG / JPEG / WEBP 格式的图片");
+        }
+        Pet pet = getById(petId);
+        if (pet == null || !pet.getUserId().equals(userId)) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
+        }
+        // 按日期分目录 + UUID 文件名，避免重名覆盖；与其他服务共用同一个桶
+        String extension = getExtension(file.getOriginalFilename());
+        String objectKey = "pet/avatar/" + LocalDate.now().format(AVATAR_DATE_FORMAT) + "/"
+                + UUID.randomUUID().toString().replace("-", "") + "." + extension;
+        pet.setImageUrl(ossService.upload(objectKey, file));
+        updateById(pet);
+        return toVO(pet);
+    }
+
+    /** 取文件扩展名（小写），无扩展名时用 jpg 兑底避免生成非法 objectKey */
+    private String getExtension(String filename) {
+        if (!StringUtils.hasText(filename)) {
+            return "jpg";
+        }
+        int index = filename.lastIndexOf('.');
+        if (index < 0 || index == filename.length() - 1) {
+            return "jpg";
+        }
+        return filename.substring(index + 1).toLowerCase(Locale.ROOT);
     }
 
     /**

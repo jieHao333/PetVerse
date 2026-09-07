@@ -21,6 +21,7 @@ import com.my.petverse.pet.service.PetService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
@@ -105,6 +106,13 @@ public class PetController {
     public Result<PetVO> rename(@RequestBody @Valid PetRenameDTO dto) {
         dto.setUserId(UserContext.getUserId());
         return Result.success(petService.renamePet(dto));
+    }
+
+    /** 上传宠物头像（真实/虚拟宠物均可），用户ID取自登录令牌 */
+    @PostMapping("/{id}/avatar")
+    public Result<PetVO> uploadAvatar(@PathVariable("id") Long id,
+                                      @RequestParam("file") MultipartFile file) {
+        return Result.success(petService.uploadAvatar(id, UserContext.getUserId(), file));
     }
 
     /** 每日签到，为用户所有虚拟宠物发放经验值，用户ID取自登录令牌 */
