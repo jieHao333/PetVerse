@@ -3,6 +3,7 @@ package com.my.petverse.pet.service;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
+import com.my.petverse.common.dto.pet.PetHealthUpdateDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetProfileUpdateDTO;
 import com.my.petverse.common.dto.pet.PetRegisterDTO;
@@ -60,6 +61,9 @@ public interface PetService extends IService<Pet> {
 
     /** 修改宠物名称 */
     PetVO renamePet(PetRenameDTO dto);
+
+    /** 更新宠物健康信息单项（猫/狗身份卡健康模块），返回更新后的宠物信息 */
+    PetVO updatePetHealth(PetHealthUpdateDTO dto);
 
     /** 上传宠物头像（真实/虚拟宠物均可），返回更新后的宠物信息 */
     PetVO uploadAvatar(Long petId, Long userId, MultipartFile file);

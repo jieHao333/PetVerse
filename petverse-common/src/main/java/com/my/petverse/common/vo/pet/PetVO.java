@@ -77,6 +77,27 @@ public class PetVO implements Serializable {
     /** 身份卡签发日期，非空表示已签发宠物身份证 */
     private LocalDate cardIssueDate;
 
+    /** 健康-体重（猫/狗） */
+    private String weight;
+
+    /** 健康-BCS 体况评分（猫/狗） */
+    private String bcs;
+
+    /** 健康-驱虫（猫/狗） */
+    private String deworming;
+
+    /** 健康-特殊时期（猫/狗） */
+    private String specialPeriod;
+
+    /** 健康-疫苗（猫/狗） */
+    private String vaccine;
+
+    /** 健康-养育方式（猫/狗） */
+    private String rearingMethod;
+
+    /** 健康-病史（猫/狗） */
+    private String medicalHistory;
+
     /** 创建时间 */
     private LocalDateTime createTime;
 }

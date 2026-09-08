@@ -5,11 +5,12 @@
 会话模型：对话按「用户 + 宠物 + 会话」三级隔离——
 一只宠物可拥有多个会话；切换宠物 / 新建对话均进入待创建态，会话在用户发出首条消息时才落库
 （避免频繁切换堆积空会话），历史会话可手动选择恢复；会话支持删除。
+前端侧栏直接展示该用户与所有宠物的全部历史会话（每条带归属宠物 petId），无需先选宠物。
 
 接口一览：
   1. POST   /ai/chat/stream             SSE 流式对话（sessionId 缺省时自动建会话，首帧 meta 回传）
   2. GET    /ai/chat/history            查询指定会话的对话历史（时间正序：旧 → 新）
-  3. GET    /ai/chat/sessions           查询指定宠物的会话列表（最近活跃在前）
+  3. GET    /ai/chat/sessions           查询用户的全部会话（跨宠物统一展示，最近活跃在前）
   4. DELETE /ai/chat/sessions/{sid}     删除会话（连带消息与 Redis 缓存）
 
 存储分层：
@@ -274,21 +275,18 @@ async def get_history(
 
 @router.get("/chat/sessions")
 async def list_sessions(
-    petId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询指定宠物的会话列表（最近活跃在前）"""
+    """查询用户的全部会话（跨宠物统一展示，最近活跃在前），每条带归属宠物 petId"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
-    if petId is None:
-        return JSONResponse(status_code=200, content=fail(400, "参数错误"))
     try:
-        sessions = await persistence.list_sessions(user_id, petId)
+        sessions = await persistence.list_sessions(user_id)
     except Exception:
-        logger.warning("查询会话列表失败: user_id=%s petId=%s", user_id, petId, exc_info=True)
+        logger.warning("查询会话列表失败: user_id=%s", user_id, exc_info=True)
         return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
-    data = SessionListData(petId=petId, sessions=sessions).model_dump()
+    data = SessionListData(sessions=sessions).model_dump()
     return JSONResponse(status_code=200, content=ok(data))
 
 

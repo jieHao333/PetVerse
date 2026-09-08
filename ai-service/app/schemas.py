@@ -3,7 +3,7 @@
 与 Java 端 petverse-common 的 Result / DTO 结构对齐，
 保证前后端拿到统一的 {"code":200,"msg":"success","data":...} 报文。
 """
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -23,6 +23,7 @@ class PetInfo(BaseModel):
     level: Optional[int] = None       # 等级
     signStreak: Optional[int] = None  # 连续签到天数
     description: Optional[str] = None  # 自我介绍（宠物档案）
+    health: Optional[Dict[str, Optional[str]]] = None  # 健康信息（类别键->内容，猫/狗身份卡维护；值为 null 时按未填写处理）
 
 
 class ChatRequest(BaseModel):
@@ -37,15 +38,15 @@ class SessionItem(BaseModel):
     """单个会话条目"""
 
     id: int                    # 会话 ID
+    petId: int = 0             # 归属宠物 ID（前端据此标注会话属于哪只宠物）
     title: str                 # 会话标题
     createTime: int = 0        # 创建时间（秒级时间戳）
     updateTime: int = 0        # 最近活跃时间（秒级时间戳）
 
 
 class SessionListData(BaseModel):
-    """GET /ai/chat/sessions 返回的 data 结构"""
+    """GET /ai/chat/sessions 返回的 data 结构（会话只按用户隔离，跨宠物统一展示）"""
 
-    petId: int
     sessions: List[SessionItem] = []
 
 
@@ -54,6 +55,7 @@ class HistoryMessage(BaseModel):
 
     role: str        # 角色：user / assistant
     content: str     # 消息内容
+    petId: Optional[int] = None  # 该轮消息归属的宠物 ID（0 / 缺失表示未知）
     ts: int = 0      # 消息时间戳（秒级）
 
 

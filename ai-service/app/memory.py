@@ -1,7 +1,7 @@
 """Redis 对话记忆（redis.asyncio，db=3）
 
 key 结构：ai:chat:history:{userId}:{sessionId}（LIST，每项为 JSON 字符串 {"role","content","ts"}）
-会话已按「用户 + 宠物」隔离创建，故 key 只需再拼会话 ID 即可完成三级隔离。
+会话按「用户 + 宠物」隔离创建，key 再拼会话 ID 即可完成三级隔离。
 
 所有操作均做了异常降级：Redis 故障时绝不让对话主流程报错，
 read 返回空列表、append / clear 静默失败仅记日志。

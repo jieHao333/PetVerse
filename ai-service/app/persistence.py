@@ -89,18 +89,19 @@ async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
             return cur.lastrowid
 
 
-async def list_sessions(user_id: int, pet_id: int) -> List[dict]:
-    """查询指定宠物的全部会话（最近活跃在前）"""
+async def list_sessions(user_id: int) -> List[dict]:
+    """查询用户的全部会话（跨宠物统一展示，最近活跃在前），每条带归属宠物 petId"""
     if _pool is None:
         raise RuntimeError("MySQL 未就绪，无法查询会话列表")
-    sql = ("SELECT id, title, UNIX_TIMESTAMP(create_time), UNIX_TIMESTAMP(update_time) "
-           "FROM chat_session WHERE user_id=%s AND pet_id=%s "
+    sql = ("SELECT id, pet_id, title, UNIX_TIMESTAMP(create_time), UNIX_TIMESTAMP(update_time) "
+           "FROM chat_session WHERE user_id=%s "
            "ORDER BY update_time DESC, id DESC")
     async with _pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(sql, (user_id, pet_id))
+            await cur.execute(sql, (user_id,))
             rows = await cur.fetchall()
-    return [{"id": r[0], "title": r[1], "createTime": int(r[2]), "updateTime": int(r[3])}
+    return [{"id": r[0], "petId": r[1], "title": r[2],
+             "createTime": int(r[3]), "updateTime": int(r[4])}
             for r in rows]
 
 
@@ -212,13 +213,13 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
     # 用子查询先按时间倒序取最近 N 条，再外层按时间正序返回，避免 ORDER BY + LIMIT 组合的方向陷阱；
     # 子查询必须同时 SELECT id，否则外层无法用 id 作为同时间戳下的次级排序键
     if limit is not None and limit > 0:
-        sql = ("SELECT role, content, UNIX_TIMESTAMP(create_time) AS ts FROM ("
-               "  SELECT id, role, content, create_time FROM chat_message "
+        sql = ("SELECT role, content, pet_id, UNIX_TIMESTAMP(create_time) AS ts FROM ("
+               "  SELECT id, role, content, pet_id, create_time FROM chat_message "
                "  WHERE user_id=%s AND session_id=%s ORDER BY create_time DESC, id DESC LIMIT %s"
                ") t ORDER BY create_time ASC, id ASC")
         params = (user_id, session_id, limit)
     else:
-        sql = ("SELECT role, content, UNIX_TIMESTAMP(create_time) AS ts FROM chat_message "
+        sql = ("SELECT role, content, pet_id, UNIX_TIMESTAMP(create_time) AS ts FROM chat_message "
                "WHERE user_id=%s AND session_id=%s ORDER BY create_time ASC, id ASC")
         params = (user_id, session_id)
     try:
@@ -226,7 +227,7 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
             async with conn.cursor() as cur:
                 await cur.execute(sql, params)
                 rows = await cur.fetchall()
-        return [{"role": r[0], "content": r[1], "ts": int(r[2])} for r in rows]
+        return [{"role": r[0], "content": r[1], "petId": r[2], "ts": int(r[3])} for r in rows]
     except Exception:
         logger.warning("读取 MySQL 对话历史失败，降级为空历史", exc_info=True)
         return []

@@ -3,6 +3,7 @@ package com.my.petverse.pet.controller;
 import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
+import com.my.petverse.common.dto.pet.PetHealthUpdateDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetProfileUpdateDTO;
 import com.my.petverse.common.dto.pet.PetRegisterDTO;
@@ -106,6 +107,13 @@ public class PetController {
     public Result<PetVO> rename(@RequestBody @Valid PetRenameDTO dto) {
         dto.setUserId(UserContext.getUserId());
         return Result.success(petService.renamePet(dto));
+    }
+
+    /** 更新宠物健康信息单项（猫/狗身份卡健康模块），用户ID取自登录令牌 */
+    @PutMapping("/health")
+    public Result<PetVO> updateHealth(@RequestBody @Valid PetHealthUpdateDTO dto) {
+        dto.setUserId(UserContext.getUserId());
+        return Result.success(petService.updatePetHealth(dto));
     }
 
     /** 上传宠物头像（真实/虚拟宠物均可），用户ID取自登录令牌 */

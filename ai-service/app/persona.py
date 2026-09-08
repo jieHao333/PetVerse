@@ -20,6 +20,17 @@ _PROFILE_TEMPLATE = """当前用户正在咨询的宠物档案：
 请在回答时结合上述宠物信息给出针对性建议。
 """
 
+# 健康信息类别键 -> 中文标签（与前端身份卡健康模块 / pet 表字段一致）
+_HEALTH_LABELS = {
+    "weight": "体重",
+    "bcs": "BCS体况评分",
+    "deworming": "驱虫",
+    "specialPeriod": "特殊时期",
+    "vaccine": "疫苗",
+    "rearingMethod": "养育方式",
+    "medicalHistory": "病史",
+}
+
 
 def build_system_prompt(pet: PetInfo) -> str:
     """根据宠物信息构建养宠顾问 System Prompt
@@ -40,6 +51,13 @@ def build_system_prompt(pet: PetInfo) -> str:
         profile_lines.append(f"- 品种：{breed}")
     if pet.age is not None:
         profile_lines.append(f"- 年龄：{pet.age} 岁")
+
+    # 健康信息（猫/狗身份卡维护）：仅拼入非空项，供顾问结合健康状况作答
+    health = pet.health or {}
+    for key, label in _HEALTH_LABELS.items():
+        value = (health.get(key) or "").strip()
+        if value:
+            profile_lines.append(f"- {label}：{value}")
 
     # 档案全空则整块省略，避免出现只有标题没有内容的尴尬段落
     profile_block = (

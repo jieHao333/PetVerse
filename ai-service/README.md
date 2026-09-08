@@ -1,6 +1,6 @@
 # PetVerse AI 服务（ai-service）
 
-AI 养宠顾问对话微服务：基于 FastAPI 构建，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供宠物健康、习性咨询的**流式对话（SSE）**与多会话管理能力。对话按「用户 + 宠物 + 会话」三级隔离：一只宠物可拥有多个会话，切换宠物 / 新建对话均进入待创建态、会话在发出首条消息时才落库（避免频繁切换堆积空会话），历史会话可手动选择恢复，会话支持删除。对话由 DeepSeek（OpenAI 兼容 API）驱动，助手以中立的养宠顾问身份回答（不扮演宠物、无语气化人设）；未配置 Key 或开启 `MOCK_CHAT` 时自动切换为内置 mock 回复；多轮对话采用**双层存储**：Redis（db=3）作为 LLM 短窗口上下文缓存（按会话滚动保留最近 N 条 + TTL），MySQL（`petverse_ai.chat_session` / `petverse_ai.chat_message`）作为会话与消息持久层（服务重启 / Redis 过期都不丢历史），两者写入时并行、删除会话时同步清理，历史查询以 MySQL 为准。
+AI 养宠顾问对话微服务：基于 FastAPI 构建，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供宠物健康、习性咨询的**流式对话（SSE）**与多会话管理能力。对话按「用户 + 宠物 + 会话」三级隔离：一只宠物可拥有多个会话，切换宠物 / 新建对话均进入待创建态、会话在发出首条消息时才落库（避免频繁切换堆积空会话），历史会话可手动选择恢复，会话支持删除；前端侧栏直接展示该用户与所有宠物的全部历史会话（每条带归属宠物 petId），无需先选宠物。对话由 DeepSeek（OpenAI 兼容 API）驱动，助手以中立的养宠顾问身份回答（不扮演宠物、无语气化人设）；未配置 Key 或开启 `MOCK_CHAT` 时自动切换为内置 mock 回复；多轮对话采用**双层存储**：Redis（db=3）作为 LLM 短窗口上下文缓存（按会话滚动保留最近 N 条 + TTL），MySQL（`petverse_ai.chat_session` / `petverse_ai.chat_message`）作为会话与消息持久层（服务重启 / Redis 过期都不丢历史），两者写入时并行、删除会话时同步清理，历史查询以 MySQL 为准。
 
 ## 环境要求
 
@@ -79,7 +79,7 @@ cd d:\Java\PetVerse_qiuzhao\PetVerse\ai-service
 |---|---|---|
 | POST | `/api/ai/chat/stream` | SSE 流式对话；请求体 `{"message": "...", "pet": {id, name, species, breed, age, ...}, "sessionId": 1}`（pet 字段均可选；sessionId 缺省时自动新建会话并通过首帧 meta 事件回传） |
 | GET | `/api/ai/chat/history?sessionId={id}` | 查询指定会话的对话历史（时间正序：旧 → 新） |
-| GET | `/api/ai/chat/sessions?petId={id}` | 查询指定宠物的会话列表（最近活跃在前） |
+| GET | `/api/ai/chat/sessions` | 查询用户的全部会话（跨宠物统一展示，最近活跃在前，每条带归属宠物 petId） |
 | DELETE | `/api/ai/chat/sessions/{sessionId}` | 删除会话（连带会话下全部消息与 Redis 缓存） |
 
 说明：

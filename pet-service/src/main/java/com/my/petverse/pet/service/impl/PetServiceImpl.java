@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
+import com.my.petverse.common.dto.pet.PetHealthUpdateDTO;
 import com.my.petverse.common.dto.pet.PetPageQueryDTO;
 import com.my.petverse.common.dto.pet.PetProfileUpdateDTO;
 import com.my.petverse.common.dto.pet.PetRegisterDTO;
@@ -234,6 +235,28 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
         }
         pet.setName(dto.getName().trim());
+        updateById(pet);
+        return toVO(pet);
+    }
+
+    /** 更新宠物健康信息单项：按类别键定位字段，仅允许修改本人宠物 */
+    @Override
+    public PetVO updatePetHealth(PetHealthUpdateDTO dto) {
+        Pet pet = getById(dto.getPetId());
+        if (pet == null || !pet.getUserId().equals(dto.getUserId())) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
+        }
+        String value = dto.getValue() == null ? "" : dto.getValue().trim();
+        switch (dto.getCategory()) {
+            case "weight" -> pet.setWeight(value);
+            case "bcs" -> pet.setBcs(value);
+            case "deworming" -> pet.setDeworming(value);
+            case "specialPeriod" -> pet.setSpecialPeriod(value);
+            case "vaccine" -> pet.setVaccine(value);
+            case "rearingMethod" -> pet.setRearingMethod(value);
+            case "medicalHistory" -> pet.setMedicalHistory(value);
+            default -> throw new BusinessException(ResultCode.BAD_REQUEST, "未知的健康信息类别：" + dto.getCategory());
+        }
         updateById(pet);
         return toVO(pet);
     }

@@ -16,6 +16,14 @@
 -- 存量数据补发：虚拟宠物按创建日期补发，档案已完善的真实宠物按更新日期补发
 -- UPDATE pet SET card_issue_date = DATE(create_time) WHERE type = 'VIRTUAL' AND card_issue_date IS NULL;
 -- UPDATE pet SET card_issue_date = DATE(update_time) WHERE type = 'REAL' AND species IS NOT NULL AND gender IS NOT NULL AND birthday IS NOT NULL AND card_issue_date IS NULL;
+-- 4) 宠物健康信息（猫/狗身份卡展示，并随 AI 咨询上下文发送）：
+-- ALTER TABLE pet ADD COLUMN weight VARCHAR(255) DEFAULT NULL COMMENT '健康-体重' AFTER card_issue_date;
+-- ALTER TABLE pet ADD COLUMN bcs VARCHAR(255) DEFAULT NULL COMMENT '健康-BCS体况评分' AFTER weight;
+-- ALTER TABLE pet ADD COLUMN deworming VARCHAR(255) DEFAULT NULL COMMENT '健康-驱虫' AFTER bcs;
+-- ALTER TABLE pet ADD COLUMN special_period VARCHAR(255) DEFAULT NULL COMMENT '健康-特殊时期' AFTER deworming;
+-- ALTER TABLE pet ADD COLUMN vaccine VARCHAR(255) DEFAULT NULL COMMENT '健康-疫苗' AFTER special_period;
+-- ALTER TABLE pet ADD COLUMN rearing_method VARCHAR(255) DEFAULT NULL COMMENT '健康-养育方式' AFTER vaccine;
+-- ALTER TABLE pet ADD COLUMN medical_history VARCHAR(500) DEFAULT NULL COMMENT '健康-病史' AFTER rearing_method;
 
 CREATE TABLE IF NOT EXISTS pet
 (
@@ -37,6 +45,13 @@ CREATE TABLE IF NOT EXISTS pet
     birthday       DATE         DEFAULT NULL COMMENT '生日(真实宠物)',
     sterilized     TINYINT      DEFAULT 0 COMMENT '是否绝育 0-否 1-是(真实宠物)',
     card_issue_date DATE      DEFAULT NULL COMMENT '身份卡签发日期',
+    weight         VARCHAR(255) DEFAULT NULL COMMENT '健康-体重',
+    bcs            VARCHAR(255) DEFAULT NULL COMMENT '健康-BCS体况评分',
+    deworming      VARCHAR(255) DEFAULT NULL COMMENT '健康-驱虫',
+    special_period VARCHAR(255) DEFAULT NULL COMMENT '健康-特殊时期',
+    vaccine        VARCHAR(255) DEFAULT NULL COMMENT '健康-疫苗',
+    rearing_method VARCHAR(255) DEFAULT NULL COMMENT '健康-养育方式',
+    medical_history VARCHAR(500) DEFAULT NULL COMMENT '健康-病史',
     create_time    DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time    DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted        TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
