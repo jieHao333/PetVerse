@@ -38,7 +38,10 @@ class SessionItem(BaseModel):
     """单个会话条目"""
 
     id: int                    # 会话 ID
-    petId: int = 0             # 归属宠物 ID（前端据此标注会话属于哪只宠物）
+    # 归属宠物 ID（前端据此标注会话属于哪只宠物）；宠物 ID 为雪花 ID（19 位），
+    # 超过 JS Number 安全整数上限，必须以字符串下发，否则前端解析时尾数被截断，
+    # 按 petId 回溯宠物（会话标签 / 切换确认）会全部失效
+    petId: str = "0"
     title: str                 # 会话标题
     createTime: int = 0        # 创建时间（秒级时间戳）
     updateTime: int = 0        # 最近活跃时间（秒级时间戳）
@@ -55,7 +58,7 @@ class HistoryMessage(BaseModel):
 
     role: str        # 角色：user / assistant
     content: str     # 消息内容
-    petId: Optional[int] = None  # 该轮消息归属的宠物 ID（0 / 缺失表示未知）
+    petId: Optional[str] = None  # 该轮消息归属的宠物 ID（雪花 ID 用字符串下发防截断；None 表示未知）
     ts: int = 0      # 消息时间戳（秒级）
 
 

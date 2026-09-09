@@ -100,7 +100,8 @@ async def list_sessions(user_id: int) -> List[dict]:
         async with conn.cursor() as cur:
             await cur.execute(sql, (user_id,))
             rows = await cur.fetchall()
-    return [{"id": r[0], "petId": r[1], "title": r[2],
+    # petId 转字符串下发：宠物 ID 是雪花 ID（19 位），以 JSON number 返回会在前端被截断
+    return [{"id": r[0], "petId": str(r[1] or 0), "title": r[2],
              "createTime": int(r[3]), "updateTime": int(r[4])}
             for r in rows]
 
@@ -119,21 +120,33 @@ async def get_session(user_id: int, session_id: int) -> Optional[dict]:
             row = await cur.fetchone()
     if row is None:
         return None
-    return {"id": row[0], "petId": row[1], "title": row[2]}
+    return {"id": row[0], "petId": str(row[1] or 0), "title": row[2]}
 
 
 async def delete_session(user_id: int, session_id: int) -> None:
-    """删除会话及其全部消息（仅限本人）；单条 DELETE 失败仅记日志"""
+    """删除会话及其全部消息（仅限本人）
+
+    连接池是 autocommit=True，两条 DELETE 必须显式包在同一事务里：
+    否则先删消息后删会话，若第二条失败就会残留一个没有任何消息的空会话
+    （侧栏还能看到、点进去却是空的）。失败时回滚并向上抛，
+    由路由层转为业务错误响应——删除是用户主动操作，不允许静默降级。
+    """
     if _pool is None:
         raise RuntimeError("MySQL 未就绪，无法删除会话")
     async with _pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM chat_message WHERE session_id=%s AND user_id=%s",
-                (session_id, user_id))
-            await cur.execute(
-                "DELETE FROM chat_session WHERE id=%s AND user_id=%s",
-                (session_id, user_id))
+            await conn.begin()
+            try:
+                await cur.execute(
+                    "DELETE FROM chat_message WHERE session_id=%s AND user_id=%s",
+                    (session_id, user_id))
+                await cur.execute(
+                    "DELETE FROM chat_session WHERE id=%s AND user_id=%s",
+                    (session_id, user_id))
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
 
 # ---------- 消息读写（异常降级，不影响对话主流程） ----------
@@ -227,7 +240,9 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
             async with conn.cursor() as cur:
                 await cur.execute(sql, params)
                 rows = await cur.fetchall()
-        return [{"role": r[0], "content": r[1], "petId": r[2], "ts": int(r[3])} for r in rows]
+        # petId 转字符串下发防前端截断；pet_id 为 0 / NULL 时视为未知，返回 None
+        return [{"role": r[0], "content": r[1], "petId": str(r[2]) if r[2] else None, "ts": int(r[3])}
+                for r in rows]
     except Exception:
         logger.warning("读取 MySQL 对话历史失败，降级为空历史", exc_info=True)
         return []

@@ -308,9 +308,18 @@ async def delete_session(
     if session is None:
         return JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
 
-    # 并行删除：Redis 上下文缓存 + MySQL 会话与消息；Redis 异常已内部降级仅记日志
-    await asyncio.gather(
-        memory.clear(user_id, session_id),
-        persistence.delete_session(user_id, session_id),
-    )
+    # 并行删除：Redis 上下文缓存 + MySQL 会话与消息。
+    # Redis 侧异常已内部降级仅记日志（memory.clear 不抛），MySQL 侧是事务化删除
+    # （消息 + 会话要么都删要么都不删）且失败会向上抛，此处必须接住转业务错误：
+    # 否则 FastAPI 会返回裸 500，前端拿不到统一的 {"code","msg","data"} 报文。
+    # Redis 已清而 MySQL 回滚的情况无害：缓存只是短窗口上下文，
+    # 下次对话会从 MySQL 回落补齐（见 _stream_generator 的历史读取分支）。
+    try:
+        await asyncio.gather(
+            memory.clear(user_id, session_id),
+            persistence.delete_session(user_id, session_id),
+        )
+    except Exception:
+        logger.warning("删除会话失败: user_id=%s sessionId=%s", user_id, session_id, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
     return JSONResponse(status_code=200, content=ok(None))
