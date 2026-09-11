@@ -27,8 +27,9 @@ from typing import Optional
 from fastapi import APIRouter, Header, Path, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app import llm, memory, persistence, persona
+from app import llm, memory, persistence
 from app.config import settings
+from app.graph.chat_graph import get_chat_graph, initial_state
 from app.schemas import (
     ChatRequest,
     HistoryData,
@@ -105,8 +106,37 @@ async def _pump(stream, queue: asyncio.Queue) -> None:
         await queue.put(("error", exc))
 
 
+async def _graph_stream(state: dict):
+    """把 LangGraph 的消息流归一化为「助手文本片段」流
+
+    graph.astream(stream_mode="messages") 会同时产出各节点的 LLM 调用消息（意图识别、
+    工具 Agent、最终生成）；这里只取最终生成节点的助手文本增量，避免把中间产物
+    透传给前端。通过 metadata.langgraph_node 过滤 generate 节点。
+    """
+    graph = get_chat_graph()
+    async for chunk, meta in graph.astream(state, stream_mode="messages"):
+        # 仅透传最终生成节点（generate）的助手文本
+        if meta and meta.get("langgraph_node") != "generate":
+            continue
+        content = getattr(chunk, "content", None)
+        if not content:
+            continue
+        # 仅保留 AI 消息（过滤 Human/System/Tool 消息）
+        chunk_type = getattr(chunk, "type", "")
+        if chunk_type and chunk_type not in ("AIMessageChunk", "ai"):
+            continue
+        if isinstance(content, str):
+            yield content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    yield part
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    yield part.get("text", "")
+
+
 async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet_id: int):
-    """SSE 流式对话生成器（核心逻辑）"""
+    """SSE 流式对话生成器（核心逻辑，由 LangGraph 编排驱动）"""
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
 
     # 1. 并发闸：超时拿不到信号量说明服务过载
@@ -123,25 +153,31 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
     appended = False        # 本轮对话是否已成功写入历史（防止取消分支重复兜底写入）
     producer: Optional[asyncio.Task] = None
     try:
-        # 3. 组装 LLM 消息：养宠顾问上下文 + 本会话历史 + 本轮用户输入
-        # 上下文来源：优先 Redis（短窗口快），Redis 为空时回落 MySQL 最近 N 条
+        # 3. 读取本会话历史（LLM 上下文）：优先 Redis（短窗口快），为空时回落 MySQL 最近 N 条
         # （服务重启、Redis TTL 过期、Redis 被清空等场景下仍能拿到历史）
         history = await memory.read(user_id, session_id)
         if not history:
             history = await persistence.read_history(
                 user_id, session_id, limit=settings.HISTORY_MAX_MESSAGES)
-        messages = [{"role": "system", "content": persona.build_system_prompt(pet)}]
-        for item in history:
-            role, content = item.get("role"), item.get("content")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": req.message})
 
-        # 4. 按模式选择数据源：mock 流或真实 DeepSeek 流
+        # 4. 由 LangGraph 编排本轮对话：意图识别 → (RAG 检索 / 工具调用) → Prompt 组装 → 生成
+        state = initial_state(
+            query=req.message,
+            pet=pet.model_dump(),
+            user_id=user_id,
+            history=[{"role": h.get("role"), "content": h.get("content")} for h in history],
+        )
+
         if settings.is_mock:
+            # mock 模式：先跑一遍编排（意图/检索/工具/组装逻辑一致），再用打字机流输出内置回复
+            try:
+                await get_chat_graph().ainvoke(state)
+            except Exception:
+                logger.warning("mock 模式编排执行异常（忽略，继续输出 mock 回复）", exc_info=True)
             stream = llm.mock_stream(req.message, pet.name or "")
         else:
-            stream = llm.stream_chat(messages)
+            # 真实模式：直接消费 LangGraph 消息流中的助手文本增量
+            stream = _graph_stream(state)
 
         # 5. 生产者-消费者消费流：消费端带 15 秒心跳超时
         queue: asyncio.Queue = asyncio.Queue()

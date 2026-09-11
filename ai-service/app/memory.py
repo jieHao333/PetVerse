@@ -152,3 +152,37 @@ async def clear(user_id: int, session_id: int) -> None:
         await _client.delete(_key(user_id, session_id))
     except Exception:
         logger.warning("清空 Redis 对话历史失败（忽略）", exc_info=True)
+
+
+# ---------- 通用 JSON 缓存（评论摘要 / 个性化推荐等） ----------
+
+async def cache_get(key: str) -> Optional[dict]:
+    """读取 JSON 缓存，未命中或异常返回 None"""
+    if _client is None:
+        return None
+    try:
+        raw = await _client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        logger.warning("读取 Redis 缓存失败（忽略）: %s", key, exc_info=True)
+        return None
+
+
+async def cache_set(key: str, value: dict, ttl: int) -> None:
+    """写入 JSON 缓存并设置 TTL；异常仅记日志"""
+    if _client is None or ttl <= 0:
+        return
+    try:
+        await _client.set(key, json.dumps(value, ensure_ascii=False), ex=ttl)
+    except Exception:
+        logger.warning("写入 Redis 缓存失败（忽略）: %s", key, exc_info=True)
+
+
+async def cache_delete(key: str) -> None:
+    """删除缓存键；异常仅记日志"""
+    if _client is None:
+        return
+    try:
+        await _client.delete(key)
+    except Exception:
+        logger.warning("删除 Redis 缓存失败（忽略）: %s", key, exc_info=True)

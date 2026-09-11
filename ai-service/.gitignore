@@ -1,0 +1,9 @@
+# 本地环境配置（含真实 API Key，禁止提交；仅提交 .env.example）
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
