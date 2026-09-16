@@ -3,13 +3,13 @@ uvicorn[standard]>=0.32
 langchain>=1.0
 langchain-openai>=1.0
 langgraph>=1.0
+langgraph-checkpoint-postgres>=3.1  # LangGraph 官方 checkpoint：对话图状态（记忆）持久化到 PostgreSQL
 langchain-postgres>=0.0.13  # pgvector 向量库接入（PGVector）
 langchain-community>=0.4    # 社区检索器 / BM25 关键词检索降级
 langchain-text-splitters>=1.0  # 知识库文档切分
-psycopg[binary,pool]>=3.2   # PostgreSQL 异步驱动（pgvector 存储）
+psycopg[binary,pool]>=3.2   # PostgreSQL 异步/同步驱动（会话消息 + checkpoint + pgvector 存储）
 pgvector>=0.3               # pgvector 类型适配
 redis>=5.0,<6  # 本机 Redis 5.0 不支持 RESP3 协议，redis-py 8.x 默认 HELLO 握手会失败，锁定 5.x 系列
-aiomysql>=0.2  # 异步 MySQL 驱动，用于对话消息持久化存储
 pydantic-settings>=2.6
 nacos-sdk-python==1.0.0
 httpx>=0.27

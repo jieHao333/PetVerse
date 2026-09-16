@@ -12,16 +12,21 @@
   - compose           组装最终 System Prompt（人设 + 宠物档案 + 参考知识 + 真实数据 + 医疗护栏）
   - generate          调用 LLM 生成回答（真实模式；mock 模式由路由层走打字机 mock 流）
 
-设计取舍：生成环节在真实模式下直接由本图调用模型，路由层用 LangGraph 原生的
-`astream(stream_mode="messages")` 逐 token 转发；mock 模式不调用模型，由路由层走
-`llm.mock_stream`，但本图的意图识别 / 检索 / 工具 / 组装仍会执行，保证编排逻辑一致。
+会话记忆（LangGraph 官方 checkpoint）：
+  图状态中的 messages 通道（add_messages reducer）跨轮累积对话消息，编译时注入
+checkpoint.get_saver() 提供的官方 PostgresSaver 后由 checkpoint 自动持久化
+（thread_id = 用户+会话），下一轮对话自动恢复历史；被用户中止的轮次由路由层
+补写回 messages（见 chat._persist_interrupted）。
+compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 token 成本。
 """
 import logging
-from typing import Any, Dict, List, TypedDict
+from typing import Annotated, Any, Dict, List, TypedDict
 
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
-from app import persona, vectorstore
+from app import checkpoint, persona, vectorstore
 from app.config import settings
 from app.llm import astructured_invoke, get_client
 from app.schemas import IntentResult, PetInfo
@@ -44,12 +49,14 @@ _CHITCHAT_WORDS = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "再�
 
 
 class ChatState(TypedDict, total=False):
-    """对话图状态（无 reducer，后写覆盖前值）"""
+    """对话图状态（messages 走 add_messages reducer，其余字段后写覆盖前值）"""
 
     query: str                     # 用户本轮输入
     pet: Dict[str, Any]            # 宠物档案（dict 形式）
     user_id: int                   # 当前用户 ID
-    history: List[Dict[str, str]]  # 历史消息（role/content）
+    # 对话消息（跨轮累积）：输入的本轮 HumanMessage、generate 写回的 AIMessage、
+    # 中断补写的人机消息都汇聚于此，由 checkpoint 按 thread 持久化，构成长期记忆
+    messages: Annotated[List[AnyMessage], add_messages]
     intent: str                    # 意图
     intent_reason: str
     knowledge: List[Dict[str, Any]]  # RAG 检索结果
@@ -149,7 +156,12 @@ async def tool_action(state: ChatState) -> Dict[str, Any]:
 
 
 async def compose(state: ChatState) -> Dict[str, Any]:
-    """组装节点：拼装最终消息列表（不调用模型）"""
+    """组装节点：拼装最终消息列表（不调用模型）
+
+    历史窗口从图状态 messages 中取最近 HISTORY_MAX_MESSAGES 条（checkpoint 保留
+    全量记忆，此处按窗口裁剪控制上下文与 token 成本）；窗口内为空内容的助手消息
+    （如 LLM 空输出）直接跳过。
+    """
     pet_dict = state.get("pet") or {}
     try:
         pet = PetInfo(**pet_dict)
@@ -165,16 +177,21 @@ async def compose(state: ChatState) -> Dict[str, Any]:
         medical=medical,
     )
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    for item in state.get("history", []):
-        role, content = item.get("role"), item.get("content")
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": state.get("query", "")})
+    history = state.get("messages") or []
+    for msg in history[-settings.HISTORY_MAX_MESSAGES:]:
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        if not content.strip():
+            continue
+        if isinstance(msg, HumanMessage):
+            messages.append({"role": "user", "content": content})
+        elif isinstance(msg, AIMessage):
+            messages.append({"role": "assistant", "content": content})
     return {"final_messages": messages, "medical": medical}
 
 
 async def generate(state: ChatState) -> Dict[str, Any]:
-    """生成节点：真实模式调用 LLM；mock 模式不调用（由路由层走 mock 流）"""
+    """生成节点：真实模式调用 LLM 并把回复写回 messages（随 checkpoint 持久化）；
+    mock 模式不调用（由路由层走 mock 流，回复由路由层补写进图状态）"""
     if settings.is_mock:
         return {"reply": ""}
     try:
@@ -183,7 +200,13 @@ async def generate(state: ChatState) -> Dict[str, Any]:
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content
                               if isinstance(p, dict) and p.get("type") == "text")
-        return {"reply": content or ""}
+        content = content or ""
+        return {
+            # 助手回复写回图状态：checkpoint 在本超级步结束后自动持久化，
+            # 下一轮对话从 checkpoint 恢复即为跨轮记忆；空输出不落记忆
+            "messages": [AIMessage(content=content)] if content.strip() else [],
+            "reply": content,
+        }
     except Exception:
         logger.warning("LLM 生成失败", exc_info=True)
         raise
@@ -210,7 +233,11 @@ _graph = None
 
 
 def get_chat_graph():
-    """构建并缓存对话编排图（编译一次，进程内复用）"""
+    """构建并缓存对话编排图（编译一次，进程内复用）
+
+    编译时注入 checkpoint saver（PostgreSQL 持久化图状态 / 对话记忆，
+    见 app/checkpoint.py）；saver 不可用时退化为无记忆图，保证对话功能仍可用。
+    """
     global _graph
     if _graph is not None:
         return _graph
@@ -231,18 +258,19 @@ def get_chat_graph():
     builder.add_edge("compose", "generate")
     builder.add_edge("generate", END)
 
-    _graph = builder.compile()
+    saver = checkpoint.get_saver()
+    _graph = builder.compile(checkpointer=saver) if saver is not None else builder.compile()
     return _graph
 
 
 def initial_state(query: str, pet: Dict[str, Any], user_id: int,
-                  history: List[Dict[str, str]]) -> ChatState:
-    """构造图初始状态"""
+                  messages: List[AnyMessage]) -> ChatState:
+    """构造图初始状态：messages 为本轮输入消息（本轮 HumanMessage，老会话首次接入时为回填历史 + 本轮）"""
     return {
         "query": query,
         "pet": pet or {},
         "user_id": user_id,
-        "history": history or [],
+        "messages": messages or [],
         "intent": "",
         "intent_reason": "",
         "knowledge": [],

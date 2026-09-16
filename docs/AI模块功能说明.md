@@ -37,8 +37,9 @@ PetVerse AI 模块是一个**独立的 Python AI 微服务**（`ai-service`）�
 | 对话模型 | OpenAI 兼容（DeepSeek / 阿里云百炼等） | 可配 `base_url` + `model` |
 | Embedding | OpenAI 兼容 | RAG 向量化 |
 | 向量库 | PostgreSQL + **pgvector** | 语义检索 |
-| 短期记忆 | Redis（db=3） | LLM 上下文缓存 + 结果缓存 |
-| 对话持久化 | MySQL（`petverse_ai`） | 会话与消息 |
+| 对话记忆 | LangGraph checkpoint（PostgreSQL） | 图状态持久化、跨轮恢复与中断补写 |
+| 对话持久化 | PostgreSQL（`petverse_ai`） | 会话与消息（与 checkpoint 同库） |
+| 结果缓存 | Redis（db=3） | 评论摘要 / 推荐等 |
 | 结果持久化 | PostgreSQL（`petverse_ai`） | 健康报告 + 缓存兜底 |
 | 服务发现 | Nacos | 注册为 `ai-service` |
 
@@ -54,14 +55,13 @@ flowchart TB
     subgraph AI_INNER ["ai-service 内部"]
         ROUTERS["路由层<br/>chat / health / review / recommend"]
         GRAPHS["LangGraph 编排层<br/>4 张 StateGraph"]
-        INFRA["基础设施层<br/>llm / vectorstore / clients / tools / memory / persistence / pg_store"]
+        INFRA["基础设施层<br/>llm / vectorstore / clients / tools / checkpoint / memory / persistence / pg_store"]
         ROUTERS --> GRAPHS --> INFRA
     end
 
     AI --> AI_INNER
-    INFRA -->|"RAG 检索"| PG[("PostgreSQL<br/>pgvector")]
-    INFRA -->|"短期记忆 / 缓存"| RD[("Redis<br/>db=3")]
-    INFRA -->|"对话持久化"| MY[("MySQL<br/>petverse_ai")]
+    INFRA -->|"RAG / 会话消息 / 对话记忆"| PG[("PostgreSQL<br/>pgvector + chat + checkpoint")]
+    INFRA -->|"结果缓存"| RD[("Redis<br/>db=3")]
     INFRA -->|"X-User-Id 直连"| BIZ["Java 业务服务<br/>pet / shop / space ..."]
     GRAPHS -->|"OpenAI 兼容"| LLM["大模型服务<br/>LLM + Embedding"]
 ```
@@ -71,14 +71,15 @@ flowchart TB
 ```
 ai-service/
 ├── app/
-│   ├── main.py              # FastAPI 入口 + lifespan（Redis/MySQL/PG/Nacos）
+│   ├── main.py              # FastAPI 入口 + lifespan（Redis/PG/Nacos）
 │   ├── config.py            # pydantic-settings 配置中心
 │   ├── llm.py               # LLM / Embedding 客户端 + 结构化输出助手
 │   ├── vectorstore.py       # pgvector 检索 + 关键词降级
 │   ├── clients.py           # 业务微服务 HTTP 客户端
 │   ├── tools.py             # LangGraph Agent 工具集
-│   ├── memory.py            # Redis 短期记忆 + 通用缓存
-│   ├── persistence.py       # MySQL 会话/消息持久化
+│   ├── memory.py            # Redis 通用缓存（评论摘要 / 推荐）
+│   ├── persistence.py       # PostgreSQL 会话/消息持久化
+│   ├── checkpoint.py        # LangGraph checkpoint 对话记忆（官方 PostgresSaver）
 │   ├── pg_store.py          # PostgreSQL 健康报告 + 缓存
 │   ├── persona.py           # 系统提示词组装
 │   ├── schemas.py           # 数据模型 + 结构化输出 Schema
@@ -89,10 +90,10 @@ ai-service/
 │   ├── graph/               # 四张 LangGraph 编排图
 │   ├── knowledge/           # RAG 知识库 Markdown 语料
 │   └── logging_setup.py     # 统一日志
-├── scripts/ingest_knowledge.py   # 知识库导入脚本
+├── scripts/ingest_knowledge.py       # 知识库导入脚本
+├── scripts/migrate_mysql_to_pg.py    # 存量数据迁移（MySQL → PostgreSQL）
 ├── db/
-│   ├── schema.sql                # MySQL 表
-│   └── schema_pgvector.sql       # PostgreSQL + pgvector 表
+│   └── schema_pgvector.sql           # PostgreSQL 业务表 + pgvector（含会话/消息）
 └── requirements.txt
 ```
 
@@ -102,8 +103,8 @@ ai-service/
 
 | 能力 | 网关接口 | 编排图 | 存储 |
 |---|---|---|---|
-| AI 养宠顾问对话 | `POST /api/ai/chat/stream`（SSE） | `chat_graph` | Redis + MySQL |
-| 会话历史 / 列表 / 删除 | `GET/DELETE /api/ai/chat/*` | — | Redis + MySQL |
+| AI 养宠顾问对话 | `POST /api/ai/chat/stream`（SSE） | `chat_graph` | PostgreSQL（checkpoint + 会话消息） |
+| 会话历史 / 列表 / 删除 | `GET/DELETE /api/ai/chat/*` | — | PostgreSQL |
 | AI 健康智能评估 | `POST /api/ai/health/assess` | `health_graph` | PostgreSQL |
 | 健康评估历史 | `GET /api/ai/health/history` | — | PostgreSQL |
 | 商品评论摘要 | `POST /api/ai/shop/review/summary` | `review_graph` | Redis 缓存 |
@@ -236,15 +237,15 @@ flowchart LR
 
 | 存储 | 内容 | Key / 表 | 生命周期 |
 |---|---|---|---|
-| Redis db=3 | 对话短期上下文 | `ai:chat:history:{userId}:{sessionId}`（LIST） | 滚动保留最近 N 条 + TTL 7 天 |
 | Redis db=3 | 评论摘要缓存 | `ai:review:summary:{productId}` | 6 小时 |
 | Redis db=3 | 推荐缓存 | `ai:recommend:{scene}:{userId}` | 10 分钟 |
-| MySQL | 会话 | `chat_session`（用户+宠物+会话三级隔离） | 永久 |
-| MySQL | 消息 | `chat_message` | 永久 |
+| PostgreSQL | 会话 | `chat_session`（用户+宠物+会话三级隔离） | 永久 |
+| PostgreSQL | 消息 | `chat_message`（`interrupted` 标记被中止的回复） | 永久 |
+| PostgreSQL | 对话记忆 | LangGraph checkpoint（thread = 用户+会话） | 永久（随会话删除清理） |
 | PostgreSQL | 健康报告 | `pet_health_report` | 永久（保留历史） |
 | PostgreSQL | 结果缓存兜底 | `ai_cache` | 带过期时间 |
 
-**对话读写一致**：写入时 Redis 与 MySQL 并行；读取历史优先 Redis（快），为空回落 MySQL 最近 N 条；删除会话时同步清理两者。客户端中途断开时，用 `append_if_exists` / `save_turn_if_exists` 做原子兜底保存，避免「复活」已删除的历史。
+**对话记忆与会话消息**：LLM 上下文记忆由 LangGraph 官方 checkpoint 按 thread（用户 + 会话）自动持久化到 PostgreSQL，跨轮自动恢复，上下文窗口从记忆裁剪最近 `HISTORY_MAX_MESSAGES` 条；`chat_session` / `chat_message` 为会话与消息持久层（前端历史展示 / 会话管理）。用户停止生成时双路收尾——`aupdate_state` 把问题与已产出的部分回复（`interrupted` 标记）补写回图状态成为后续记忆，`save_turn_if_exists` 条件写入消息表（会话已删则跳过，不复活历史），并以 `asyncio.shield` 保证取消路径的写入落地。
 
 ---
 
@@ -259,8 +260,8 @@ flowchart LR
 | Embedding | 未配置 / 不可用 | RAG 降级为关键词检索 |
 | pgvector | 连接失败 | 60 秒冷却期内直接走关键词检索，避免反复打堆栈 |
 | 业务服务 | 未启动 / 超时 | 相应上下文返回空，推荐退化为热门 |
-| Redis | 不可用 | 读返回空、写静默失败；历史回落 MySQL |
-| MySQL / PG | 不可用 | 会话不可建时回业务错误；消息/报告静默降级 |
+| Redis | 不可用 | 读返回 None、写静默失败；摘要 / 推荐缓存失效但主流程不受影响 |
+| PostgreSQL | 不可用 | 会话操作回业务错误；消息 / 对话记忆 / 报告静默降级（恢复后自动重试） |
 | 并发过载 | 信号量 3 秒超时 | 返回 `error` 事件（全局并发上限 20） |
 
 > **关键点**：`structured output` 的跨服务商降级是必须的。例如 DeepSeek 思考模型既不支持 `json_schema` 也不支持 `tool_choice`，若不做降级，意图识别、健康评估、评论摘要、推荐重排会全部**静默退化**为规则逻辑（接口仍返回 200，难以察觉）。
@@ -276,11 +277,11 @@ flowchart LR
 | 对话模型 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | OpenAI 兼容；`LLM_*` 留空时回落 `DEEPSEEK_*` |
 | Embedding | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 不配置则 RAG 关键词降级 |
 | 模式 | `MOCK_CHAT` | `true` 走内置模拟回复，无需真实调用 |
-| pgvector | `PG_HOST/PORT/USER/PASSWORD/DB` | 向量库与健康报告 |
+| PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB` | 会话/消息 + checkpoint + 向量库 + 健康报告 |
 | RAG | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | 检索开关与参数 |
 | 业务服务 | `PET_/SPACE_/USER_/SOCIAL_/REMARK_/SHOP_SERVICE_URL` | 直连地址 |
 | 缓存 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 各能力缓存 TTL |
-| 记忆 | `HISTORY_MAX_MESSAGES` / `HISTORY_TTL_SECONDS` | 上下文窗口 |
+| 记忆 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口（从 checkpoint 记忆裁剪） |
 | 生成 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
 **服务商切换示例**：
@@ -363,8 +364,7 @@ data: {"type":"error","msg":"..."}         // 异常
 ## 十二、部署与初始化
 
 ```powershell
-# 1. 初始化数据库
-mysql -uroot -p123456 < db/schema.sql
+# 1. 初始化数据库（PostgreSQL；会话/消息与 checkpoint 表由服务启动时自动创建）
 psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 需先 CREATE DATABASE petverse_ai
 
 # 2. 安装依赖
@@ -379,7 +379,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 需先 CREATE DATA
 .venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
 ```
 
-需预先启动：Nacos、Redis、MySQL、PostgreSQL（含 pgvector）、各 Java 业务服务。
+需预先启动：Nacos、Redis、PostgreSQL（含 pgvector）、各 Java 业务服务。
 
 ---
 
@@ -391,5 +391,5 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 需先 CREATE DATA
 4. **RAG 双通路**：语义检索 + 关键词降级，任何环境都能工作。
 5. **跨服务商结构化输出**：三级自动降级，规避不同模型对 `json_schema` / `tool_choice` 的支持差异。
 6. **安全护栏**：医疗 / 急症意图强制就医提示，健康评估报告含免责声明。
-7. **契约稳定**：重构为 LangGraph 后，SSE 协议、会话隔离、Redis/MySQL 双写语义全部保持不变，前端零改动。
+7. **契约稳定**：存储层从「Redis + MySQL」演进为「LangGraph checkpoint + PostgreSQL」过程中，SSE 协议、会话隔离与全部接口契约保持不变，前端零改动。
 8. **全面降级**：每个外部依赖都有兜底路径，单点故障不影响主流程。

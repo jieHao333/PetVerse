@@ -52,16 +52,7 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     REDIS_DB: int = 3                           # 对话记忆专用 db
 
-    # ---------- MySQL（对话消息持久化） ----------
-    MYSQL_HOST: str = "localhost"
-    MYSQL_PORT: int = 3306
-    MYSQL_USER: str = "root"
-    MYSQL_PASSWORD: str = "123456"
-    MYSQL_DB: str = "petverse_ai"
-    MYSQL_POOL_MIN: int = 1                     # 连接池最小连接数
-    MYSQL_POOL_MAX: int = 10                    # 连接池最大连接数
-
-    # ---------- PostgreSQL + pgvector（RAG 向量库） ----------
+    # ---------- PostgreSQL（业务持久化：会话/消息 + checkpoint + RAG + 健康报告） ----------
     PG_HOST: str = "localhost"
     PG_PORT: int = 5432
     PG_USER: str = "postgres"
@@ -91,8 +82,9 @@ class Settings(BaseSettings):
     HEALTH_CACHE_TTL: int = 3600                # 健康评估结果缓存 1 小时
 
     # ---------- 对话记忆 ----------
-    HISTORY_MAX_MESSAGES: int = 40              # 每个宠物最多保留的历史消息条数
-    HISTORY_TTL_SECONDS: int = 604800           # 历史过期时间（默认 7 天）
+    # LLM 上下文窗口条数：compose 组装时从 checkpoint 记忆裁剪最近 N 条，控制 token 成本；
+    # 同时作为存量会话（升级前只有 MySQL 历史）首次接入 checkpoint 时的回填上限
+    HISTORY_MAX_MESSAGES: int = 40
 
     # ---------- LLM 生成参数 ----------
     LLM_MAX_TOKENS: int = 512

@@ -1,8 +1,9 @@
 """ai-service 启动入口
 
 FastAPI 实例 + lifespan 生命周期：
-- 启动：初始化 Redis 连接池（redis.asyncio）+ MySQL 连接池（aiomysql）+ Nacos 注册（同步 SDK 放后台线程，不阻塞事件循环）
-- 停机：Nacos 反注册 + 关闭 MySQL 连接池 + 关闭 Redis 连接池
+- 启动：初始化 Redis 连接池（通用缓存）+ PostgreSQL（会话/消息/checkpoint/pgvector）
+  + Nacos 注册（同步 SDK 放后台线程）
+- 停机：Nacos 反注册 + 依次释放各连接池
 
 服务绑定 127.0.0.1:8086（与 .env 中 AI_SERVICE_IP / AI_SERVICE_PORT 保持一致）。
 """
@@ -23,7 +24,7 @@ _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PACKAGE_ROOT not in sys.path:
     sys.path.insert(0, _PACKAGE_ROOT)
 
-from app import memory, nacos_client, persistence, pg_store
+from app import checkpoint, memory, nacos_client, persistence, pg_store
 from app.chat import router as chat_router
 from app.clients import biz
 from app.config import settings
@@ -48,10 +49,13 @@ async def lifespan(app: FastAPI):
             "如需接入真实模型，请在 .env 中填写 LLM_API_KEY（并将 MOCK_CHAT 置为 false）",
             settings.MOCK_CHAT, "为空" if not settings.LLM_API_KEY.strip() else "已配置但被开关覆盖",
         )
-    # Redis 连接池：创建连接池本身不发网络请求，真正连接在首次命令时惰性建立
+    # Redis 连接池：评论摘要 / 推荐等通用缓存（创建连接池本身不发网络请求）
     memory.init()
-    # MySQL 连接池：对话消息持久化存储，aiomysql.create_pool 是异步的需 await
+    # 会话与消息持久层（PostgreSQL）：连接池 + 业务表自动创建（幂等）
     await persistence.init()
+    # LangGraph checkpoint：对话图状态（记忆）持久化到 PostgreSQL（同库不同表），
+    # 建表失败的降级与重试由 checkpoint 模块内部处理，不会阻塞启动
+    await checkpoint.init()
     # PostgreSQL 连接池：健康评估报告持久化 + AI 结果缓存（pgvector 由 vectorstore 惰性初始化）
     await pg_store.init()
     # Nacos 注册：SDK 是同步库，用 to_thread 丢进后台线程，避免阻塞事件循环
@@ -63,6 +67,7 @@ async def lifespan(app: FastAPI):
     # ---------- 停机阶段 ----------
     await asyncio.to_thread(nacos_client.deregister)
     await biz.close()
+    await checkpoint.close()
     await pg_store.close()
     await persistence.close()
     await memory.close()

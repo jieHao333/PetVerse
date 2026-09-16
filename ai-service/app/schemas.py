@@ -64,6 +64,7 @@ class HistoryMessage(BaseModel):
     content: str     # 消息内容
     petId: Optional[str] = None  # 该轮消息归属的宠物 ID（雪花 ID 用字符串下发防截断；None 表示未知）
     ts: int = 0      # 消息时间戳（秒级）
+    interrupted: bool = False    # assistant 回复是否被用户中止生成（历史回放展示「（已停止）」）
 
 
 class HistoryData(BaseModel):

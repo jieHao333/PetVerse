@@ -13,27 +13,35 @@
 
 **对话编排（chat_graph）**：`意图识别 →（条件分支）知识检索 / 工具调用 → Prompt 组装 → 生成`。命中医疗 / 急症意图时，最终 Prompt 会强制附加「及时咨询专业宠物医生」的就医护栏。工具让 AI 能查询用户真实数据（我的宠物 / 订单 / 购物车 / 商品评论 / 热门动态）。
 
+**对话记忆（LangGraph 官方 checkpoint）**：对话图编译时注入 `PostgresSaver`（`langgraph-checkpoint-postgres`），图状态 `messages` 按 `thread_id = 用户:会话` 在每个超级步自动持久化到 PostgreSQL，下一轮对话自动恢复上下文。用户点击「停止生成」时，路由层把「问题 + 已产出的部分回复（`interrupted` 标记）」经 `aupdate_state` 补写回图状态——被中止的轮次同样进入后续对话的记忆，不再「暂停即失忆」。
+
 **RAG 检索**：首选 pgvector 语义检索（OpenAI 兼容 Embedding）；未配置 Embedding 或 pgvector 不可用时，自动降级为内置知识文件的字符 bigram 关键词检索，保证功能在无外部依赖时仍可演示。
 
-**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；Redis（db=3）作 LLM 短窗口上下文缓存，MySQL（`petverse_ai.chat_session` / `chat_message`）作持久层，两者并行写入；健康评估报告落 PostgreSQL（`petverse_ai.pet_health_report`）。
+**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；Redis（db=3）承担评论摘要 / 推荐等结果缓存。
 
 ## 环境要求
 
 - Python 3.12
 - 可访问的 Nacos（默认 `localhost:8848`）
 - 可访问的 Redis（默认 `localhost:6379`，密码 `123456`，db=3）
-- 可访问的 MySQL（默认 `localhost:3306`，库 `petverse_ai`）
-- 可访问的 PostgreSQL + **pgvector 插件**（默认 `localhost:5432`，库 `petverse_ai`；仅 RAG 语义检索 / 健康报告持久化需要，缺失时自动降级）
+- 可访问的 PostgreSQL + **pgvector 插件**（默认 `localhost:5432`，库 `petverse_ai`；会话与消息、对话记忆 checkpoint、RAG 语义检索、健康报告都在这里，缺失时相应能力自动降级）
 - LLM API Key（OpenAI 兼容，可选：留空或 `MOCK_CHAT=true` 时走内置 mock 回复）
 - Embedding API Key（OpenAI 兼容，可选：不配置则 RAG 走关键词降级）
 
 ## 初始化数据库
 
 ```powershell
-# MySQL：会话与消息表
-mysql -uroot -p123456 < db/schema.sql
-# PostgreSQL：pgvector 扩展 + 健康报告 / 缓存表
+# 数据库 petverse_ai 需先存在：CREATE DATABASE petverse_ai;
+# 业务表（chat_session / chat_message）+ pgvector 扩展 + 健康报告 / 缓存表
 psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
+# 会话 / 消息表与 checkpoint 表都会在服务启动时自动创建（幂等），本脚本为手动入口与表结构文档
+```
+
+存量数据迁移（原 MySQL 库 → PostgreSQL，一次性、幂等，保留原会话 ID）：
+
+```powershell
+.venv\Scripts\pip install aiomysql        # 仅迁移脚本需要，完成后可卸载
+.venv\Scripts\python -m scripts.migrate_mysql_to_pg
 ```
 
 ## 安装依赖
@@ -53,11 +61,11 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `DEEPSEEK_*` | 兼容旧配置：`LLM_*` 留空时自动回落 |
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化（OpenAI 兼容）。阿里云百炼 `text-embedding-v3`（dim 支持 1024/768/512）。**不配置则 RAG 自动降级为关键词检索** |
 | `MOCK_CHAT` | `true` 强制内置模拟回复，无需真实调用 |
-| `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告） |
+| `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告 / LangGraph checkpoint 对话记忆） |
 | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | RAG 开关与检索参数 |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` / `HEALTH_CACHE_TTL` | 各能力结果缓存 TTL（秒） |
-| `HISTORY_MAX_MESSAGES` / `HISTORY_TTL_SECONDS` | Redis 对话上下文窗口与过期时间 |
+| `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
 > pgvector 维度必须与 `EMBEDDING_DIM` 一致；切换 Embedding 模型需重建向量集合。
@@ -84,9 +92,9 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | 方法 | 网关路径（前端调用） | 说明 |
 |---|---|---|
 | POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}`；首帧 `meta` 回传 sessionId |
-| GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（MySQL，时间正序） |
+| GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（PostgreSQL，时间正序） |
 | GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物，最近活跃在前） |
-| DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 Redis 缓存） |
+| DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint 记忆） |
 | POST | `/api/ai/health/assess` | 宠物健康评估；体为宠物档案（含 `health`），返回结构化报告 |
 | GET | `/api/ai/health/history?petId=` | 宠物历史健康评估 |
 | POST | `/api/ai/shop/review/summary` | 商品评论摘要；体 `{"productId"}` |
@@ -106,7 +114,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 
 ## 生产环境韧性设计
 
-AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → Redis / MySQL / PostgreSQL），
+AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → Redis / PostgreSQL），
 任一环节都可能出问题。以下机制保证「短暂故障不显化为用户可见的错误」，分四层：
 
 ### 1. 网络层（前端）
@@ -129,16 +137,23 @@ AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → R
 
 ### 3. 存储层降级与自愈
 
-- **Redis 上下文缓存**：故障时读降级为空、写静默失败，对话主流程不受影响；
+- **Redis 通用缓存**：故障时读返回 None、写静默失败，主流程不受影响；
   Redis 恢复后自动重连（redis-py 内建）。
-- **MySQL 消息持久化**：读降级为空历史、写仅记日志；**连接池惰性重建**——启动时
-  MySQL 未就绪不再永久不可用，后续请求带 5s 冷却重试重建，MySQL 恢复后无需重启服务；
-  连接级异常时把坏连接显式淘汰出池，坏连接不会反复回池挨个坑请求。
+- **LangGraph checkpoint（对话记忆）**：官方 `PostgresSaver`（同步存储引擎）+ 线程适配层——
+  本服务运行在 Windows 上，psycopg 异步连接在默认 ProactorEventLoop 下不可用（与 pg_store 同款约束），
+  故异步方法统一经线程池代理执行；PG 故障时读降级为「无历史」、写静默失败，对话不受影响；
+  建表失败带 30s 冷却重试，PG 恢复后无需重启服务即可重新启用记忆。
+- **PostgreSQL 会话与消息持久化**：读降级为空历史、写仅记日志；连接池采用
+  psycopg_pool（惰性连接 + 自有断线重连与坏连接淘汰），PG 重启 / 网络闪断后
+  无需重启服务即可自愈；业务表缺失时带 30s 冷却自动补建。
 - **会话操作（建 / 删 / 查）**：失败向上抛，由路由层转成统一业务错误报文（不静默降级）。
 
 ### 4. 断连与异常收尾
 
 - **SSE 心跳**：15s 无 token 产出即发注释行 ping，防止网关 / 代理 idle 超时断连。
-- **客户端中途断开**：已生成的部分回复经 `append_if_exists` / `save_turn_if_exists`
-  原子化兜底落库（会话已被删则跳过，不复活历史；`asyncio.shield` 保证取消路径写入落地）。
+- **客户端中途断开 / 用户点击「停止生成」**：问题与已产出的部分回复被补写进两处存储——
+  LangGraph checkpoint（`aupdate_state` 追加进图状态，部分回复标记 `interrupted`，
+  成为后续对话的长期记忆）与 PostgreSQL（`save_turn_if_exists` 兜底保存，供前端历史回放，
+  会话已删则按会话表原子跳过，不复活历史）；**用户消息无条件落库**（即使中止时零产出，
+  首轮提问也不会丢）；`asyncio.shield` 保证取消路径的写入落地。
 - **统一报文契约**：所有错误均为 HTTP 200 + `{code,msg,data}`，前端不会收到裸 5xx 或英文技术报错。
