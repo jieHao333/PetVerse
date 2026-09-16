@@ -47,10 +47,28 @@ router = APIRouter(prefix="/ai")
 _semaphore = asyncio.Semaphore(20)
 # 获取并发闸的超时（秒）：超时视为过载，向前端发 error 事件
 _SEMAPHORE_TIMEOUT = 3.0
+# 单用户并发上限：防止个别用户刷脚本占满全局 20 路并发，挤占其他用户
+_USER_MAX_CONCURRENT = 2
+# 单用户当前并发的流式对话数（user_id -> 计数），随流的 finally 释放
+_user_active: dict = {}
 # SSE 心跳间隔（秒）：超过该时间没有 token 产出就发一行注释 ping，防止代理断连
 _HEARTBEAT_INTERVAL = 15.0
-# 对外统一兜底话术
+# 单条用户消息长度上限（字符）：超长消息会稀释上下文、烧 token，直接拒绛
+_MAX_MESSAGE_LEN = 2000
+# 流式生成的最大尝试次数：首帧前失败（LLM 网络抖动 / 服务端瞬时故障）自动静默重试一轮
+_STREAM_ATTEMPTS = 2
+# 对外统一兑底话术
 _ERROR_MSG = "AI 服务暂时开小差了，请稍后再试"
+_USER_BUSY_MSG = "您有正在生成的咨询回复，请等它结束后再发送"
+
+
+def _release_user_slot(user_id: int) -> None:
+    """释放单用户并发槽位（计数归零时移除键，避免字典无限膨胀）"""
+    left = _user_active.get(user_id, 0) - 1
+    if left > 0:
+        _user_active[user_id] = left
+    else:
+        _user_active.pop(user_id, None)
 
 
 def _sse(data: dict) -> str:
@@ -146,13 +164,20 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         yield _sse({"type": "error", "msg": _ERROR_MSG})
         return
 
-    # 2. 首帧回传会话元信息：前端据此绑定 sessionId（自动新建会话场景）并刷新会话列表
-    yield _sse({"type": "meta", "sessionId": session_id})
-
     collected = []          # 已累计的回复片段
-    appended = False        # 本轮对话是否已成功写入历史（防止取消分支重复兜底写入）
+    appended = False        # 本轮对话是否已成功写入历史（防止取消分支重复兑底写入）
     producer: Optional[asyncio.Task] = None
+    user_slot_taken = False # 是否已登记单用户并发槽位（finally 按此决定是否释放）
     try:
+        # 1.5 单用户并发登记：与路由层的预检查配合（非严格原子，竞态窗口极小）
+        _user_active[user_id] = _user_active.get(user_id, 0) + 1
+        user_slot_taken = True
+        if _user_active[user_id] > _USER_MAX_CONCURRENT:
+            yield _sse({"type": "error", "msg": _USER_BUSY_MSG})
+            return   # finally 负责释放信号量与用户槽位
+    
+        # 2. 首帧回传会话元信息：前端据此绑定 sessionId（自动新建会话场景）并刷新会话列表
+        yield _sse({"type": "meta", "sessionId": session_id})
         # 3. 读取本会话历史（LLM 上下文）：优先 Redis（短窗口快），为空时回落 MySQL 最近 N 条
         # （服务重启、Redis TTL 过期、Redis 被清空等场景下仍能拿到历史）
         history = await memory.read(user_id, session_id)
@@ -174,30 +199,43 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                 await get_chat_graph().ainvoke(state)
             except Exception:
                 logger.warning("mock 模式编排执行异常（忽略，继续输出 mock 回复）", exc_info=True)
-            stream = llm.mock_stream(req.message, pet.name or "")
-        else:
-            # 真实模式：直接消费 LangGraph 消息流中的助手文本增量
-            stream = _graph_stream(state)
 
         # 5. 生产者-消费者消费流：消费端带 15 秒心跳超时
+        # 首帧韧性：若在产出任何内容之前流就失败（LLM 服务商网络抖动、瞬时 429 等），
+        # 自动重建流静默重试一轮，用户无感知；已产出内容后失败不重试，
+        # 避免向用户重复输出（collected 非空时直接走 error 分支）。
         queue: asyncio.Queue = asyncio.Queue()
-        producer = asyncio.create_task(_pump(stream, queue))
-        while True:
-            try:
-                kind, payload = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_INTERVAL)
-            except asyncio.TimeoutError:
-                # 心跳注释行：以冒号开头，SSE 客户端会自动忽略
-                yield ": ping\n\n"
-                continue
-            if kind == "end":
-                break
-            if kind == "error":
-                logger.warning("LLM 流生成失败: %r", payload)
-                yield _sse({"type": "error", "msg": _ERROR_MSG})
-                return
-            # kind == "delta"
-            collected.append(payload)
-            yield _sse({"type": "delta", "content": payload})
+        for attempt in range(_STREAM_ATTEMPTS):
+            if settings.is_mock:
+                stream = llm.mock_stream(req.message, pet.name or "")
+            else:
+                stream = _graph_stream(state)
+            producer = asyncio.create_task(_pump(stream, queue))
+            retryable = False
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_INTERVAL)
+                except asyncio.TimeoutError:
+                    # 心跳注释行：以冒号开头，SSE 客户端会自动忽略
+                    yield ": ping\n\n"
+                    continue
+                if kind == "end":
+                    break
+                if kind == "error":
+                    if not collected and attempt < _STREAM_ATTEMPTS - 1:
+                        # 首帧前失败：静默重建流重试（producer 已随 error 信号自行结束）
+                        logger.warning("LLM 流首帧前失败，自动重试（第 %s 次）: %r",
+                                       attempt + 1, payload)
+                        retryable = True
+                        break
+                    logger.warning("LLM 流生成失败: %r", payload)
+                    yield _sse({"type": "error", "msg": _ERROR_MSG})
+                    return
+                # kind == "delta"
+                collected.append(payload)
+                yield _sse({"type": "delta", "content": payload})
+            if not retryable:
+                break   # 流正常结束，退出尝试循环进入收尾写入
 
         # 6. 流正常结束：Redis + MySQL 并行写入，随后发出 done
         # 两者均为 best-effort（内部已捕获异常仅记日志），任何一个失败都不影响另一个；
@@ -237,6 +275,8 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
     finally:
         if producer is not None:
             producer.cancel()   # 生产者可能仍在跑（如消费端已退出），主动取消防泄漏
+        if user_slot_taken:
+            _release_user_slot(user_id)
         _semaphore.release()
 
 
@@ -257,9 +297,16 @@ async def chat_stream(
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
 
-    # 2. 消息内容校验：空 / 纯空白直接拒绝
+    # 2. 消息内容校验：空 / 纯空白直接拒绛；超长消息拒绛（保护上下文窗口与 token 成本）
     if not req.message or not req.message.strip():
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
+    if len(req.message) > _MAX_MESSAGE_LEN:
+        return JSONResponse(status_code=200, content=fail(400, f"消息过长，请精简到 {_MAX_MESSAGE_LEN} 字以内"))
+    
+    # 2.5 单用户并发闸：同一用户最多同时 _USER_MAX_CONCURRENT 路流式对话（预检查在会话创建前，
+    # 避免超限请求白建空会话；正式登记在流生成器内完成，二者非严格原子但竞态窗口极小）
+    if _user_active.get(user_id, 0) >= _USER_MAX_CONCURRENT:
+        return JSONResponse(status_code=200, content=fail(429, _USER_BUSY_MSG))
 
     # 3. 会话解析：校验已有会话归属，或按宠物自动新建会话
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
