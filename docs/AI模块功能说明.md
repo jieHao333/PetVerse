@@ -39,8 +39,8 @@ PetVerse AI 模块是一个**独立的 Python AI 微服务**（`ai-service`）�
 | 向量库 | PostgreSQL + **pgvector** | 语义检索 |
 | 对话记忆 | LangGraph checkpoint（PostgreSQL） | 图状态持久化、跨轮恢复与中断补写 |
 | 对话持久化 | PostgreSQL（`petverse_ai`） | 会话与消息（与 checkpoint 同库） |
-| 结果缓存 | Redis（db=3） | 评论摘要 / 推荐等 |
-| 结果持久化 | PostgreSQL（`petverse_ai`） | 健康报告 + 缓存兜底 |
+| 结果缓存 | Redis（db=3）+ PG `ai_cache` | 评论摘要 / 推荐等（两级降级） |
+| 结果持久化 | PostgreSQL（`petverse_ai`） | 健康报告 + 结果缓存温层 |
 | 服务发现 | Nacos | 注册为 `ai-service` |
 
 ---
@@ -78,9 +78,10 @@ ai-service/
 │   ├── clients.py           # 业务微服务 HTTP 客户端
 │   ├── tools.py             # LangGraph Agent 工具集
 │   ├── memory.py            # Redis 通用缓存（评论摘要 / 推荐）
+│   ├── cache.py             # 结果缓存门面（Redis 热 + ai_cache 温两级）
 │   ├── persistence.py       # PostgreSQL 会话/消息持久化
 │   ├── checkpoint.py        # LangGraph checkpoint 对话记忆（官方 PostgresSaver）
-│   ├── pg_store.py          # PostgreSQL 健康报告 + 缓存
+│   ├── pg_store.py          # PostgreSQL 健康报告 + 结果缓存温层
 │   ├── persona.py           # 系统提示词组装
 │   ├── schemas.py           # 数据模型 + 结构化输出 Schema
 │   ├── chat.py              # 对话路由（SSE）
@@ -107,8 +108,8 @@ ai-service/
 | 会话历史 / 列表 / 删除 | `GET/DELETE /api/ai/chat/*` | — | PostgreSQL |
 | AI 健康智能评估 | `POST /api/ai/health/assess` | `health_graph` | PostgreSQL |
 | 健康评估历史 | `GET /api/ai/health/history` | — | PostgreSQL |
-| 商品评论摘要 | `POST /api/ai/shop/review/summary` | `review_graph` | Redis 缓存 |
-| 个性化推荐 | `GET /api/ai/recommend/feed` | `recommend_graph` | Redis 缓存 |
+| 商品评论摘要 | `POST /api/ai/shop/review/summary` | `review_graph` | 两级缓存（Redis + ai_cache） |
+| 个性化推荐 | `GET /api/ai/recommend/feed` | `recommend_graph` | 两级缓存（Redis + ai_cache） |
 
 ---
 
@@ -183,10 +184,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    S([START]) --> FR["fetch_reviews<br/>拉取评论"] --> SM["summarize<br/>map-reduce 摘要"] --> PC["persist_cache<br/>Redis 缓存"] --> E([END])
+    S([START]) --> FR["fetch_reviews<br/>拉取评论"] --> SM["summarize<br/>map-reduce 摘要"] --> PC["persist_cache<br/>两级缓存"] --> E([END])
 ```
 
-- 先查 Redis 缓存（`ai:review:summary:{productId}`，默认 6 小时）。
+- 先查两级缓存（`ai:review:summary:{productId}`，默认 6 小时；Redis 未命中自动回落 `ai_cache`）。
 - 拉取真实评论 → LLM 结构化摘要；评论为空或 LLM 失败时降级为规则摘要（评分均值定情感、正负词抽句）。
 - 输出：`sentiment`（positive/neutral/negative）、`one_line`、`pros[]`、`cons[]`、`keywords[]`、`count`。
 
@@ -200,7 +201,7 @@ flowchart LR
 - `gather_profile`：并发拉取宠物、订单、购物车、评价、我的动态（任一失败不影响其余）。
 - `recall_candidates`：用宠物物种/品种 + 交互商品的名称作为关键词搜索商品，再补热门商品与热门动态，去重规范化。
 - `rerank`：LLM 结合画像从候选里挑选并生成推荐理由（限用候选内 id，防幻觉）；失败时启发式排序。
-- `persist_cache`：按「用户 + 场景」缓存（默认 10 分钟），`refresh=true` 可跳过。
+- `persist_cache`：按「用户 + 场景」写两级缓存（默认 10 分钟，Redis 热 + ai_cache 温），`refresh=true` 可跳过。
 
 ---
 
@@ -237,13 +238,13 @@ flowchart LR
 
 | 存储 | 内容 | Key / 表 | 生命周期 |
 |---|---|---|---|
-| Redis db=3 | 评论摘要缓存 | `ai:review:summary:{productId}` | 6 小时 |
-| Redis db=3 | 推荐缓存 | `ai:recommend:{scene}:{userId}` | 10 分钟 |
+| Redis db=3（热） | 评论摘要缓存 | `ai:review:summary:{productId}` | 6 小时 |
+| Redis db=3（热） | 推荐缓存 | `ai:recommend:{scene}:{userId}` | 10 分钟 |
 | PostgreSQL | 会话 | `chat_session`（用户+宠物+会话三级隔离） | 永久 |
 | PostgreSQL | 消息 | `chat_message`（`interrupted` 标记被中止的回复） | 永久 |
 | PostgreSQL | 对话记忆 | LangGraph checkpoint（thread = 用户+会话） | 永久（随会话删除清理） |
 | PostgreSQL | 健康报告 | `pet_health_report` | 永久（保留历史） |
-| PostgreSQL | 结果缓存兜底 | `ai_cache` | 带过期时间 |
+| PostgreSQL | 结果缓存温层 | `ai_cache`（Redis 未命中 / 故障时兜底） | 与 Redis 同 TTL |
 
 **对话记忆与会话消息**：LLM 上下文记忆由 LangGraph 官方 checkpoint 按 thread（用户 + 会话）自动持久化到 PostgreSQL，跨轮自动恢复，上下文窗口从记忆裁剪最近 `HISTORY_MAX_MESSAGES` 条；`chat_session` / `chat_message` 为会话与消息持久层（前端历史展示 / 会话管理）。用户停止生成时双路收尾——`aupdate_state` 把问题与已产出的部分回复（`interrupted` 标记）补写回图状态成为后续记忆，`save_turn_if_exists` 条件写入消息表（会话已删则跳过，不复活历史），并以 `asyncio.shield` 保证取消路径的写入落地。
 
@@ -260,7 +261,7 @@ flowchart LR
 | Embedding | 未配置 / 不可用 | RAG 降级为关键词检索 |
 | pgvector | 连接失败 | 60 秒冷却期内直接走关键词检索，避免反复打堆栈 |
 | 业务服务 | 未启动 / 超时 | 相应上下文返回空，推荐退化为热门 |
-| Redis | 不可用 | 读返回 None、写静默失败；摘要 / 推荐缓存失效但主流程不受影响 |
+| Redis | 不可用 | 读写静默降级；评论摘要 / 推荐缓存自动回落 PG `ai_cache`（温层） |
 | PostgreSQL | 不可用 | 会话操作回业务错误；消息 / 对话记忆 / 报告静默降级（恢复后自动重试） |
 | 并发过载 | 信号量 3 秒超时 | 返回 `error` 事件（全局并发上限 20） |
 
@@ -280,7 +281,7 @@ flowchart LR
 | PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB` | 会话/消息 + checkpoint + 向量库 + 健康报告 |
 | RAG | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | 检索开关与参数 |
 | 业务服务 | `PET_/SPACE_/USER_/SOCIAL_/REMARK_/SHOP_SERVICE_URL` | 直连地址 |
-| 缓存 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 各能力缓存 TTL |
+| 缓存 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（Redis 热层与 ai_cache 温层共用） |
 | 记忆 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口（从 checkpoint 记忆裁剪） |
 | 生成 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 

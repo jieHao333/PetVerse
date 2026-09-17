@@ -5,7 +5,7 @@ LangGraph 编排：
   - gather_profile：并发拉取用户画像数据（宠物 / 订单 / 购物车 / 评价 / 我的动态）；
   - recall_candidates：基于画像关键词召回商品候选 + 热门商品 + 热门动态；
   - rerank：真实模式用 LLM 结合画像重排并生成推荐理由；mock / 失败时按启发式排序；
-  - persist_cache：按用户 + 场景写 Redis 缓存（TTL 可配）。
+  - persist_cache：按用户 + 场景写两级缓存（Redis 热 + ai_cache 温，TTL 可配）。
 
 对外由 app/recommend.py 的 GET /ai/recommend/feed 调用。
 """
@@ -15,7 +15,7 @@ from typing import Any, Dict, List, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from app import memory
+from app import cache
 from app.clients import biz
 from app.config import settings
 from app.llm import astructured_invoke
@@ -167,11 +167,11 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
 
 
 async def persist_cache(state: RecommendState) -> Dict[str, Any]:
-    """写入推荐缓存（按用户 + 场景）"""
+    """写入推荐缓存（按用户 + 场景；Redis 热 + ai_cache 温两层）"""
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
     if state.get("items"):
-        await memory.cache_set(
+        await cache.set_cached(
             f"ai:recommend:{scene}:{user_id}",
             {"items": state.get("items") or [], "summary": state.get("summary") or ""},
             settings.RECOMMEND_CACHE_TTL)
@@ -268,10 +268,10 @@ def get_recommend_graph():
 
 
 async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -> Dict[str, Any]:
-    """生成个性化推荐（优先读缓存），返回 {items, summary}"""
+    """生成个性化推荐（优先读两级缓存），返回 {items, summary}"""
     cache_key = f"ai:recommend:{scene}:{user_id}"
     if use_cache:
-        cached = await memory.cache_get(cache_key)
+        cached = await cache.get_cached(cache_key)
         if cached is not None:
             return cached
     state: RecommendState = {"user_id": user_id, "scene": scene}

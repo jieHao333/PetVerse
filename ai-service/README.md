@@ -17,7 +17,7 @@
 
 **RAG 检索**：首选 pgvector 语义检索（OpenAI 兼容 Embedding）；未配置 Embedding 或 pgvector 不可用时，自动降级为内置知识文件的字符 bigram 关键词检索，保证功能在无外部依赖时仍可演示。
 
-**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；Redis（db=3）承担评论摘要 / 推荐等结果缓存。
+**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；评论摘要 / 推荐结果为两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底）。
 
 ## 环境要求
 
@@ -61,10 +61,10 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `DEEPSEEK_*` | 兼容旧配置：`LLM_*` 留空时自动回落 |
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化（OpenAI 兼容）。阿里云百炼 `text-embedding-v3`（dim 支持 1024/768/512）。**不配置则 RAG 自动降级为关键词检索** |
 | `MOCK_CHAT` | `true` 强制内置模拟回复，无需真实调用 |
-| `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告 / LangGraph checkpoint 对话记忆） |
+| `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告 / LangGraph checkpoint 对话记忆 / 结果缓存温层 `ai_cache`） |
 | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | RAG 开关与检索参数 |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
-| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` / `HEALTH_CACHE_TTL` | 各能力结果缓存 TTL（秒） |
+| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（秒；Redis 热层与 ai_cache 温层共用） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
@@ -104,7 +104,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
 - SSE 事件：`meta` → `delta` * n → `done`；异常时 `error` 后结束流。
-- 推荐 / 评论摘要 / 健康评估结果分别按用户、商品缓存于 Redis，`refresh=true` 可跳过推荐缓存强制刷新。
+- 推荐 / 评论摘要结果按用户、商品缓存于两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底，见 `app/cache.py`），`refresh=true` 可跳过推荐缓存强制刷新。
 - 中文模型配置与 pgvector 初始化完成后，即自动启用语义检索；否则关键词降级仍可工作。
 
 ## 安全提示
@@ -137,8 +137,10 @@ AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → R
 
 ### 3. 存储层降级与自愈
 
-- **Redis 通用缓存**：故障时读返回 None、写静默失败，主流程不受影响；
-  Redis 恢复后自动重连（redis-py 内建）。
+- **结果缓存两级降级（评论摘要 / 推荐）**：热层 Redis + 温层 PostgreSQL `ai_cache`，
+  由 `app/cache.py` 门面统一读写——读：Redis 未命中自动回落 ai_cache；写：两级并行双写；
+  Redis 故障时读自动走 ai_cache、写仅落 ai_cache，仅两级都不可用才退化为重新计算；
+  任何缓存异常均内部静默降级，主流程不受影响（恢复后 redis-py 自动重连）。
 - **LangGraph checkpoint（对话记忆）**：官方 `PostgresSaver`（同步存储引擎）+ 线程适配层——
   本服务运行在 Windows 上，psycopg 异步连接在默认 ProactorEventLoop 下不可用（与 pg_store 同款约束），
   故异步方法统一经线程池代理执行；PG 故障时读降级为「无历史」、写静默失败，对话不受影响；

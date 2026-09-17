@@ -121,7 +121,7 @@ async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> Lis
 # ---------- 通用缓存 ----------
 
 async def cache_get(cache_key: str) -> Optional[dict]:
-    """读取未过期的缓存，未命中返回 None"""
+    """读取未过期的缓存，未命中返回 None（两级缓存的温层兜底，由 app/cache.py 门面调用）"""
     sql = "SELECT payload FROM ai_cache WHERE cache_key=%s AND expire_time > NOW()"
     try:
         rows = await _run(sql, (cache_key,), fetch=True)
@@ -140,7 +140,7 @@ async def cache_get(cache_key: str) -> Optional[dict]:
 
 
 async def cache_set(cache_key: str, payload: dict, ttl_seconds: int) -> None:
-    """写入缓存（UPSERT，带过期时间）"""
+    """写入缓存（UPSERT，带过期时间；两级缓存的温层，由 app/cache.py 门面调用）"""
     if ttl_seconds <= 0:
         return
     sql = ("INSERT INTO ai_cache (cache_key, payload, expire_time) "

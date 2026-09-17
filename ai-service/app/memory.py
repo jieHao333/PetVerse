@@ -52,7 +52,7 @@ async def close() -> None:
         _pool = None
 
 
-# ---------- 通用 JSON 缓存（评论摘要 / 个性化推荐 / 健康评估兜底等） ----------
+# ---------- 通用 JSON 缓存（评论摘要 / 个性化推荐等 AI 结果；由 app/cache.py 两级门面统一调用） ----------
 
 async def cache_get(key: str) -> Optional[dict]:
     """读取 JSON 缓存，未命中或异常返回 None"""

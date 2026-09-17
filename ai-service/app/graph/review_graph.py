@@ -4,7 +4,7 @@ LangGraph 编排：
     fetch_reviews → summarize → persist_cache
   - fetch_reviews：通过 clients 拉取商品评论（真实数据）；
   - summarize：真实模式用 LLM 结构化输出 ReviewSummary；mock / 少评论时用规则摘要；
-  - persist_cache：写入 Redis 缓存（TTL 可配），命中缓存直接返回。
+  - persist_cache：两级缓存写入（Redis 热 + ai_cache 温，TTL 可配），命中缓存直接返回。
 
 对外由 app/review.py 的 POST /ai/shop/review/summary 调用。
 """
@@ -13,7 +13,7 @@ from typing import Any, Dict, List, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from app import memory
+from app import cache
 from app.clients import biz
 from app.config import settings
 from app.llm import astructured_invoke
@@ -84,11 +84,11 @@ async def summarize(state: ReviewState) -> Dict[str, Any]:
 
 
 async def persist_cache(state: ReviewState) -> Dict[str, Any]:
-    """写入 Redis 缓存（TTL 可配）"""
+    """写入两级缓存：Redis（热）+ PostgreSQL ai_cache（温兜底），TTL 可配"""
     product_id = state.get("product_id", 0)
     summary = state.get("summary") or {}
     if summary.get("count", 0) > 0:
-        await memory.cache_set(f"ai:review:summary:{product_id}", summary,
+        await cache.set_cached(f"ai:review:summary:{product_id}", summary,
                                settings.REVIEW_SUMMARY_TTL)
     return {}
 
@@ -164,10 +164,10 @@ def get_review_graph():
 
 
 async def summarize_product(product_id: int, use_cache: bool = True) -> Dict[str, Any]:
-    """生成商品评论摘要（优先读缓存），返回摘要 dict"""
+    """生成商品评论摘要（优先读两级缓存），返回摘要 dict"""
     cache_key = f"ai:review:summary:{product_id}"
     if use_cache:
-        cached = await memory.cache_get(cache_key)
+        cached = await cache.get_cached(cache_key)
         if cached is not None:
             return cached
     state: ReviewState = {"product_id": product_id}
