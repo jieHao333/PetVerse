@@ -64,5 +64,5 @@ auth:
   whitelist-paths: /api/user/login,/api/user/register
 
 jwt:
-  # 与 user-service 保持一致
-  secret: petverse-jwt-secret-key-please-change-in-production-2026
+  # 与 user-service 保持一致；生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值
+  secret: ${JWT_SECRET:petverse-jwt-secret-key-please-change-in-production-2026}
