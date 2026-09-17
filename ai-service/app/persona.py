@@ -81,7 +81,11 @@ def build_system_prompt(pet: PetInfo, memory_context: str = "",
     breed = (pet.breed or "").strip()
     if breed:
         profile_lines.append(f"- 品种：{breed}")
-    if pet.age is not None:
+    # 年龄优先用前端按生日换算的精确文本（含月龄），缺失时回退数值年龄
+    age_text = (pet.ageText or "").strip()
+    if age_text:
+        profile_lines.append(f"- 年龄：{age_text}")
+    elif pet.age is not None:
         profile_lines.append(f"- 年龄：{pet.age} 岁")
 
     # 健康信息（猫/狗身份卡维护）：仅拼入非空项，供顾问结合健康状况作答

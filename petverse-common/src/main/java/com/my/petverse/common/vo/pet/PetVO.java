@@ -32,7 +32,7 @@ public class PetVO implements Serializable {
     /** 品种 */
     private String breed;
 
-    /** 年龄 */
+    /** 年龄（真实宠物为按生日实时换算的整岁；虚拟宠物为年龄字段值） */
     private Integer age;
 
     /** 宠物描述 */

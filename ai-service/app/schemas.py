@@ -23,7 +23,8 @@ class PetInfo(BaseModel):
     name: Optional[str] = None        # 宠物名字
     species: Optional[str] = None     # 物种（猫 / 狗 / ...）
     breed: Optional[str] = None       # 品种
-    age: Optional[int] = None         # 年龄
+    age: Optional[int] = None         # 年龄（数值：真实宠物为按生日换算的整岁数；虚拟宠物为年龄字段值）
+    ageText: Optional[str] = None     # 年龄精确文本（真实宠物按生日换算，含月龄如「8 个月」「1 岁 3 个月」；渲染档案时优先于 age）
     level: Optional[int] = None       # 等级
     signStreak: Optional[int] = None  # 连续签到天数
     description: Optional[str] = None  # 自我介绍（宠物档案）

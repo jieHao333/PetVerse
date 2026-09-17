@@ -38,6 +38,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDate;
+import java.time.Period;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
@@ -425,6 +426,11 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         vo.setTypeName(PetType.labelOf(pet.getType()));
         vo.setGenderName(PetGender.labelOf(pet.getGender()));
         vo.setSterilized(pet.getSterilized() != null && pet.getSterilized() == 1);
+        // 真实宠物的 age 列登记后不再维护（恒为 0），对外以生日实时换算的整岁为准
+        // （与身份卡展示 / AI 上下文年龄口径一致，不足 1 岁为 0）
+        if (PetType.REAL.name().equals(pet.getType()) && pet.getBirthday() != null) {
+            vo.setAge(Math.max(0, Period.between(pet.getBirthday(), LocalDate.now()).getYears()));
+        }
         if (pet.getLevel() == null || pet.getLevel() >= PetLevelCalculator.MAX_LEVEL) {
             vo.setNextLevelExp(0L);
         } else {

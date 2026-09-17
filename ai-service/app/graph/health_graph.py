@@ -51,6 +51,8 @@ def _profile_lines(pet: Dict[str, Any]) -> tuple[List[str], List[str]]:
     species = (pet.get("species") or "").strip()
     breed = (pet.get("breed") or "").strip()
     age = pet.get("age")
+    age_text = pet.get("ageText")
+    age_text = age_text.strip() if isinstance(age_text, str) else ""
     if name:
         lines.append(f"名字：{name}")
     if species:
@@ -59,7 +61,10 @@ def _profile_lines(pet: Dict[str, Any]) -> tuple[List[str], List[str]]:
         missing.append("物种")
     if breed:
         lines.append(f"品种：{breed}")
-    if age is not None:
+    # 年龄优先用前端按生日换算的精确文本（含月龄），缺失时回退数值年龄
+    if age_text:
+        lines.append(f"年龄：{age_text}")
+    elif age is not None:
         lines.append(f"年龄：{age} 岁")
     else:
         missing.append("年龄")
