@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # 同时作为存量会话（升级前只有 MySQL 历史）首次接入 checkpoint 时的回填上限
     HISTORY_MAX_MESSAGES: int = 40
 
+    # ---------- 长期记忆（LangGraph 官方 runtime store，跨会话） ----------
+    MEMORY_ENABLED: bool = True                 # 总开关：关闭后既不注入也不抽取（store 表保留）
+    MEMORY_MAX_ITEMS: int = 20                  # 注入 System Prompt 的记忆条数上限（用户级 + 宠物级合计）
+
     # ---------- LLM 生成参数 ----------
     LLM_MAX_TOKENS: int = 512
     LLM_TEMPERATURE: float = 0.8

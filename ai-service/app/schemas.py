@@ -152,3 +152,47 @@ class RecommendResult(BaseModel):
 
     items: List[RecommendItem] = Field(default_factory=list, description="按相关度降序的推荐列表")
     summary: str = Field(default="", description="整体推荐说明")
+
+
+# ============================================================
+# 长期记忆（LangGraph 官方 runtime store）
+# ============================================================
+
+# 单条记忆的归类：preference 偏好 / habit 习性 / fact 事实（如病史）
+MemoryKind = Literal["preference", "habit", "fact"]
+
+
+class MemoryItem(BaseModel):
+    """GET /ai/chat/memories 返回的单条长期记忆"""
+
+    key: str                      # store 内的唯一标识（删除接口用）
+    scope: Literal["user", "pet"] = Field(description="记忆归属：user 用户级 / pet 宠物级")
+    petId: Optional[str] = None   # 宠物级记忆的归属宠物 ID（字符串防精度丢失；user 级为 None）
+    petName: Optional[str] = None # 写入时快照的宠物名字（宠物改名/删除后仅作展示参考）
+    kind: MemoryKind = "preference"
+    content: str                  # 记忆内容（≤50 字）
+    createdAt: int = 0            # 创建时间（秒级时间戳）
+    updatedAt: int = 0            # 最近更新时间（秒级时间戳）
+
+
+class MemoryListData(BaseModel):
+    """GET /ai/chat/memories 返回的 data 结构"""
+
+    memories: List[MemoryItem] = []
+
+
+class MemoryOp(BaseModel):
+    """单条记忆维护操作（LLM 结构化输出，由 longterm 应用到 store）"""
+
+    action: Literal["add", "update", "delete", "none"] = Field(
+        description="add 新增记忆 / update 更新既有记忆（必须带 key）/ delete 删除过时或错误的既有记忆（必须带 key）/ none 本轮无长期记忆变更")
+    key: Optional[str] = Field(default=None, description="update / delete 时对应的既有记忆 key；add / none 时留空")
+    scope: Literal["user", "pet"] = Field(default="user", description="记忆归属：与具体宠物无关的用户信息用 user；当前宠物的习性/偏好/病史用 pet")
+    content: str = Field(default="", description="记忆内容，50 字以内的一条客观事实；action 为 none/delete 时留空")
+    kind: MemoryKind = Field(default="preference", description="记忆归类：preference 偏好 / habit 习性 / fact 事实")
+
+
+class MemoryUpdateResult(BaseModel):
+    """长期记忆抽取的结构化输出（本轮问答 → 记忆维护操作列表）"""
+
+    ops: List[MemoryOp] = Field(default_factory=list, description="本轮需要执行的记忆维护操作；无长期有效信息时为空列表或仅一条 none")

@@ -4,12 +4,13 @@
 
     START → classify_intent ──┬─(知识类)──→ retrieve_knowledge ──┬─(工具类)──→ tool_action ──┐
                              ├─(工具类)──────────────────────────┴───────────────────────────┤
-                             └─(闲聊)──────────────────────────────────────────────────────→ compose → generate → END
+                             └─(闲聊)──────────────────────────────────────────────────────→ recall_memory → compose → generate → END
 
   - classify_intent   意图识别（联网用 LLM 结构化输出，mock / 失败降级为关键词规则）
   - retrieve_knowledge RAG 检索：pgvector 语义检索，不可用时自动降级为关键词检索
   - tool_action       Agent 工具调用：查询用户真实宠物 / 订单 / 购物车 / 评论 / 动态
-  - compose           组装最终 System Prompt（人设 + 宠物档案 + 参考知识 + 真实数据 + 医疗护栏）
+  - recall_memory     长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
+  - compose           组装最终 System Prompt（人设 + 宠物档案 + 长期记忆 + 参考知识 + 真实数据 + 医疗护栏）
   - generate          调用 LLM 生成回答（真实模式；mock 模式由路由层走打字机 mock 流）
 
 会话记忆（LangGraph 官方 checkpoint）：
@@ -18,15 +19,21 @@ checkpoint.get_saver() 提供的官方 PostgresSaver 后由 checkpoint 自动持
 （thread_id = 用户+会话），下一轮对话自动恢复历史；被用户中止的轮次由路由层
 补写回 messages（见 chat._persist_interrupted）。
 compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 token 成本。
+
+长期记忆（LangGraph 官方 runtime store）：
+  编译时另注入 memstore.get_store() 提供的官方 PostgresStore，recall_memory 节点
+  经 config["store"] 读取（用户 + 宠物命名空间隔离，跨会话生效，见 app/memstore.py）；
+  store 不可用或 MEMORY_ENABLED 关闭时降级为无长期记忆，不影响对话。
 """
 import logging
 from typing import Annotated, Any, Dict, List, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from app import checkpoint, persona, vectorstore
+from app import checkpoint, memstore, persona, vectorstore
 from app.config import settings
 from app.llm import astructured_invoke, get_client
 from app.schemas import IntentResult, PetInfo
@@ -62,6 +69,7 @@ class ChatState(TypedDict, total=False):
     knowledge: List[Dict[str, Any]]  # RAG 检索结果
     knowledge_text: str            # 拼接后的知识上下文
     tool_context: str              # 工具查询结果
+    memory_text: str               # 长期记忆上下文（recall_memory 从 runtime store 读取渲染）
     medical: bool                  # 是否命中医疗护栏
     final_messages: List[Dict[str, str]]  # 最终发给模型的消息
     reply: str                     # 生成结果（真实模式）
@@ -155,6 +163,46 @@ async def tool_action(state: ChatState) -> Dict[str, Any]:
     return {"tool_context": ""}
 
 
+async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, Any]:
+    """长期记忆读取节点：从 runtime store 读取用户级 + 当前宠物级记忆
+
+    store 由图编译时注入（config["store"]，LangGraph 官方 runtime store 机制）；
+    store 缺失（未初始化 / 未注入）、MEMORY_ENABLED 关闭或读取失败时降级为
+    空字符串，compose 对应省略记忆块，对话主流程不受影响。
+    记忆条数按 MEMORY_MAX_ITEMS 截断（用户级 + 宠物级合计），控制 token 成本。
+    """
+    if not settings.MEMORY_ENABLED:
+        return {"memory_text": ""}
+    store = (config or {}).get("store") if isinstance(config, dict) else None
+    if store is None:
+        return {"memory_text": ""}
+
+    pet_dict = state.get("pet") or {}
+    pet_id = pet_dict.get("id") or 0
+    pet_name = (pet_dict.get("name") or "").strip()
+    user_id = state.get("user_id", 0)
+
+    lines: List[str] = []
+    try:
+        for ns, label in (
+            (memstore.user_ns(user_id), "用户"),
+            (memstore.pet_ns(user_id, pet_id), pet_name or "宠物"),
+        ):
+            items = await store.asearch(ns, limit=settings.MEMORY_MAX_ITEMS)
+            for item in items:
+                content = str((item.value or {}).get("content", "")).strip()
+                if content:
+                    lines.append(f"- [{label}] {content}")
+                if len(lines) >= settings.MEMORY_MAX_ITEMS:
+                    break
+            if len(lines) >= settings.MEMORY_MAX_ITEMS:
+                break
+    except Exception:
+        logger.warning("读取长期记忆失败，本轮不注入长期记忆", exc_info=True)
+        return {"memory_text": ""}
+    return {"memory_text": "\n".join(lines)}
+
+
 async def compose(state: ChatState) -> Dict[str, Any]:
     """组装节点：拼装最终消息列表（不调用模型）
 
@@ -172,6 +220,7 @@ async def compose(state: ChatState) -> Dict[str, Any]:
 
     system_prompt = persona.build_system_prompt(
         pet,
+        memory_context=state.get("memory_text", ""),
         knowledge_context=state.get("knowledge_text", ""),
         tool_context=state.get("tool_context", ""),
         medical=medical,
@@ -220,11 +269,11 @@ def _route_after_classify(state: ChatState) -> str:
         return "retrieve_knowledge"
     if intent == "tool_query":
         return "tool_action"
-    return "compose"
+    return "recall_memory"
 
 
 def _route_after_retrieve(state: ChatState) -> str:
-    return "tool_action" if state.get("intent") == "tool_query" else "compose"
+    return "tool_action" if state.get("intent") == "tool_query" else "recall_memory"
 
 
 # ---------- 图构建 ----------
@@ -235,8 +284,10 @@ _graph = None
 def get_chat_graph():
     """构建并缓存对话编排图（编译一次，进程内复用）
 
-    编译时注入 checkpoint saver（PostgreSQL 持久化图状态 / 对话记忆，
-    见 app/checkpoint.py）；saver 不可用时退化为无记忆图，保证对话功能仍可用。
+    编译时注入 checkpoint saver（PostgreSQL 持久化图状态 / 会话记忆，
+    见 app/checkpoint.py）与 runtime store（PostgreSQL 持久化长期记忆，
+    见 app/memstore.py）；任一不可用时对应能力退化（无会话记忆 / 无长期记忆），
+    保证对话功能仍可用。
     """
     global _graph
     if _graph is not None:
@@ -246,20 +297,23 @@ def get_chat_graph():
     builder.add_node("classify_intent", classify_intent)
     builder.add_node("retrieve_knowledge", retrieve_knowledge)
     builder.add_node("tool_action", tool_action)
+    builder.add_node("recall_memory", recall_memory)
     builder.add_node("compose", compose)
     builder.add_node("generate", generate)
 
     builder.add_edge(START, "classify_intent")
     builder.add_conditional_edges("classify_intent", _route_after_classify,
-                                  ["retrieve_knowledge", "tool_action", "compose"])
+                                  ["retrieve_knowledge", "tool_action", "recall_memory"])
     builder.add_conditional_edges("retrieve_knowledge", _route_after_retrieve,
-                                  ["tool_action", "compose"])
-    builder.add_edge("tool_action", "compose")
+                                  ["tool_action", "recall_memory"])
+    builder.add_edge("tool_action", "recall_memory")
+    builder.add_edge("recall_memory", "compose")
     builder.add_edge("compose", "generate")
     builder.add_edge("generate", END)
 
     saver = checkpoint.get_saver()
-    _graph = builder.compile(checkpointer=saver) if saver is not None else builder.compile()
+    store = memstore.get_store()
+    _graph = builder.compile(checkpointer=saver, store=store)
     return _graph
 
 
@@ -276,6 +330,7 @@ def initial_state(query: str, pet: Dict[str, Any], user_id: int,
         "knowledge": [],
         "knowledge_text": "",
         "tool_context": "",
+        "memory_text": "",
         "medical": False,
         "final_messages": [],
         "reply": "",

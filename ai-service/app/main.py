@@ -24,7 +24,7 @@ _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PACKAGE_ROOT not in sys.path:
     sys.path.insert(0, _PACKAGE_ROOT)
 
-from app import checkpoint, memory, nacos_client, persistence, pg_store
+from app import checkpoint, memory, memstore, nacos_client, persistence, pg_store
 from app.chat import router as chat_router
 from app.clients import biz
 from app.config import settings
@@ -56,6 +56,9 @@ async def lifespan(app: FastAPI):
     # LangGraph checkpoint：对话图状态（记忆）持久化到 PostgreSQL（同库不同表），
     # 建表失败的降级与重试由 checkpoint 模块内部处理，不会阻塞启动
     await checkpoint.init()
+    # LangGraph runtime store：长期记忆（用户 / 宠物偏好，跨会话）持久化到
+    # PostgreSQL（同库不同表），建表失败的降级与重试由 memstore 模块内部处理
+    await memstore.init()
     # PostgreSQL 连接池：健康评估报告持久化 + AI 结果缓存（pgvector 由 vectorstore 惰性初始化）
     await pg_store.init()
     # Nacos 注册：SDK 是同步库，用 to_thread 丢进后台线程，避免阻塞事件循环
@@ -68,6 +71,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(nacos_client.deregister)
     await biz.close()
     await checkpoint.close()
+    await memstore.close()
     await pg_store.close()
     await persistence.close()
     await memory.close()

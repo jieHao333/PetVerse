@@ -30,12 +30,13 @@ from fastapi import APIRouter, Header, Path, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app import checkpoint, llm, persistence
+from app import checkpoint, llm, longterm, memstore, persistence
 from app.config import settings
 from app.graph.chat_graph import get_chat_graph, initial_state
 from app.schemas import (
     ChatRequest,
     HistoryData,
+    MemoryListData,
     PetInfo,
     SessionListData,
     fail,
@@ -64,6 +65,9 @@ _STREAM_ATTEMPTS = 2
 _ERROR_MSG = "AI 服务暂时开小差了，请稍后再试"
 _USER_BUSY_MSG = "您有正在生成的咨询回复，请等它结束后再发送"
 
+# 后台长期记忆抽取任务集合（持引用防 GC；done 回调自动移除）
+_bg_memory_tasks: set = set()
+
 
 def _release_user_slot(user_id: int) -> None:
     """释放单用户并发槽位（计数归零时移除键，避免字典无限膨胀）"""
@@ -77,6 +81,19 @@ def _release_user_slot(user_id: int) -> None:
 def _sse(data: dict) -> str:
     """构造一条 SSE 事件（data: JSON + 空行结尾）"""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _spawn_memory_extraction(user_id: int, pet_id: int, pet_name: str,
+                             user_msg: str, reply: str) -> None:
+    """每轮正常结束后后台抽取长期记忆（不阻塞 SSE done / 不拖慢响应）
+
+    条件由调用方保证（真实模式 + reply 非空 + 长期记忆可用）；任务持引用防 GC，
+    done 回调从集合移除避免无限膨胀；任务内部已全部静默降级，此处无需接异常。
+    """
+    task = asyncio.create_task(
+        longterm.extract_and_apply(user_id, pet_id, pet_name, user_msg, reply))
+    _bg_memory_tasks.add(task)
+    task.add_done_callback(_bg_memory_tasks.discard)
 
 
 def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
@@ -333,6 +350,12 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
             await _append_mock_reply(graph, config, reply)
         await persistence.save_turn(user_id, pet_id, session_id, req.message, reply)
         appended = True   # 已收尾写入：后续若被取消，取消分支不再重复补写
+        # 8. 后台抽取长期记忆：正常轮 + 完整回复才抽取（中断轮 partial 易误导），
+        #    异步执行不阻塞 done 事件，失败在任务内部静默降级
+        if (not settings.is_mock and reply.strip()
+                and settings.MEMORY_ENABLED and memstore.available()):
+            _spawn_memory_extraction(user_id, pet_id, pet.name or "",
+                                     req.message, reply)
         yield _sse({"type": "done"})
     except (asyncio.CancelledError, GeneratorExit):
         # 客户端中途断开 / 用户点击「停止生成」：补写本轮记忆后安静退出。
@@ -457,6 +480,61 @@ async def list_sessions(
         return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
     data = SessionListData(sessions=sessions).model_dump()
     return JSONResponse(status_code=200, content=ok(data))
+
+
+@router.get("/chat/memories")
+async def list_memories(
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """查询当前用户的全部长期记忆（用户级 + 所有宠物级，最近更新在前）
+
+    长期记忆存于 LangGraph 官方 runtime store（PostgreSQL，见 app/memstore.py），
+    跨会话生效、与删除会话解耦；读取异常已内部降级为空列表，前端不会报错。
+    """
+    user_id = _parse_user_id(x_user_id)
+    if user_id is None:
+        return JSONResponse(status_code=200, content=fail(401, "未登录"))
+    try:
+        memories = await longterm.list_memories(user_id)
+    except Exception:
+        logger.warning("查询长期记忆失败: user_id=%s", user_id, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    data = MemoryListData(memories=memories).model_dump()
+    return JSONResponse(status_code=200, content=ok(data))
+
+
+@router.delete("/chat/memories/{key}")
+async def delete_memory(
+    key: str = Path(...),
+    scope: str = Query(default="user"),
+    petId: Optional[int] = Query(default=None),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """删除单条长期记忆
+
+    命名空间由「用户 ID + scope + petId」定位，天然隔离越权：他人无法通过
+    猜 key 删掉别人的记忆；store 侧删除异常已内部降级，返回成功但记忆可能
+    仍在（前端刷新列表可见），不影响主流程。
+    """
+    user_id = _parse_user_id(x_user_id)
+    if user_id is None:
+        return JSONResponse(status_code=200, content=fail(401, "未登录"))
+    if scope not in ("user", "pet"):
+        return JSONResponse(status_code=200, content=fail(400, "参数错误"))
+    if scope == "pet" and petId is None:
+        return JSONResponse(status_code=200, content=fail(400, "参数错误"))
+
+    store = memstore.get_store()
+    if store is None:
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    ns = (memstore.user_ns(user_id) if scope == "user"
+          else memstore.pet_ns(user_id, petId))
+    try:
+        await store.adelete(ns, key)
+    except Exception:
+        logger.warning("删除长期记忆失败: user_id=%s key=%s", user_id, key, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    return JSONResponse(status_code=200, content=ok(None))
 
 
 @router.delete("/chat/sessions/{session_id}")
