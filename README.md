@@ -2,9 +2,9 @@
 
 > 面向宠物爱好者的微服务社区平台后端，覆盖「虚拟宠物养成 + 真实宠物档案管理 + 社区社交 + 周边商城」四大业务域，并自研 AI 服务提供养宠顾问对话、健康智能评估、评论摘要与个性化推荐能力。
 
-本仓库为 **后端代码**，采用 **Java + Python 混合微服务**：Java 侧包含网关、用户、宠物、宠域空间（动态）、社交、点赞评论通知、商城共 8 个服务；AI 能力独立为 Python（FastAPI）服务，注册进 Nacos 后由 Spring Cloud Gateway 统一路由（`/api/ai/**`），与 Java 体系共享网关鉴权与服务发现。
+本仓库为 **后端代码**，采用 **Java + Python 混合微服务**：Java 侧包含网关、用户、宠物、宠域空间（动态）、社交、点赞评论通知、商城共 8 个服务；AI 能力独立为 Python（FastAPI、langchain\LangGragh）服务，注册进 Nacos 后由 Spring Cloud Gateway 统一路由（`/api/ai/**`），与 Java 体系共享网关鉴权与服务发现。
 
-> 前端代码见独立仓库 `PetVerse-web`（Vue 3 + Vite + Element Plus）。
+> 前端代码见独立仓库: https://github.com/jieHao333/PetVerse-web。
 
 ## 目录
 
