@@ -38,7 +38,8 @@ CREATE INDEX IF NOT EXISTS idx_chat_session_user_pet_update
     ON chat_session (user_id, pet_id, update_time DESC);
 
 -- ------------------------------------------------------------
--- 对话消息表（按会话隔离；interrupted 标记被用户中止生成的回复）
+-- 对话消息表（按会话隔离；interrupted 标记被用户中止生成的回复；
+-- attachments 为多模态附件 JSONB 数组，仅用户消息携带）
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS chat_message
 (
@@ -51,12 +52,15 @@ CREATE TABLE IF NOT EXISTS chat_message
     interrupted BOOLEAN     NOT NULL DEFAULT FALSE,
     create_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- 多模态附件列（幂等：存量库补列，新建表由上方 CREATE 语句保证缺失——此处统一补齐）
+ALTER TABLE chat_message ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb;
 COMMENT ON TABLE chat_message IS '宠物AI对话消息（按会话隔离的持久化存储）';
 COMMENT ON COLUMN chat_message.user_id IS '所属用户ID';
 COMMENT ON COLUMN chat_message.pet_id IS '所属宠物ID（缺失时兜底为0）';
 COMMENT ON COLUMN chat_message.session_id IS '所属会话ID（chat_session.id）';
 COMMENT ON COLUMN chat_message.role IS '角色：user / assistant';
 COMMENT ON COLUMN chat_message.interrupted IS '助手回复是否被用户中止生成（仅 assistant 消息置位）';
+COMMENT ON COLUMN chat_message.attachments IS '多模态附件数组 [{type,url,mime,name,size,transcript?}]（仅用户消息）';
 CREATE INDEX IF NOT EXISTS idx_chat_message_user_session_time
     ON chat_message (user_id, session_id, create_time);
 CREATE INDEX IF NOT EXISTS idx_chat_message_user_pet_time

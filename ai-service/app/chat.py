@@ -8,10 +8,13 @@
 前端侧栏直接展示该用户与所有宠物的全部历史会话（每条带归属宠物 petId），无需先选宠物。
 
 接口一览：
-  1. POST   /ai/chat/stream             SSE 流式对话（sessionId 缺省时自动建会话，首帧 meta 回传）
+  1. POST   /ai/chat/stream             SSE 流式对话（sessionId 缺省时自动建会话，首帧 meta 回传；
+                                        支持多模态附件：图片走视觉模型、音频可转写、视频文字占位）
   2. GET    /ai/chat/history            查询指定会话的对话历史（时间正序：旧 → 新）
   3. GET    /ai/chat/sessions           查询用户的全部会话（跨宠物统一展示，最近活跃在前）
   4. DELETE /ai/chat/sessions/{sid}     删除会话（连带消息与 checkpoint 记忆）
+  5. POST   /ai/chat/upload             上传多模态附件（图片/音频/视频），返回附件信息
+  6. GET    /ai/chat/media/{name}       附件回放（uuid 文件名不可猜测，走网关免鉴权白名单）
 
 存储分层（PostgreSQL 库 petverse_ai，业务数据同库）：
   - LangGraph checkpoint（checkpoint.py）：LLM 上下文记忆——图状态 messages 按
@@ -26,11 +29,11 @@ import logging
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Header, Path, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, File, Header, Path, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app import checkpoint, llm, longterm, memstore, persistence
+from app import checkpoint, llm, longterm, memstore, media, persistence
 from app.config import settings
 from app.graph.chat_graph import get_chat_graph, initial_state
 from app.schemas import (
@@ -105,6 +108,42 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return user_id if user_id > 0 else None
+
+
+async def _prepare_attachments(attachments: list) -> list:
+    """附件预处理：真实模式下转写音频（转写文本回填 transcript 字段）
+
+    转写失败 / 未配置 ASR 时静默降级（transcript 保持 None，后续以文字占位
+    提示模型），绝不阻断对话主流程；mock 模式跳过转写（无外部服务可调）。
+    """
+    if settings.is_mock or not attachments:
+        return attachments
+    for att in attachments:
+        if att.get("type") != media.KIND_AUDIO:
+            continue
+        transcript = await media.transcribe_audio(att)
+        if transcript:
+            att["transcript"] = transcript
+    return attachments
+
+
+def _attachment_enriched_text(text: str, attachments: list) -> str:
+    """构造进入 LLM / checkpoint 记忆的用户消息文本
+
+    原文字 + 附件摘要（含音频转写）+ 给模型的降级提示（无法看图 / 无法看视频 /
+    音频未转写时引导用户文字补充）。持久化的 content 只存原文字（前端单独渲染
+    附件），两者刻意分离：历史回放气泡不会出现与渲染的附件重复的占位文本。
+    """
+    parts = [text] if text else []
+    if attachments:
+        summary = media.attachment_summary(attachments)
+        if summary:
+            parts.append(f"（{summary}）")
+        describe = media.describe_for_prompt(
+            attachments, settings.vision_enabled, settings.asr_enabled)
+        if describe:
+            parts.append(describe)
+    return "\n".join(parts)
 
 
 async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int], Optional[JSONResponse]]:
@@ -195,13 +234,14 @@ def _history_messages(history: list) -> list:
 
 async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
                                session_id: int, user_msg: str,
-                               human_msg: HumanMessage, partial: str) -> None:
+                               human_msg: HumanMessage, partial: str,
+                               attachments: Optional[list] = None) -> None:
     """用户中止生成后的记忆补写（在 asyncio.shield 保护下调用）
 
     1) checkpoint：把用户问题（与输入同 id，去重）与已产出的部分回复补写回图状态，
        部分回复标记 interrupted；as_node="generate" 表示这些更新来自最终生成节点，
        图状态就此收尾（next 为空），下一轮对话从 START 重新展开，不会重放未完成节点；
-    2) PostgreSQL：兜底保存本轮（供前端历史回放），会话已删除时原子跳过。
+    2) PostgreSQL：兜底保存本轮（供前端历史回放，含多模态附件），会话已删除时原子跳过。
     """
     messages: list = [human_msg]
     if partial:
@@ -213,7 +253,7 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
             logger.warning("中断记忆补写 checkpoint 失败(忽略): user_id=%s session_id=%s",
                            user_id, session_id, exc_info=True)
     await persistence.save_turn_if_exists(user_id, pet_id, session_id, user_msg, partial,
-                                          interrupted=True)
+                                          interrupted=True, attachments=attachments)
 
 
 async def _append_mock_reply(graph, config: dict, reply: str) -> None:
@@ -265,10 +305,24 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         #    取消分支必须能安全引用这三个对象来补写记忆。
         graph = get_chat_graph()
         config = checkpoint.thread_config(user_id, session_id)
-        human_msg = HumanMessage(content=req.message, id=uuid4().hex)
+        text = (req.message or "").strip()
+        attachments = [a.model_dump() for a in (req.attachments or [])]
+        # 进入 LLM / checkpoint 的用户文本（含附件摘要与降级提示；音频转写后再增强）
+        enriched = _attachment_enriched_text(text, attachments)
+        human_msg = HumanMessage(content=enriched or "（附件咨询）", id=uuid4().hex)
+        # 持久化的用户消息文本：只存原文字（纯附件时用摘要做会话标题兜底）
+        persist_msg = text or (media.attachment_summary(attachments) or "附件咨询")
 
         # 3. 首帧回传会话元信息：前端据此绑定 sessionId（自动新建会话场景）并刷新会话列表
         yield _sse({"type": "meta", "sessionId": session_id})
+
+        # 3.5 多模态附件预处理（音频转写，耗时网络调用）：完成后重算增强文本。
+        #    此处被取消时取消分支用转写前的 human_msg / persist_msg 兜底补写，不丢本轮提问
+        if attachments:
+            attachments = await _prepare_attachments(attachments)
+            enriched = _attachment_enriched_text(text, attachments)
+            if enriched:
+                human_msg = HumanMessage(content=enriched, id=human_msg.id)
 
         # 4. 构造本轮输入：历史记忆由 checkpoint 按 thread（用户 + 会话）恢复；
         #    中断过的轮次也已补写进图状态，因此「用户暂停后 AI 没记忆」不再发生。
@@ -289,11 +343,17 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                 input_messages = _history_messages(history) + input_messages
 
         # 5. 由 LangGraph 编排本轮对话：意图识别 → (RAG 检索 / 工具调用) → Prompt 组装 → 生成
+        #    query 为意图识别 / RAG 检索用的文本：优先原文字；纯附件时用音频转写
+        #    （转写内容是最有检索价值的文本信号；纯图片 / 视频则交由意图兜底逻辑处理）
+        query = text
+        if not query:
+            query = "；".join(a.get("transcript") or "" for a in attachments).strip("；")
         state = initial_state(
-            query=req.message,
+            query=query,
             pet=pet.model_dump(),
             user_id=user_id,
             messages=input_messages,
+            attachments=attachments,
         )
 
         if settings.is_mock:
@@ -312,7 +372,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         queue: asyncio.Queue = asyncio.Queue()
         for attempt in range(_STREAM_ATTEMPTS):
             if settings.is_mock:
-                stream = llm.mock_stream(req.message, pet.name or "")
+                stream = llm.mock_stream(human_msg.content, pet.name or "")
             else:
                 stream = _graph_stream(state, config)
             producer = asyncio.create_task(_pump(stream, queue))
@@ -342,20 +402,21 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
             if not retryable:
                 break   # 流正常结束，退出尝试循环进入收尾写入
 
-        # 7. 流正常结束：PostgreSQL 持久化（前端历史）+ mock 模式补写图状态，随后发出 done
+        # 7. 流正常结束：PostgreSQL 持久化（前端历史，含多模态附件）+ mock 模式补写图状态，随后发出 done
         # checkpoint 侧：真实模式由 generate 节点写回 messages，图任务收尾时自动落库；
         # mock 模式回复不在图内，由 _append_mock_reply 手动补写，保持两模式记忆一致。
         reply = "".join(collected)
         if settings.is_mock and reply.strip():
             await _append_mock_reply(graph, config, reply)
-        await persistence.save_turn(user_id, pet_id, session_id, req.message, reply)
+        await persistence.save_turn(user_id, pet_id, session_id, persist_msg, reply,
+                                    attachments=attachments)
         appended = True   # 已收尾写入：后续若被取消，取消分支不再重复补写
         # 8. 后台抽取长期记忆：正常轮 + 完整回复才抽取（中断轮 partial 易误导），
         #    异步执行不阻塞 done 事件，失败在任务内部静默降级
         if (not settings.is_mock and reply.strip()
                 and settings.MEMORY_ENABLED and memstore.available()):
             _spawn_memory_extraction(user_id, pet_id, pet.name or "",
-                                     req.message, reply)
+                                     human_msg.content, reply)
         yield _sse({"type": "done"})
     except (asyncio.CancelledError, GeneratorExit):
         # 客户端中途断开 / 用户点击「停止生成」：补写本轮记忆后安静退出。
@@ -373,7 +434,8 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
             if not appended and graph is not None and human_msg is not None:
                 partial = "".join(collected)
                 await asyncio.shield(_persist_interrupted(
-                    graph, config, user_id, pet_id, session_id, req.message, human_msg, partial))
+                    graph, config, user_id, pet_id, session_id, persist_msg,
+                    human_msg, partial, attachments=attachments))
         except BaseException:
             pass
         raise
@@ -394,10 +456,10 @@ async def chat_stream(
     req: ChatRequest,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """SSE 流式对话
+    """SSE 流式对话（支持多模态附件）
 
     - 网关注入的 X-User-Id 缺失 / 非法：HTTP 200 + {"code":401,"msg":"未登录"}
-    - 消息为空或纯空白：HTTP 200 + {"code":400,"msg":"参数错误"}
+    - 消息为空且无附件：HTTP 200 + {"code":400,"msg":"参数错误"}
     - sessionId 非法 / 不属于当前用户：HTTP 200 + {"code":404,"msg":"会话不存在或已删除"}
     - 正常：text/event-stream 流，meta → delta * n → done（异常时发 error 后结束）
     """
@@ -406,11 +468,14 @@ async def chat_stream(
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
 
-    # 2. 消息内容校验：空 / 纯空白直接拒绝；超长消息拒绝（保护上下文窗口与 token 成本）
-    if not req.message or not req.message.strip():
+    # 2. 消息内容校验：文字与附件至少其一；超长文字 / 超量附件拒绝（保护上下文窗口与 token 成本）
+    if not (req.message or "").strip() and not req.attachments:
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
-    if len(req.message) > _MAX_MESSAGE_LEN:
+    if len(req.message or "") > _MAX_MESSAGE_LEN:
         return JSONResponse(status_code=200, content=fail(400, f"消息过长，请精简到 {_MAX_MESSAGE_LEN} 字以内"))
+    if len(req.attachments) > settings.CHAT_MAX_ATTACHMENTS:
+        return JSONResponse(status_code=200, content=fail(
+            400, f"单条消息最多携带 {settings.CHAT_MAX_ATTACHMENTS} 个附件"))
     
     # 2.5 单用户并发闸：同一用户最多同时 _USER_MAX_CONCURRENT 路流式对话（预检查在会话创建前，
     # 避免超限请求白建空会话；正式登记在流生成器内完成，二者非严格原子但竞态窗口极小）
@@ -434,6 +499,42 @@ async def chat_stream(
             "Connection": "keep-alive",         # 保持长连接
         },
     )
+
+
+@router.post("/chat/upload")
+async def upload_chat_attachment(
+    file: UploadFile = File(..., description="附件文件（图片/音频/视频）"),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """上传多模态附件，返回附件信息（前端原样放入 ChatRequest.attachments）
+
+    类型与大小校验在 app/media.save_upload 内完成（MIME 主类型判定 + 扩展名兜底；
+    图片 10MB / 音频 20MB / 视频 50MB，上限可经 .env 调整）。
+    """
+    user_id = _parse_user_id(x_user_id)
+    if user_id is None:
+        return JSONResponse(status_code=200, content=fail(401, "未登录"))
+    try:
+        attachment = await media.save_upload(file.filename, file.content_type, file.read)
+    except media.UploadError as exc:
+        return JSONResponse(status_code=200, content=fail(400, str(exc)))
+    except Exception:
+        logger.warning("保存附件失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, "附件上传失败，请稍后再试"))
+    return JSONResponse(status_code=200, content=ok(attachment))
+
+
+@router.get("/chat/media/{name}")
+async def get_chat_media(name: str = Path(..., description="附件文件名（uuid + 扩展名）")):
+    """附件回放（历史消息渲染 / 前端预览）
+
+    <img>/<video>/<audio> 标签无法携带 Authorization 头，本路径走网关免鉴权白名单；
+    文件名为不可猜测的 uuid4，且正则白名单校验扩展名（防路径穿越与任意文件读取）。
+    """
+    path = media.media_path(name)
+    if path is None:
+        return JSONResponse(status_code=200, content=fail(404, "附件不存在或已清理"))
+    return FileResponse(path, media_type=media.mime_by_ext(path.suffix.lower()))
 
 
 @router.get("/chat/history")

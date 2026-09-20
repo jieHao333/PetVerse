@@ -24,6 +24,7 @@
      ON UPDATE CURRENT_TIMESTAMP，等价语义在此显式实现）。
 """
 import asyncio
+import json
 import logging
 import time
 from typing import List, Optional
@@ -69,6 +70,9 @@ _SCHEMA_STATEMENTS = (
          interrupted BOOLEAN     NOT NULL DEFAULT FALSE,
          create_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )""",
+    # 多模态附件（图片/音频/视频，JSONB 数组，仅用户消息携带）。
+    # CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，存量库靠这条幂等 ALTER 升级
+    """ALTER TABLE chat_message ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb""",
     """CREATE INDEX IF NOT EXISTS idx_chat_message_user_session_time
          ON chat_message (user_id, session_id, create_time)""",
     """CREATE INDEX IF NOT EXISTS idx_chat_message_user_pet_time
@@ -239,41 +243,48 @@ async def delete_session(user_id: int, session_id: int) -> None:
 # - 用户消息永远落库（含中止时零产出的场景），保证这轮提问不丢；
 # - reply 为空时只写用户消息，不产生空回复条目；
 # - interrupted 仅标记 assistant 消息（该回复是否被用户中止生成）；
+# - 多模态附件（attachments）仅随用户消息落库（JSONB，assistant 回复恒为空数组）；
 # - _TOUCH_SQL 每轮刷新会话活跃时间（列表排序依据），并在标题仍为默认
 #   「新会话」时用首条用户消息自动命名（对中断兜底保存同样生效）。
-_INSERT_SQL = ("INSERT INTO chat_message (user_id, pet_id, session_id, role, content, interrupted, create_time) "
-               "VALUES (%s, %s, %s, %s, %s, %s, NOW())")
+_INSERT_SQL = ("INSERT INTO chat_message (user_id, pet_id, session_id, role, content, interrupted, attachments, create_time) "
+               "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW())")
 _TOUCH_SQL = ("UPDATE chat_session SET title = CASE WHEN title = '新会话' THEN %s ELSE title END, "
               "update_time = NOW() WHERE id = %s AND user_id = %s")
 
 
 def _turn_statements(user_id: int, pet_id: int, session_id: int,
-                     user_msg: str, reply: str, interrupted: bool) -> List[tuple]:
+                     user_msg: str, reply: str, interrupted: bool,
+                     attachments: Optional[list] = None) -> List[tuple]:
     """构造一轮对话的事务语句列表（用户消息 + 可选助手回复 + 会话刷新）"""
-    statements = [(_INSERT_SQL, (user_id, pet_id, session_id, "user", user_msg, False))]
+    att_json = json.dumps(attachments or [], ensure_ascii=False)
+    statements = [(_INSERT_SQL, (user_id, pet_id, session_id, "user", user_msg, False, att_json))]
     if reply:
         statements.append(
-            (_INSERT_SQL, (user_id, pet_id, session_id, "assistant", reply, interrupted)))
-    statements.append((_TOUCH_SQL, (user_msg.strip()[:TITLE_MAX_LEN], session_id, user_id)))
+            (_INSERT_SQL, (user_id, pet_id, session_id, "assistant", reply, interrupted, "[]")))
+    statements.append((_TOUCH_SQL, (user_msg.strip()[:TITLE_MAX_LEN] or "新会话", session_id, user_id)))
     return statements
 
 
 async def save_turn(user_id: int, pet_id: int, session_id: int,
-                    user_msg: str, reply: str, interrupted: bool = False) -> None:
+                    user_msg: str, reply: str, interrupted: bool = False,
+                    attachments: Optional[list] = None) -> None:
     """持久化一轮对话（用户消息 + 助手回复）到 PostgreSQL
 
     一次事务写入，保证顺序与原子性；顺带刷新会话活跃时间、
     首轮时用首条用户消息命名会话；reply 为空（模型空输出）时只写用户消息。
+    attachments 为多模态附件列表（仅用户消息携带）。
     任何异常仅记日志，不影响对话主流程。
     """
     try:
-        await _run_tx(_turn_statements(user_id, pet_id, session_id, user_msg, reply, interrupted))
+        await _run_tx(_turn_statements(user_id, pet_id, session_id,
+                                       user_msg, reply, interrupted, attachments))
     except Exception:
         logger.warning("写入 PostgreSQL 对话历史失败（不影响本次对话）", exc_info=True)
 
 
 async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
-                              user_msg: str, reply: str, interrupted: bool = False) -> None:
+                              user_msg: str, reply: str, interrupted: bool = False,
+                              attachments: Optional[list] = None) -> None:
     """条件持久化一轮对话：仅当该会话仍然存在时才写入
 
     客户端中途断开 / 用户停止生成的兜底保存走这里：若用户此刻已删除该会话
@@ -290,7 +301,8 @@ async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
         if not rows:
             # 会话已被删除：跳过写入，避免复活历史
             return
-        await _run_tx(_turn_statements(user_id, pet_id, session_id, user_msg, reply, interrupted))
+        await _run_tx(_turn_statements(user_id, pet_id, session_id,
+                                       user_msg, reply, interrupted, attachments))
     except Exception:
         logger.warning("条件写入 PostgreSQL 对话历史失败（不影响本次对话）", exc_info=True)
 
@@ -305,22 +317,36 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
     # 用子查询先按时间倒序取最近 N 条，再外层按时间正序返回，避免 ORDER BY + LIMIT 组合的方向陷阱；
     # 子查询必须同时 SELECT id，否则外层无法用 id 作为同时间戳下的次级排序键
     if limit is not None and limit > 0:
-        sql = ("SELECT role, content, pet_id, EXTRACT(EPOCH FROM create_time)::bigint AS ts, interrupted FROM ("
-               "  SELECT id, role, content, pet_id, interrupted, create_time FROM chat_message "
+        sql = ("SELECT role, content, pet_id, attachments, EXTRACT(EPOCH FROM create_time)::bigint AS ts, interrupted FROM ("
+               "  SELECT id, role, content, pet_id, attachments, interrupted, create_time FROM chat_message "
                "  WHERE user_id=%s AND session_id=%s ORDER BY create_time DESC, id DESC LIMIT %s"
                ") t ORDER BY create_time ASC, id ASC")
         params = (user_id, session_id, limit)
     else:
-        sql = ("SELECT role, content, pet_id, EXTRACT(EPOCH FROM create_time)::bigint AS ts, interrupted "
+        sql = ("SELECT role, content, pet_id, attachments, EXTRACT(EPOCH FROM create_time)::bigint AS ts, interrupted "
                "FROM chat_message WHERE user_id=%s AND session_id=%s ORDER BY create_time ASC, id ASC")
         params = (user_id, session_id)
     try:
         rows = await _run(sql, params, fetch=True)
         # petId 转字符串下发防前端截断；pet_id 为 0 / NULL 时视为未知，返回 None；
-        # interrupted 标记助手回复是否被用户中止（前端历史回放展示「（已停止）」）
+        # interrupted 标记助手回复是否被用户中止（前端历史回放展示「（已停止）」）；
+        # attachments 为该条消息的多模态附件（JSONB 数组，psycopg 反序列化为 list）
         return [{"role": r[0], "content": r[1], "petId": str(r[2]) if r[2] else None,
-                 "ts": int(r[3]), "interrupted": bool(r[4])}
+                 "attachments": _clean_attachments(r[3]), "ts": int(r[4]), "interrupted": bool(r[5])}
                 for r in rows]
     except Exception:
         logger.warning("读取 PostgreSQL 对话历史失败，降级为空历史", exc_info=True)
         return []
+
+
+def _clean_attachments(raw) -> list:
+    """附件列容错清洗：非 list（旧版本空值 / 脏数据）一律归一为空列表"""
+    if isinstance(raw, list):
+        return [a for a in raw if isinstance(a, dict) and a.get("type") and a.get("url")]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+    return []

@@ -31,12 +31,30 @@ class PetInfo(BaseModel):
     health: Optional[Dict[str, Optional[str]]] = None  # 健康信息（类别键->内容，猫/狗身份卡维护；值为 null 时按未填写处理）
 
 
+class AttachmentInfo(BaseModel):
+    """单个多模态附件（图片 / 音频 / 视频）
+
+    由 POST /ai/chat/upload 上传后返回，前端原样放进 ChatRequest.attachments；
+    url 为本服务回放地址（/ai/chat/media/{uuid}.ext），transcript 为音频转写结果
+    （由后端转写后回填，前端只读）。
+    """
+
+    type: Literal["image", "audio", "video"] = Field(description="附件类型")
+    url: str = Field(description="附件回放 URL（/ai/chat/media/{name}）")
+    mime: str = Field(default="", description="MIME 类型")
+    name: str = Field(default="", description="原始文件名")
+    size: int = Field(default=0, description="文件大小（字节）")
+    transcript: Optional[str] = Field(default=None, description="音频转写文本（后端转写后回填）")
+
+
 class ChatRequest(BaseModel):
     """POST /ai/chat/stream 请求体"""
 
-    message: str = Field(..., description="用户本轮输入的消息")
+    message: str = Field(default="", description="用户本轮输入的文字消息；纯附件时可缺省")
     pet: PetInfo = Field(default_factory=PetInfo, description="当前咨询的宠物信息（缺省时不拼宠物档案）")
     sessionId: Optional[int] = Field(default=None, description="会话 ID；缺省时后端自动新建会话并通过 meta 事件回传")
+    attachments: List[AttachmentInfo] = Field(default_factory=list,
+                                             description="本轮多模态附件（图片/音频/视频），先经 /ai/chat/upload 上传")
 
 
 class SessionItem(BaseModel):
@@ -62,10 +80,12 @@ class HistoryMessage(BaseModel):
     """单条对话历史消息"""
 
     role: str        # 角色：user / assistant
-    content: str     # 消息内容
+    content: str     # 消息文字内容（纯附件的用户消息可能为空串，附件在 attachments 字段）
     petId: Optional[str] = None  # 该轮消息归属的宠物 ID（雪花 ID 用字符串下发防截断；None 表示未知）
     ts: int = 0      # 消息时间戳（秒级）
     interrupted: bool = False    # assistant 回复是否被用户中止生成（历史回放展示「（已停止）」）
+    attachments: List[AttachmentInfo] = Field(default_factory=list,
+                                              description="该条消息携带的多模态附件（仅用户消息）")
 
 
 class HistoryData(BaseModel):

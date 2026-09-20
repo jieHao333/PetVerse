@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # 真实模式客户端单例（惰性创建；mock 模式下永远不会触发创建）
 _client = None
+_vision_client = None
 _embeddings = None
 
 
@@ -42,6 +43,31 @@ def get_client():
             max_retries=1,                           # 重试上限 1 次：失败快速暴露给心跳超时兜底
         )
     return _client
+
+
+def get_vision_client():
+    """获取视觉理解（多模态）ChatOpenAI 客户端单例
+
+    与文本客户端分开配置（LLM_VISION_*）：文本走 DeepSeek、图片走百炼 qwen-vl
+    这类「不同服务商混搭」是常见形态；Key / BaseURL 缺省时已回落到 LLM_*。
+    调用方（chat_graph.generate）保证仅在 settings.vision_enabled 时才会走到这里，
+    未配置视觉模型时图片不会进入消息内容（降级为文字占位，见 app/media.py）。
+    """
+    global _vision_client
+    if _vision_client is None:
+        from langchain_openai import ChatOpenAI
+
+        _vision_client = ChatOpenAI(
+            base_url=settings.LLM_VISION_BASE_URL,
+            api_key=settings.LLM_VISION_API_KEY,
+            model=settings.LLM_VISION_MODEL,
+            streaming=True,
+            max_tokens=settings.LLM_MAX_TOKENS,
+            temperature=settings.LLM_TEMPERATURE,
+            timeout=90,                              # 图片上下行体积大，超时略宽于文本客户端
+            max_retries=1,
+        )
+    return _vision_client
 
 
 def get_embeddings():

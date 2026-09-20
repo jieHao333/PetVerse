@@ -26,7 +26,7 @@ compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 t
   store 不可用或 MEMORY_ENABLED 关闭时降级为无长期记忆，不影响对话。
 """
 import logging
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -35,7 +35,8 @@ from langgraph.graph.message import add_messages
 
 from app import checkpoint, memstore, persona, vectorstore
 from app.config import settings
-from app.llm import astructured_invoke, get_client
+from app.llm import astructured_invoke, get_client, get_vision_client
+from app.media import KIND_IMAGE, image_data_url
 from app.schemas import IntentResult, PetInfo
 from app.tools import build_tools
 
@@ -58,11 +59,14 @@ _CHITCHAT_WORDS = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "再�
 class ChatState(TypedDict, total=False):
     """对话图状态（messages 走 add_messages reducer，其余字段后写覆盖前值）"""
 
-    query: str                     # 用户本轮输入
+    query: str                     # 用户本轮输入（纯附件时为附件摘要文本，含音频转写）
     pet: Dict[str, Any]            # 宠物档案（dict 形式）
     user_id: int                   # 当前用户 ID
+    attachments: List[Dict[str, Any]]  # 本轮多模态附件（图片/音频/视频，dict 形式）
     # 对话消息（跨轮累积）：输入的本轮 HumanMessage、generate 写回的 AIMessage、
-    # 中断补写的人机消息都汇聚于此，由 checkpoint 按 thread 持久化，构成长期记忆
+    # 中断补写的人机消息都汇聚于此，由 checkpoint 按 thread 持久化，构成长期记忆；
+    # 消息内容恒为纯文本（附件描述 / 转写以文字并入），图片分片仅在 compose 组装
+    # 最终请求时按当前轮附件现算——避免 base64 图片进 checkpoint 撑爆记忆存储
     messages: Annotated[List[AnyMessage], add_messages]
     intent: str                    # 意图
     intent_reason: str
@@ -94,8 +98,15 @@ def _rule_intent(query: str) -> str:
 
 
 async def classify_intent(state: ChatState) -> Dict[str, Any]:
-    """意图识别节点：真实模式用 LLM 结构化输出，其余走规则"""
+    """意图识别节点：真实模式用 LLM 结构化输出，其余走规则
+
+    纯附件消息（无文字）没有可分类的文本：养宠场景发图片 / 音频 / 视频
+    绝大多数是「看看这是什么情况」的知识或健康咨询，直接归 knowledge，
+    不再让分类器对「用户发送了 N 张图片」这类摘要文本猜意图。
+    """
     query = state.get("query", "")
+    if state.get("attachments") and not query.strip():
+        return {"intent": "knowledge", "intent_reason": "attachment/no-text"}
     if settings.is_mock:
         intent = _rule_intent(query)
         return {"intent": intent, "intent_reason": "mock/rule"}
@@ -203,12 +214,33 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
     return {"memory_text": "\n".join(lines)}
 
 
+def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> list:
+    """当前轮用户消息的多模态内容分片（OpenAI 兼容格式）
+
+    视觉可用时图片以 image_url 分片直发（base64 data URL，服务商无法回源拉取
+    本服务内网附件地址）；图片文件缺失（被清理）时跳过该图并保留文字描述。
+    返回内容为 list 表示走视觉模型；无有效图片时返回 None 由调用方退回纯文本。
+    """
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": text or "请帮我看看这些内容"}]
+    used = False
+    for att in attachments or []:
+        if att.get("type") != KIND_IMAGE:
+            continue
+        data_url = image_data_url(att)
+        if data_url:
+            parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            used = True
+    return parts if used else None
+
+
 async def compose(state: ChatState) -> Dict[str, Any]:
     """组装节点：拼装最终消息列表（不调用模型）
 
     历史窗口从图状态 messages 中取最近 HISTORY_MAX_MESSAGES 条（checkpoint 保留
     全量记忆，此处按窗口裁剪控制上下文与 token 成本）；窗口内为空内容的助手消息
     （如 LLM 空输出）直接跳过。
+    多模态：仅当前轮（窗口内最后一条 HumanMessage）携带 image_url 分片发给视觉
+    模型；历史轮的附件早已以文字描述并入消息内容，不再重复发图控制 token 成本。
     """
     pet_dict = state.get("pet") or {}
     try:
@@ -225,14 +257,25 @@ async def compose(state: ChatState) -> Dict[str, Any]:
         tool_context=state.get("tool_context", ""),
         medical=medical,
     )
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     history = state.get("messages") or []
-    for msg in history[-settings.HISTORY_MAX_MESSAGES:]:
+    window = history[-settings.HISTORY_MAX_MESSAGES:]
+    # 当前轮用户消息：窗口内最后一条 HumanMessage（compose 运行时 generate 尚未执行）
+    current_human = next((m for m in reversed(window) if isinstance(m, HumanMessage)), None)
+    multimodal = None
+    if current_human is not None and settings.vision_enabled:
+        multimodal = _multimodal_content(
+            current_human.content if isinstance(current_human.content, str) else str(current_human.content),
+            state.get("attachments") or [])
+    for msg in window:
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        if not content.strip():
+        if not content.strip() and msg is not current_human:
             continue
         if isinstance(msg, HumanMessage):
-            messages.append({"role": "user", "content": content})
+            if msg is current_human and multimodal is not None:
+                messages.append({"role": "user", "content": multimodal})
+            elif content.strip():
+                messages.append({"role": "user", "content": content})
         elif isinstance(msg, AIMessage):
             messages.append({"role": "assistant", "content": content})
     return {"final_messages": messages, "medical": medical}
@@ -240,11 +283,18 @@ async def compose(state: ChatState) -> Dict[str, Any]:
 
 async def generate(state: ChatState) -> Dict[str, Any]:
     """生成节点：真实模式调用 LLM 并把回复写回 messages（随 checkpoint 持久化）；
-    mock 模式不调用（由路由层走 mock 流，回复由路由层补写进图状态）"""
+    mock 模式不调用（由路由层走 mock 流，回复由路由层补写进图状态）
+
+    最终消息含多模态分片（当前轮带图）时切换视觉模型客户端；视觉模型不可用
+    的兜底由 compose 保证（不会组装出带图内容），此处仅按内容形态选客户端。
+    """
     if settings.is_mock:
         return {"reply": ""}
+    final_messages = state.get("final_messages", [])
+    has_image = any(isinstance(m.get("content"), list) for m in final_messages)
+    client = get_vision_client() if has_image else get_client()
     try:
-        resp = await get_client().ainvoke(state.get("final_messages", []))
+        resp = await client.ainvoke(final_messages)
         content = resp.content
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content
@@ -318,12 +368,15 @@ def get_chat_graph():
 
 
 def initial_state(query: str, pet: Dict[str, Any], user_id: int,
-                  messages: List[AnyMessage]) -> ChatState:
-    """构造图初始状态：messages 为本轮输入消息（本轮 HumanMessage，老会话首次接入时为回填历史 + 本轮）"""
+                  messages: List[AnyMessage],
+                  attachments: Optional[List[Dict[str, Any]]] = None) -> ChatState:
+    """构造图初始状态：messages 为本轮输入消息（本轮 HumanMessage，老会话首次接入时为回填历史 + 本轮）；
+    attachments 为本轮多模态附件（compose 组装带图内容时用，消息通道本身只存文本）"""
     return {
         "query": query,
         "pet": pet or {},
         "user_id": user_id,
+        "attachments": attachments or [],
         "messages": messages or [],
         "intent": "",
         "intent_reason": "",
