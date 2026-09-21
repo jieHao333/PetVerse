@@ -7,7 +7,7 @@
                              └─(闲聊)──────────────────────────────────────────────────────→ recall_memory → compose → generate → END
 
   - classify_intent   意图识别（联网用 LLM 结构化输出，mock / 失败降级为关键词规则）
-  - retrieve_knowledge RAG 检索：pgvector 语义检索，不可用时自动降级为关键词检索
+  - retrieve_knowledge RAG 检索：pgvector 语义检索，不可用时直接报错（不降级）
   - tool_action       Agent 工具调用：查询用户真实宠物 / 订单 / 购物车 / 评论 / 动态
   - recall_memory     长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
   - compose           组装最终 System Prompt（人设 + 宠物档案 + 长期记忆 + 参考知识 + 真实数据 + 医疗护栏）
@@ -36,7 +36,7 @@ from langgraph.graph.message import add_messages
 from app import checkpoint, memstore, persona, vectorstore
 from app.config import settings
 from app.llm import astructured_invoke, get_client, get_vision_client
-from app.media import KIND_IMAGE, image_data_url
+from app.media import KIND_IMAGE
 from app.schemas import IntentResult, PetInfo
 from app.tools import build_tools
 
@@ -66,7 +66,7 @@ class ChatState(TypedDict, total=False):
     # 对话消息（跨轮累积）：输入的本轮 HumanMessage、generate 写回的 AIMessage、
     # 中断补写的人机消息都汇聚于此，由 checkpoint 按 thread 持久化，构成长期记忆；
     # 消息内容恒为纯文本（附件描述 / 转写以文字并入），图片分片仅在 compose 组装
-    # 最终请求时按当前轮附件现算——避免 base64 图片进 checkpoint 撑爆记忆存储
+    # 最终请求时按当前轮附件现算——避免图片分片进 checkpoint 撑爆记忆存储
     messages: Annotated[List[AnyMessage], add_messages]
     intent: str                    # 意图
     intent_reason: str
@@ -131,17 +131,17 @@ async def classify_intent(state: ChatState) -> Dict[str, Any]:
 
 
 async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
-    """RAG 检索节点：命中知识类意图时检索知识库"""
+    """RAG 检索节点：命中知识类意图时检索知识库
+
+    检索链路不可用时抛 RagUnavailable（由路由层转成 error 事件），不降级为
+    关键词检索、也不静默跳过——避免让模型在没有知识依据的情况下作答。
+    """
     query = state.get("query", "")
     intent = state.get("intent", "")
     if intent not in _KB_INTENTS or not settings.RAG_ENABLED:
         return {"knowledge": [], "knowledge_text": ""}
-    try:
-        results = await vectorstore.retrieve(query)
-        return {"knowledge": results, "knowledge_text": vectorstore.format_context(results)}
-    except Exception:
-        logger.warning("知识检索失败，跳过 RAG 上下文", exc_info=True)
-        return {"knowledge": [], "knowledge_text": ""}
+    results = await vectorstore.retrieve(query)
+    return {"knowledge": results, "knowledge_text": vectorstore.format_context(results)}
 
 
 async def tool_action(state: ChatState) -> Dict[str, Any]:
@@ -217,19 +217,18 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
 def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> list:
     """当前轮用户消息的多模态内容分片（OpenAI 兼容格式）
 
-    视觉可用时图片以 image_url 分片直发（base64 data URL，服务商无法回源拉取
-    本服务内网附件地址）；图片文件缺失（被清理）时跳过该图并保留文字描述。
-    返回内容为 list 表示走视觉模型；无有效图片时返回 None 由调用方退回纯文本。
+    图片以 image_url 分片直发，URL 为 OSS 公网地址，由视觉模型服务商回源拉取；
+    URL 缺失（异常数据）时跳过该图并保留文字描述。返回内容为 list 表示走
+    视觉模型；无有效图片时返回 None 由调用方退回纯文本。
     """
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text or "请帮我看看这些内容"}]
     used = False
     for att in attachments or []:
-        if att.get("type") != KIND_IMAGE:
+        url = (att.get("url") or "").strip()
+        if att.get("type") != KIND_IMAGE or not url:
             continue
-        data_url = image_data_url(att)
-        if data_url:
-            parts.append({"type": "image_url", "image_url": {"url": data_url}})
-            used = True
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+        used = True
     return parts if used else None
 
 

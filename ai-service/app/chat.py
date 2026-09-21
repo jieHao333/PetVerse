@@ -13,8 +13,7 @@
   2. GET    /ai/chat/history            查询指定会话的对话历史（时间正序：旧 → 新）
   3. GET    /ai/chat/sessions           查询用户的全部会话（跨宠物统一展示，最近活跃在前）
   4. DELETE /ai/chat/sessions/{sid}     删除会话（连带消息与 checkpoint 记忆）
-  5. POST   /ai/chat/upload             上传多模态附件（图片/音频/视频），返回附件信息
-  6. GET    /ai/chat/media/{name}       附件回放（uuid 文件名不可猜测，走网关免鉴权白名单）
+  5. POST   /ai/chat/upload             上传多模态附件（图片/音频/视频）直传 OSS，返回附件信息
 
 存储分层（PostgreSQL 库 petverse_ai，业务数据同库）：
   - LangGraph checkpoint（checkpoint.py）：LLM 上下文记忆——图状态 messages 按
@@ -30,10 +29,10 @@ from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Header, Path, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app import checkpoint, llm, longterm, memstore, media, persistence
+from app import checkpoint, llm, longterm, memstore, media, oss, persistence
 from app.config import settings
 from app.graph.chat_graph import get_chat_graph, initial_state
 from app.schemas import (
@@ -110,18 +109,19 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
     return user_id if user_id > 0 else None
 
 
-async def _prepare_attachments(attachments: list) -> list:
+async def _prepare_attachments(attachments: list, user_id: int) -> list:
     """附件预处理：真实模式下转写音频（转写文本回填 transcript 字段）
 
-    转写失败 / 未配置 ASR 时静默降级（transcript 保持 None，后续以文字占位
-    提示模型），绝不阻断对话主流程；mock 模式跳过转写（无外部服务可调）。
+    音频字节按对象 key 从 OSS 读取（仅本人命名空间，见 media.read_attachment_bytes）；
+    转写失败 / 未配置 ASR 时静默降级（transcript 保持 None，后续以文字占位提示模型），
+    绝不阻断对话主流程；mock 模式跳过转写（无外部服务可调）。
     """
     if settings.is_mock or not attachments:
         return attachments
     for att in attachments:
         if att.get("type") != media.KIND_AUDIO:
             continue
-        transcript = await media.transcribe_audio(att)
+        transcript = await media.transcribe_audio(att, user_id)
         if transcript:
             att["transcript"] = transcript
     return attachments
@@ -319,7 +319,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         # 3.5 多模态附件预处理（音频转写，耗时网络调用）：完成后重算增强文本。
         #    此处被取消时取消分支用转写前的 human_msg / persist_msg 兜底补写，不丢本轮提问
         if attachments:
-            attachments = await _prepare_attachments(attachments)
+            attachments = await _prepare_attachments(attachments, user_id)
             enriched = _attachment_enriched_text(text, attachments)
             if enriched:
                 human_msg = HumanMessage(content=enriched, id=human_msg.id)
@@ -506,8 +506,9 @@ async def upload_chat_attachment(
     file: UploadFile = File(..., description="附件文件（图片/音频/视频）"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """上传多模态附件，返回附件信息（前端原样放入 ChatRequest.attachments）
+    """上传多模态附件（直传 OSS），返回附件信息（前端原样放入 ChatRequest.attachments）
 
+    url 为 OSS 公网地址，浏览器回放与视觉模型回源拉取共用。
     类型与大小校验在 app/media.save_upload 内完成（MIME 主类型判定 + 扩展名兜底；
     图片 10MB / 音频 20MB / 视频 50MB，上限可经 .env 调整）。
     """
@@ -515,26 +516,16 @@ async def upload_chat_attachment(
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
     try:
-        attachment = await media.save_upload(file.filename, file.content_type, file.read)
+        attachment = await media.save_upload(file.filename, file.content_type, file.read, user_id)
     except media.UploadError as exc:
         return JSONResponse(status_code=200, content=fail(400, str(exc)))
+    except oss.OssError as exc:
+        logger.warning("附件上传失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
+        return JSONResponse(status_code=200, content=fail(500, str(exc)))
     except Exception:
         logger.warning("保存附件失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
         return JSONResponse(status_code=200, content=fail(500, "附件上传失败，请稍后再试"))
     return JSONResponse(status_code=200, content=ok(attachment))
-
-
-@router.get("/chat/media/{name}")
-async def get_chat_media(name: str = Path(..., description="附件文件名（uuid + 扩展名）")):
-    """附件回放（历史消息渲染 / 前端预览）
-
-    <img>/<video>/<audio> 标签无法携带 Authorization 头，本路径走网关免鉴权白名单；
-    文件名为不可猜测的 uuid4，且正则白名单校验扩展名（防路径穿越与任意文件读取）。
-    """
-    path = media.media_path(name)
-    if path is None:
-        return JSONResponse(status_code=200, content=fail(404, "附件不存在或已清理"))
-    return FileResponse(path, media_type=media.mime_by_ext(path.suffix.lower()))
 
 
 @router.get("/chat/history")

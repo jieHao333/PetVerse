@@ -60,7 +60,7 @@ COMMENT ON COLUMN chat_message.pet_id IS '所属宠物ID（缺失时兜底为0�
 COMMENT ON COLUMN chat_message.session_id IS '所属会话ID（chat_session.id）';
 COMMENT ON COLUMN chat_message.role IS '角色：user / assistant';
 COMMENT ON COLUMN chat_message.interrupted IS '助手回复是否被用户中止生成（仅 assistant 消息置位）';
-COMMENT ON COLUMN chat_message.attachments IS '多模态附件数组 [{type,url,mime,name,size,transcript?}]（仅用户消息）';
+COMMENT ON COLUMN chat_message.attachments IS '多模态附件数组 [{type,url,key,mime,name,size,transcript?}]（仅用户消息；url 为 OSS 公网地址，key 为 OSS 对象 key）';
 CREATE INDEX IF NOT EXISTS idx_chat_message_user_session_time
     ON chat_message (user_id, session_id, create_time);
 CREATE INDEX IF NOT EXISTS idx_chat_message_user_pet_time

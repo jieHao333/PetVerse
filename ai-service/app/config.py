@@ -38,13 +38,12 @@ class Settings(BaseSettings):
     DEEPSEEK_MODEL: str = "deepseek-chat"
 
     # ---------- Embedding（OpenAI 兼容格式，RAG 检索用） ----------
-    EMBEDDING_API_KEY: str = ""                 # 为空时 RAG 自动降级为关键词检索
+    EMBEDDING_API_KEY: str = ""                 # 为空时知识库检索不可用（知识类提问直接报错）
     EMBEDDING_BASE_URL: str = ""                # 例如阿里云 https://dashscope.aliyuncs.com/compatible-mode/v1
     EMBEDDING_MODEL: str = "text-embedding-v3"
     EMBEDDING_DIM: int = 1024                   # 必须与 pgvector 建表维度一致（v3 支持 1024/768/512）
 
-    # ---------- 多模态附件（图片 / 音频 / 视频） ----------
-    CHAT_UPLOAD_DIR: str = ""                   # 附件落盘目录；空时默认 ai-service/data/uploads
+    # ---------- 多模态附件（图片 / 音频 / 视频，直传 OSS，见下方 OSS_* 配置） ----------
     CHAT_MAX_ATTACHMENTS: int = 4               # 单轮对话附件数上限
     MEDIA_MAX_IMAGE_MB: int = 10                # 单张图片大小上限（MB）
     MEDIA_MAX_AUDIO_MB: int = 20                # 单条音频大小上限（MB）
@@ -59,6 +58,15 @@ class Settings(BaseSettings):
     ASR_API_KEY: str = ""
     ASR_BASE_URL: str = ""                      # 例如 https://dashscope.aliyuncs.com/compatible-mode/v1
     ASR_MODEL: str = ""                         # 例如 paraformer-v2
+
+    # ---------- 阿里云 OSS（多模态附件持久化，与 Java 侧 petverse-common 共用同一个桶） ----------
+    # 四项配置齐全后附件直传 OSS（对象 key：ai-chat/{userId}/{yyyyMMdd}/{uuid}.ext），
+    # 公网 URL 同时用于浏览器回放与视觉模型回源拉取；缺任一项时上传接口明确报错
+    OSS_ENDPOINT: str = ""                      # 例如 oss-cn-beijing.aliyuncs.com
+    OSS_ACCESS_KEY_ID: str = ""
+    OSS_ACCESS_KEY_SECRET: str = ""
+    OSS_BUCKET_NAME: str = ""
+    OSS_DOMAIN: str = ""                        # 可选：自定义 / CDN 访问域名（含协议）
 
     # ---------- 对话模式开关 ----------
     MOCK_CHAT: bool = False                     # true 时强制使用 mock 回复（联调 / 无 Key 验证用）
@@ -122,8 +130,8 @@ class Settings(BaseSettings):
         """LLM_* 未显式配置时，回落到 DEEPSEEK_* 旧配置，保证平滑迁移
 
         注意：Embedding 不自动复用 LLM 的 Key/Base——DeepSeek 无 embedding 接口，
-        且不同服务商密钥不通用；Embedding 必须单独配置，未配置时 RAG 自动降级为
-        关键词检索（不会尝试连接 pgvector）。
+        且不同服务商密钥不通用；Embedding 必须单独配置，未配置时知识库检索
+        不可用（知识类提问会明确报错，不会静默跳过）。
         视觉模型同样单独回落：LLM_VISION_API_KEY / LLM_VISION_BASE_URL 缺省时
         复用 LLM_*（同一服务商同时提供文本与视觉模型时只需配一个 MODEL）。
         """
@@ -151,20 +159,8 @@ class Settings(BaseSettings):
 
     @property
     def embedding_enabled(self) -> bool:
-        """Embedding 是否可用（RAG 向量检索的前提；不可用时降级为关键词检索）"""
+        """Embedding 是否可用（RAG 向量检索的前提；不可用时知识检索直接报错）"""
         return bool(self.EMBEDDING_API_KEY.strip() and self.EMBEDDING_MODEL.strip())
-
-    @property
-    def rag_enabled(self) -> bool:
-        """RAG 是否可用：显式开关 + Embedding 就绪"""
-        return self.RAG_ENABLED and self.embedding_enabled
-
-    @property
-    def upload_dir(self) -> Path:
-        """多模态附件落盘目录（惰性创建，首次访问时建立）"""
-        base = Path(self.CHAT_UPLOAD_DIR) if self.CHAT_UPLOAD_DIR.strip() else BASE_DIR / "data" / "uploads"
-        base.mkdir(parents=True, exist_ok=True)
-        return base
 
     @property
     def vision_enabled(self) -> bool:
@@ -177,6 +173,12 @@ class Settings(BaseSettings):
     def asr_enabled(self) -> bool:
         """语音转写是否可用：三项配置齐全（未配置时音频降级为文字占位提示）"""
         return bool(self.ASR_API_KEY.strip() and self.ASR_BASE_URL.strip() and self.ASR_MODEL.strip())
+
+    @property
+    def oss_configured(self) -> bool:
+        """OSS 配置是否齐全：四项必填（缺任一项时附件回落本服务磁盘存储）"""
+        return bool(self.OSS_ENDPOINT.strip() and self.OSS_ACCESS_KEY_ID.strip()
+                    and self.OSS_ACCESS_KEY_SECRET.strip() and self.OSS_BUCKET_NAME.strip())
 
     @property
     def pg_dsn(self) -> str:

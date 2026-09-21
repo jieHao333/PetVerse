@@ -9,7 +9,7 @@
   3. 清空既有集合后重新写入 pgvector（幂等：可反复执行，以文件为唯一事实来源）。
 
 前置：PostgreSQL 已安装 pgvector 扩展；.env 已配置 EMBEDDING_API_KEY/BASE_URL/MODEL。
-未配置 Embedding 时脚本会直接提示并退出（关键词降级检索无需导入，直接读取原文件）。
+Embedding 未配置或向量库不可用时脚本报错退出（RAG 只有 pgvector 一条链路，不做关键词降级）。
 """
 import asyncio
 import sys
@@ -43,18 +43,12 @@ def load_documents() -> list:
 
 async def main() -> None:
     setup_logging()
-    if not settings.embedding_enabled:
-        print("[跳过] 未配置 EMBEDDING_API_KEY / EMBEDDING_MODEL，"
-              "RAG 将使用关键词降级检索，无需导入向量库。")
-        print("       如需语义检索，请在 .env 配置 Embedding 后重跑本脚本。")
-        return
-
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
     docs = load_documents()
     if not docs:
         print(f"[错误] 未找到知识文件：{KNOWLEDGE_DIR}")
-        return
+        sys.exit(1)
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=280,          # 片段长度：适配中文，约 1-2 段
@@ -77,15 +71,12 @@ async def main() -> None:
 
     print(f"知识文件 {len(docs)} 个，切分片段 {len(texts)} 条，开始写入 pgvector（集合 {settings.RAG_COLLECTION}）...")
 
-    # 幂等：先清空集合内旧向量，再全量写入
-    store = vectorstore.get_store()
-    if store is None:
-        print("[错误] pgvector 初始化失败：请确认 PostgreSQL 可访问且已安装 pgvector 扩展，"
-              "并检查 .env 的 PG_* 配置。")
-        return
-    await vectorstore.aclear()   # 删除旧集合（首次导入无集合，静默忽略）
-
-    written = await vectorstore.aadd_texts(texts, metadatas)
+    try:
+        await vectorstore.aclear()   # 幂等：先清空集合内旧向量，再全量写入
+        written = await vectorstore.aadd_texts(texts, metadatas)
+    except Exception as exc:
+        print(f"[错误] 写入 pgvector 失败：{exc}")
+        sys.exit(1)
     print(f"[完成] 成功写入 {written} 条知识片段到 pgvector。")
 
 

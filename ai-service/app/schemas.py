@@ -34,13 +34,15 @@ class PetInfo(BaseModel):
 class AttachmentInfo(BaseModel):
     """单个多模态附件（图片 / 音频 / 视频）
 
-    由 POST /ai/chat/upload 上传后返回，前端原样放进 ChatRequest.attachments；
-    url 为本服务回放地址（/ai/chat/media/{uuid}.ext），transcript 为音频转写结果
+    由 POST /ai/chat/upload 上传 OSS 后返回，前端原样放进 ChatRequest.attachments；
+    url 为 OSS 公网地址（浏览器回放与视觉模型回源拉取共用）；key 为 OSS 对象 key
+    （服务端读取转写时校验本人命名空间）；transcript 为音频转写结果
     （由后端转写后回填，前端只读）。
     """
 
     type: Literal["image", "audio", "video"] = Field(description="附件类型")
-    url: str = Field(description="附件回放 URL（/ai/chat/media/{name}）")
+    url: str = Field(description="附件地址（OSS 公网 URL）")
+    key: Optional[str] = Field(default=None, description="OSS 对象 key")
     mime: str = Field(default="", description="MIME 类型")
     name: str = Field(default="", description="原始文件名")
     size: int = Field(default=0, description="文件大小（字节）")

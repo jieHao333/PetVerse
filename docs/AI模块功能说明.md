@@ -74,7 +74,7 @@ ai-service/
 │   ├── main.py              # FastAPI 入口 + lifespan（Redis/PG/Nacos）
 │   ├── config.py            # pydantic-settings 配置中心
 │   ├── llm.py               # LLM / Embedding 客户端 + 结构化输出助手
-│   ├── vectorstore.py       # pgvector 检索 + 关键词降级
+│   ├── vectorstore.py       # pgvector 语义检索（不可用即报错，无降级）
 │   ├── clients.py           # 业务微服务 HTTP 客户端
 │   ├── tools.py             # LangGraph Agent 工具集
 │   ├── memory.py            # Redis 通用缓存（评论摘要 / 推荐）
@@ -207,12 +207,10 @@ flowchart LR
 
 ## 六、RAG 知识库
 
-### 双通路检索
+### 语义检索
 
-1. **语义检索（首选）**：pgvector + OpenAI 兼容 Embedding，余弦距离，理解同义表达。
-2. **关键词降级**：未配置 Embedding 或 pgvector 不可用时，直接对内置知识文件做字符 bigram 覆盖度打分，保证零外部依赖也能演示。
-
-两者都受 `RAG_SCORE_THRESHOLD` 影响；关键词通路使用自适应的较低阈值（因为 bigram 分数天然远低于余弦相似度）。
+1. **pgvector + OpenAI 兼容 Embedding**：余弦距离检索，理解同义表达；召回片段受 `RAG_SCORE_THRESHOLD`（默认 0.35）过滤，低于阈值的片段直接丢弃。
+2. **不可用时明确失败**：Embedding 未配置或向量库不可用时抛 `RagUnavailable`（对话侧转 `error` 事件），**不做关键词降级**——避免拿低质上下文诱导模型编造答案。
 
 ### 知识语料
 
@@ -224,7 +222,7 @@ flowchart LR
 .venv\Scripts\python -m scripts.ingest_knowledge
 ```
 
-脚本用 `RecursiveCharacterTextSplitter`（中文分隔符优先）切分，**幂等重建**集合后写入 pgvector；未配置 Embedding 时提示跳过。
+脚本用 `RecursiveCharacterTextSplitter`（中文分隔符优先）切分，**幂等重建**集合后写入 pgvector；Embedding 未配置或向量库不可用时脚本报错退出（不降级）。
 
 ### 向量库接入
 
@@ -258,8 +256,8 @@ flowchart LR
 |---|---|---|
 | LLM API | 超时 / 报错 | 对话：发 `error` 事件；健康 / 摘要 / 推荐：降级为规则逻辑 |
 | 结构化输出 | 服务商不支持 json_schema | 自动按 `json_schema → function_calling → json_mode` 探测降级 |
-| Embedding | 未配置 / 不可用 | RAG 降级为关键词检索 |
-| pgvector | 连接失败 | 60 秒冷却期内直接走关键词检索，避免反复打堆栈 |
+| Embedding | 未配置 / 不可用 | 知识检索抛 `RagUnavailable` 明确报错（不降级） |
+| pgvector | 连接失败 | 同上：知识类提问直接报错，不做关键词兜底 |
 | 业务服务 | 未启动 / 超时 | 相应上下文返回空，推荐退化为热门 |
 | Redis | 不可用 | 读写静默降级；评论摘要 / 推荐缓存自动回落 PG `ai_cache`（温层） |
 | PostgreSQL | 不可用 | 会话操作回业务错误；消息 / 对话记忆 / 报告静默降级（恢复后自动重试） |
@@ -276,7 +274,7 @@ flowchart LR
 | 类别 | 配置项 | 说明 |
 |---|---|---|
 | 对话模型 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | OpenAI 兼容；`LLM_*` 留空时回落 `DEEPSEEK_*` |
-| Embedding | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 不配置则 RAG 关键词降级 |
+| Embedding | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 不配置则知识检索不可用（明确报错） |
 | 模式 | `MOCK_CHAT` | `true` 走内置模拟回复，无需真实调用 |
 | PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB` | 会话/消息 + checkpoint + 向量库 + 健康报告 |
 | RAG | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | 检索开关与参数 |
@@ -389,8 +387,8 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 需先 CREATE DATA
 1. **统一编排**：四类能力全部用 LangGraph 显式状态图驱动，节点职责单一、可观测、易扩展。
 2. **按需执行**：对话按意图条件路由，闲聊不触发检索与工具，节省 token 与延迟。
 3. **Agent 真实数据**：工具让 AI 能查用户的宠物 / 订单 / 购物车 / 评论 / 商品 / 动态，而非凭空作答。
-4. **RAG 双通路**：语义检索 + 关键词降级，任何环境都能工作。
+4. **RAG 单一链路**：只走 pgvector 语义检索，链路不可用时明确报错——宁可检索失败，也不拿低质上下文诱导模型编造答案。
 5. **跨服务商结构化输出**：三级自动降级，规避不同模型对 `json_schema` / `tool_choice` 的支持差异。
 6. **安全护栏**：医疗 / 急症意图强制就医提示，健康评估报告含免责声明。
 7. **契约稳定**：存储层从「Redis + MySQL」演进为「LangGraph checkpoint + PostgreSQL」过程中，SSE 协议、会话隔离与全部接口契约保持不变，前端零改动。
-8. **全面降级**：每个外部依赖都有兜底路径，单点故障不影响主流程。
+8. **可控降级边界**：外部依赖故障时能兜底的兜底（缓存 / 记忆 / 上下文）、该报错的报错——知识检索不做降级，避免"答得像真的却无依据"。

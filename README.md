@@ -168,7 +168,7 @@ OSS 密钥取值优先级：**环境变量 > secrets-local.yml > 空**。涉及 
 | `OSS_BUCKET_NAME` | OSS 桶名 | `petverse-me` |
 | `OSS_DOMAIN` | 可选自定义 / CDN 域名 | 空 |
 
-AI 服务（Python）密钥通过 `ai-service/.env` 管理，仓库仅提交 `.env.example` 模板（`LLM_API_KEY`、`EMBEDDING_API_KEY` 等默认为空，留空即进入 mock / 关键词降级模式）。完整清单见 [docs/配置与密钥说明.md](docs/配置与密钥说明.md)。
+AI 服务（Python）密钥通过 `ai-service/.env` 管理，仓库仅提交 `.env.example` 模板（`LLM_API_KEY`、`EMBEDDING_API_KEY` 等默认为空，`LLM_API_KEY` 留空进入 mock 模式；Embedding 留空则知识检索不可用）。完整清单见 [docs/配置与密钥说明.md](docs/配置与密钥说明.md)。
 
 ## 数据库初始化
 
@@ -212,7 +212,7 @@ mysql -u root -p petverse_user < user-service/src/main/resources/db/schema.sql
 1. **独立设计实现 AI 对话编排引擎**：基于 LangGraph StateGraph 将「意图识别 → RAG 检索 / Agent 工具调用 → Prompt 组装 → 流式生成」编排为条件路由状态图；Agent 通过 6 个工具查询用户真实数据作答；命中急症意图时强制注入「就医提示」安全护栏。
 2. **高可用 SSE 流式对话链路**：自定义 `meta → delta → done` 事件协议 + 15s 心跳防掐断；全局信号量限流实现过载保护；用户中途停止生成时问题与部分回复双路收尾，避免内容丢失与记忆断裂。
 3. **基于 LangGraph 官方 checkpoint 的可恢复对话记忆**：图状态 messages 按「用户 + 会话」线程自动持久化到 PostgreSQL，跨轮自动恢复上下文；被中断的轮次同样进入后续记忆。
-4. **RAG 知识库双通路检索**：pgvector 语义检索（余弦相似度阈值 + 来源引用注入），Embedding 未配置或向量库故障时自动降级为字符 bigram 关键词检索。
+4. **基于 pgvector 的 RAG 知识库**：语义检索（余弦相似度阈值过滤 + 来源引用注入）；Embedding 未配置或向量库故障时明确报错，不做关键词降级。
 5. **跨大模型厂商的结构化输出兼容**：`json_schema → function_calling → json_mode` 三级自动探测降级，规避不同服务商能力差异导致的「静默降级」。
 6. **事件驱动的微服务基础设施**：RocketMQ 解耦异步链路（ES 索引同步、订单超时取消回补库存、点赞落库 + 通知、商家审核角色升级）；ES 故障 60s 熔断窗口自动降级；网关统一 JWT 鉴权与内部信任头注入，支撑跨语言身份透传。
 

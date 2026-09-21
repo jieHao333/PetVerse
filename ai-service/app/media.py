@@ -1,32 +1,25 @@
-"""多模态附件（图片 / 音频 / 视频）：上传落盘、回放与语音转写
+"""多模态附件（图片 / 音频 / 视频）：上传 OSS、元信息组装与语音转写
 
 设计要点：
-  1. 附件直接存本服务（data/uploads，可用 CHAT_UPLOAD_DIR 覆盖），不经 OSS /
-     其他微服务——多模态对话是 ai-service 自己的能力，闭环在本服务内最简单；
-  2. 文件名用 uuid4 + 原扩展名（不可猜测），回放路径 /ai/chat/media/{name}
-     走网关白名单（<img>/<video> 标签无法携带 Authorization 头）；
+  1. 附件直传阿里云 OSS（配置与客户端见 app/oss.py），返回公网 URL——
+     浏览器回放与视觉模型回源拉取都用该 URL，不经本服务转发；
+  2. 对象 key 用 uuid4（不可猜测），形如 ai-chat/{userId}/{yyyyMMdd}/{uuid}.ext；
   3. 类型与大小双重校验：按 MIME 主类型判类，MIME 不可信时按扩展名兜底；
      超限 / 类型不支持直接拒绝（UploadError → 路由层转业务错误）；
   4. 语音转写走 OpenAI 兼容 /audio/transcriptions（如百炼 paraformer-v2），
-     未配置 ASR 时调用方降级为文字占位提示，本模块不感知降级逻辑。
-  5. 图片发给视觉模型时转 base64 data URL——本服务附件 URL 只在内网可达，
-     服务商（百炼等）无法回源拉取，必须把图片内容直接放进请求体。
+     未配置 ASR 时调用方降级为文字占位提示，本模块不感知降级逻辑；
+     读取附件字节（转写用）只接受本人命名空间的对象 key，防跨用户取文件。
 """
-import base64
 import logging
-import re
 from pathlib import Path
-from typing import Optional, Tuple
-from uuid import uuid4
+from typing import Optional
 
 import httpx
 
+from app import oss
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-# 回放 URL 前缀（与 chat.py 的 GET /ai/chat/media/{name} 路由对应）
-MEDIA_URL_PREFIX = "/ai/chat/media"
 
 # 附件大类（与前端展示、模型内容分片一一对应）
 KIND_IMAGE = "image"
@@ -47,12 +40,9 @@ _KIND_BY_EXT = {
     ".mp4": KIND_VIDEO, ".webm": KIND_VIDEO, ".mov": KIND_VIDEO, ".m4v": KIND_VIDEO, ".avi": KIND_VIDEO, ".mkv": KIND_VIDEO,
 }
 
-# 文件名安全校验：仅允许 uuid4 + 白名单扩展名（防路径穿越与任意文件读取）
-_SAFE_NAME = re.compile(r"^[0-9a-f]{32}(\.[a-z0-9]{2,5})$")
-
 
 class UploadError(Exception):
-    """附件上传业务错误（类型不支持 / 超限 / 读文件失败），message 直接作为业务 msg"""
+    """附件上传业务错误（类型不支持 / 超限），message 直接作为业务 msg"""
 
 
 def detect_kind(mime: str, filename: str) -> Optional[str]:
@@ -79,13 +69,17 @@ def kind_label(kind: str) -> str:
     return {KIND_IMAGE: "图片", KIND_AUDIO: "音频", KIND_VIDEO: "视频"}.get(kind, "附件")
 
 
-async def save_upload(file_name: str, content_type: str, read_bytes) -> dict:
-    """保存一个上传附件，返回附件信息 dict（type/url/mime/name/size）
+async def save_upload(file_name: str, content_type: str, read_bytes, user_id: int) -> dict:
+    """保存一个上传附件，返回附件信息 dict（type/url/key/mime/name/size）
+
+    附件直传 OSS，url 为公网地址（浏览器回放与视觉模型回源拉取共用）。
 
     :param file_name: 原始文件名（仅用于类型判定与回显）
     :param content_type: 上传 Content-Type
     :param read_bytes: 无参异步函数，返回文件字节（分块读取由调用方决定）
+    :param user_id: 上传用户 ID（进 OSS 对象命名空间，服务端读取时校验归属性）
     :raises UploadError: 类型不支持 / 超过大小上限
+    :raises oss.OssError: 存储未配置 / 上传失败
     """
     kind = detect_kind(content_type, file_name)
     if kind is None:
@@ -93,50 +87,25 @@ async def save_upload(file_name: str, content_type: str, read_bytes) -> dict:
 
     limit = size_limit(kind)
     ext = Path(file_name or "").suffix.lower()[:8]
-    stored_name = f"{uuid4().hex}{ext}"
-    path = settings.upload_dir / stored_name
+    mime = (content_type or "").split(";")[0].strip().lower()
 
-    size = 0
-    with open(path, "wb") as out:
-        data = await read_bytes()
-        while data:
-            size += len(data)
-            if size > limit:
-                out.close()
-                path.unlink(missing_ok=True)
-                raise UploadError(f"{kind_label(kind)}超过 {limit // (1024 * 1024)}MB 大小限制")
-            out.write(data)
-            data = await read_bytes()
+    # 边读边累计大小：超限立即中断，不产生上传流量
+    buffered = bytearray()
+    chunk = await read_bytes()
+    while chunk:
+        buffered.extend(chunk)
+        if len(buffered) > limit:
+            raise UploadError(f"{kind_label(kind)}超过 {limit // (1024 * 1024)}MB 大小限制")
+        chunk = await read_bytes()
 
-    return {
-        "type": kind,
-        "url": f"{MEDIA_URL_PREFIX}/{stored_name}",
-        "mime": (content_type or "").split(";")[0].strip().lower(),
-        "name": file_name or stored_name,
-        "size": size,
-    }
-
-
-def media_path(name: str) -> Optional[Path]:
-    """回放文件名 -> 本地路径；不合法（路径穿越 / 非白名单扩展名）返回 None"""
-    if not _SAFE_NAME.match(name or ""):
-        return None
-    path = settings.upload_dir / name
-    return path if path.is_file() else None
-
-
-def load_attachment(url: str) -> Optional[dict]:
-    """按附件 URL（/ai/chat/media/{name}）加载附件元信息（存在时）"""
-    name = (url or "").rsplit("/", 1)[-1]
-    path = media_path(name)
-    if path is None:
-        return None
-    kind = _KIND_BY_EXT.get(path.suffix.lower()) or detect_kind("", name)
-    return {"path": path, "type": kind, "mime": mime_by_ext(path.suffix.lower())}
+    key = oss.chat_key(user_id, ext)
+    url = await oss.upload(key, bytes(buffered), mime or mime_by_ext(ext))
+    return {"type": kind, "url": url, "key": key, "mime": mime,
+            "name": file_name or key.rsplit("/", 1)[-1], "size": len(buffered)}
 
 
 def mime_by_ext(ext: str) -> str:
-    """扩展名 -> MIME（回放响应 Content-Type 与 data URL 用）"""
+    """扩展名 -> MIME（上传对象的 Content-Type 与前端预览用）"""
     return {
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
         ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
@@ -147,45 +116,42 @@ def mime_by_ext(ext: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def image_data_url(att: dict) -> Optional[str]:
-    """图片附件 -> base64 data URL（发给视觉模型用）
+async def read_attachment_bytes(att: dict, user_id: int) -> Optional[bytes]:
+    """读取附件字节（音频转写用）；失败返回 None，调用方降级为文字占位
 
-    附件文件缺失（被清理 / 跨实例无共享盘）时返回 None，调用方降级为文字占位。
+    客户端可伪造 attachments，故只按对象 key 取文件（不按任何 URL 去抓取，避免
+    SSRF），且校验 key 落在本人命名空间内（避免跨用户读取）。
     """
-    info = load_attachment(att.get("url", ""))
-    if info is None or info["type"] != KIND_IMAGE:
+    key = (att.get("key") or "").strip()
+    if not key:
         return None
-    try:
-        raw = info["path"].read_bytes()
-    except OSError:
-        logger.warning("读取图片附件失败: %s", att.get("url"), exc_info=True)
+    if not oss.is_own_key(key, user_id):
+        logger.warning("拒绝读取非本人命名空间的附件: user_id=%s key=%s", user_id, key)
         return None
-    mime = att.get("mime") or info["mime"]
-    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    return await oss.get_bytes(key)
 
 
-async def transcribe_audio(att: dict) -> Optional[str]:
+async def transcribe_audio(att: dict, user_id: int) -> Optional[str]:
     """音频附件 -> 文字（OpenAI 兼容 /audio/transcriptions）
 
     未配置 ASR / 调用失败 / 返回为空时返回 None，调用方降级为文字占位提示，
     绝不让转写失败阻断对话主流程。转写结果会写回附件 dict 的 transcript 字段。
     """
-    if not settings.asr_enabled:
+    if not settings.asr_enabled or att.get("type") != KIND_AUDIO:
         return None
-    info = load_attachment(att.get("url", ""))
-    if info is None or info["type"] != KIND_AUDIO:
+    raw = await read_attachment_bytes(att, user_id)
+    if raw is None:
         return None
     url = settings.ASR_BASE_URL.rstrip("/") + "/audio/transcriptions"
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
-            with open(info["path"], "rb") as f:
-                resp = await client.post(
-                    url,
-                    files={"file": (att.get("name") or info["path"].name, f,
-                                    att.get("mime") or info["mime"])},
-                    data={"model": settings.ASR_MODEL},
-                    headers={"Authorization": f"Bearer {settings.ASR_API_KEY}"},
-                )
+            resp = await client.post(
+                url,
+                files={"file": (att.get("name") or "audio", raw,
+                                att.get("mime") or "application/octet-stream")},
+                data={"model": settings.ASR_MODEL},
+                headers={"Authorization": f"Bearer {settings.ASR_API_KEY}"},
+            )
         resp.raise_for_status()
         text = (resp.json() or {}).get("text", "")
     except Exception:

@@ -49,6 +49,11 @@ async def lifespan(app: FastAPI):
             "如需接入真实模型，请在 .env 中填写 LLM_API_KEY（并将 MOCK_CHAT 置为 false）",
             settings.MOCK_CHAT, "为空" if not settings.LLM_API_KEY.strip() else "已配置但被开关覆盖",
         )
+    if settings.RAG_ENABLED and not settings.embedding_enabled:
+        logger.warning(
+            "RAG_ENABLED=true 但未配置 Embedding（EMBEDDING_API_KEY / EMBEDDING_MODEL），"
+            "知识类提问将直接报错；如不需要知识检索请将 RAG_ENABLED 置为 false"
+        )
     # Redis 连接池：评论摘要 / 推荐等通用缓存（创建连接池本身不发网络请求）
     memory.init()
     # 会话与消息持久层（PostgreSQL）：连接池 + 业务表自动创建（幂等）
@@ -63,9 +68,10 @@ async def lifespan(app: FastAPI):
     await pg_store.init()
     # Nacos 注册：SDK 是同步库，用 to_thread 丢进后台线程，避免阻塞事件循环
     await asyncio.to_thread(nacos_client.register)
-    logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag=%s）",
+    logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s）",
                 settings.AI_SERVICE_NAME, settings.AI_SERVICE_IP,
-                settings.AI_SERVICE_PORT, settings.is_mock, settings.rag_enabled)
+                settings.AI_SERVICE_PORT, settings.is_mock,
+                settings.RAG_ENABLED, settings.embedding_enabled)
     yield
     # ---------- 停机阶段 ----------
     await asyncio.to_thread(nacos_client.deregister)

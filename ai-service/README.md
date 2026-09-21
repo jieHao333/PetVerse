@@ -15,7 +15,7 @@
 
 **对话记忆（LangGraph 官方 checkpoint）**：对话图编译时注入 `PostgresSaver`（`langgraph-checkpoint-postgres`），图状态 `messages` 按 `thread_id = 用户:会话` 在每个超级步自动持久化到 PostgreSQL，下一轮对话自动恢复上下文。用户点击「停止生成」时，路由层把「问题 + 已产出的部分回复（`interrupted` 标记）」经 `aupdate_state` 补写回图状态——被中止的轮次同样进入后续对话的记忆，不再「暂停即失忆」。
 
-**RAG 检索**：首选 pgvector 语义检索（OpenAI 兼容 Embedding）；未配置 Embedding 或 pgvector 不可用时，自动降级为内置知识文件的字符 bigram 关键词检索，保证功能在无外部依赖时仍可演示。
+**RAG 检索**：pgvector + OpenAI 兼容 Embedding 的语义检索（余弦相似度 + 阈值过滤 + 来源引用）。Embedding 未配置或向量库不可用时**直接报错**（`RagUnavailable`），不做关键词降级——知识问答里"无依据却答得像真的"比明确失败更糟。
 
 **会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；评论摘要 / 推荐结果为两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底）。
 
@@ -24,9 +24,9 @@
 - Python 3.12
 - 可访问的 Nacos（默认 `localhost:8848`）
 - 可访问的 Redis（默认 `localhost:6379`，密码 `123456`，db=3）
-- 可访问的 PostgreSQL + **pgvector 插件**（默认 `localhost:5432`，库 `petverse_ai`；会话与消息、对话记忆 checkpoint、RAG 语义检索、健康报告都在这里，缺失时相应能力自动降级）
+- 可访问的 PostgreSQL + **pgvector 插件**（默认 `localhost:5432`，库 `petverse_ai`；会话与消息、对话记忆 checkpoint、RAG 语义检索、健康报告都在这里；缺失时聊天记忆等自动降级，知识检索则直接报错）
 - LLM API Key（OpenAI 兼容，可选：留空或 `MOCK_CHAT=true` 时走内置 mock 回复）
-- Embedding API Key（OpenAI 兼容，可选：不配置则 RAG 走关键词降级）
+- Embedding API Key（OpenAI 兼容；**知识检索必需**，不配置时知识类提问直接报错）
 
 ## 初始化数据库
 
@@ -59,7 +59,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 |---|---|
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 对话模型（OpenAI 兼容）。DeepSeek：`https://api.deepseek.com/v1` + `deepseek-chat`；阿里云百炼：`https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus`。留空 Key 或 `MOCK_CHAT=true` 时走 mock |
 | `DEEPSEEK_*` | 兼容旧配置：`LLM_*` 留空时自动回落 |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化（OpenAI 兼容）。阿里云百炼 `text-embedding-v3`（dim 支持 1024/768/512）。**不配置则 RAG 自动降级为关键词检索** |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化（OpenAI 兼容）。阿里云百炼 `text-embedding-v3`（dim 支持 1024/768/512）。**不配置则知识检索不可用（知识类提问明确报错）** |
 | `MOCK_CHAT` | `true` 强制内置模拟回复，无需真实调用 |
 | `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告 / LangGraph checkpoint 对话记忆 / 结果缓存温层 `ai_cache`） |
 | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | RAG 开关与检索参数 |
@@ -78,8 +78,8 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 .venv\Scripts\python -m scripts.ingest_knowledge
 ```
 
-- 配置了 Embedding：切分后全量写入 pgvector（幂等，可反复执行，以文件为唯一事实来源）。
-- 未配置 Embedding：脚本提示跳过；对话检索直接读取原文件做关键词匹配。
+- 切分后全量写入 pgvector（幂等，可反复执行，以文件为唯一事实来源）。
+- Embedding 未配置或向量库不可用：脚本报错退出（RAG 只有 pgvector 一条链路，不做关键词降级）。
 
 ## 启动服务
 
@@ -105,7 +105,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
 - SSE 事件：`meta` → `delta` * n → `done`；异常时 `error` 后结束流。
 - 推荐 / 评论摘要结果按用户、商品缓存于两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底，见 `app/cache.py`），`refresh=true` 可跳过推荐缓存强制刷新。
-- 中文模型配置与 pgvector 初始化完成后，即自动启用语义检索；否则关键词降级仍可工作。
+- 中文模型配置与 pgvector 初始化完成后即启用语义检索；Embedding 或向量库不可用时知识类提问直接报错（不降级）。
 
 ## 安全提示
 
