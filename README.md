@@ -1,242 +1,188 @@
 # PetVerse · 宠域
-# Java + AI(langchain生态)
+# Java + AI（LangGraph 生态）
 
-> 面向宠物爱好者的微服务社区平台后端，覆盖「虚拟宠物养成 + 真实宠物档案管理 + 社区社交 + 周边商城 + AI养宠问询」五大业务域，服务提供养宠顾问对话、健康智能评估、评论摘要与个性化推荐能力。
+面向宠物爱好者的社区平台后端，覆盖 **虚拟宠物养成 · 真实宠物档案 · 宠域空间（社区动态）· 好友与聊天 · 点赞评论通知 · 周边商城 · AI 养宠问询** 等业务域。
 
-本仓库为 **后端代码**，采用 **Java + Python 混合微服务**：Java 侧包含网关、用户、宠物、宠域空间（动态）、社交、点赞评论通知、商城共 8 个服务；AI 能力独立为 Python（FastAPI、langchain\LangGragh）服务，注册进 Nacos 后由 Spring Cloud Gateway 统一路由（`/api/ai/**`），与 Java 体系共享网关鉴权与服务发现。
+采用 **Java + Python 混合微服务**架构：Spring Cloud Gateway 统一入口，JWT 鉴权后向 Java / Python 两侧透传用户身份，各服务独立数据库、通过 Nacos 注册发现、RocketMQ 驱动异步链路。
 
-> 前端代码见独立仓库: https://github.com/jieHao333/PetVerse-web。
+| **PetVerse**（本仓库）| 8 个 Java 模块 + `ai-service`（Python） | Java 21 / Spring Boot 3.4 / Spring Cloud 2024 / FastAPI |
+| **PetVerse-web**(https://github.com/jieHao333/PetVerse-web) | Web 前端 | Vue 3 + Vite + Element Plus，dev 端口 `5173`，`/api` 代理到网关 `8080` |
 
-## 目录
-
-- [技术栈](#技术栈)
-- [服务与架构](#服务与架构)
-- [模块说明](#模块说明)
-- [快速开始](#快速开始)
-- [配置与环境变量](#配置与环境变量)
-- [数据库初始化](#数据库初始化)
-- [API 概览](#api-概览)
-- [项目亮点](#项目亮点)
-- [安全与密钥说明](#安全与密钥说明)
-- [常见问题](#常见问题)
-
-## 技术栈
-
-| 分类 | 选型 |
-|---|---|
-| 语言 / 运行时 | Java 21、Python 3.12 |
-| 微服务框架 | Spring Boot 3.4.13、Spring Cloud 2024.0.3、Spring Cloud Alibaba 2023.0.3.4 |
-| 网关 | Spring Cloud Gateway（WebFlux） |
-| 注册 / 配置中心 | Nacos |
-| ORM | MyBatis-Plus 3.5.9（逻辑删除、雪花 ID） |
-| 认证 | JWT（jjwt 0.12.7） |
-| 存储 | MySQL 8、Redis、阿里云 OSS（aliyun-sdk-oss 3.18.1） |
-| 检索 | Elasticsearch 8.15.5（商品 / 动态全文检索，故障自动降级 MySQL 模糊查询） |
-| 消息队列 | RocketMQ 2.3.3（事件驱动、订单超时延迟消息） |
-| AI 服务 | FastAPI + LangChain / LangGraph、PostgreSQL + pgvector |
-
-## 服务与架构
-
-所有请求经网关统一入口 `http://localhost:8080/api/**`，按 `Path=/api/{service}/**` + `StripPrefix=1` 路由到对应服务；网关完成 JWT 鉴权后剥离并注入内部信任头 `X-User-Id`，实现 Java / Python 跨语言的身份透传与越权防护。
-
-| 服务 | 端口 | 语言 | 网关前缀 | 职责 |
-|---|---|---|---|---|
-| gateway-service | 8080 | Java | — | 统一路由、JWT 鉴权、跨域、内部信任头注入 |
-| pet-service | 8081 | Java | `/api/pet/**` | 宠物档案、虚拟宠物养成（经验/等级）、健康信息、身份证 |
-| space-service | 8082 | Java | `/api/space/**` | 宠域空间动态（可见性/热度榜）、媒体上传、ES 检索 |
-| user-service | 8083 | Java | `/api/user/**` | 注册登录、JWT 签发、用户资料、头像上传、角色 |
-| social-service | 8084 | Java | `/api/social/**` | 好友关系、私聊会话与消息、聊天文件 |
-| remark-service | 8085 | Java | `/api/remark/**` | 通用点赞、评论、通知（独立通用服务） |
-| ai-service | 8086 | Python | `/api/ai/**` | AI 养宠对话、健康评估、评论摘要、个性化推荐 |
-| shop-service | 8087 | Java | `/api/shop/**` | 商品、购物车、订单、商家入驻、评价、ES 搜索 |
+## 架构总览
 
 ```
-浏览器 / 前端
+浏览器 / 前端 (:5173)
       │
       ▼
- Spring Cloud Gateway :8080  ──(JWT 鉴权 + 注入 X-User-Id)──┐
-      │                                                     │
-      ├── /api/user/**   ──▶ user-service :8083             │
-      ├── /api/pet/**    ──▶ pet-service  :8081             │
-      ├── /api/space/**  ──▶ space-service :8082            │  Nacos（注册 / 配置）
-      ├── /api/social/** ──▶ social-service :8084           │  RocketMQ（事件驱动）
-      ├── /api/remark/** ──▶ remark-service :8085           │  Redis / MySQL / ES
-      ├── /api/shop/**   ──▶ shop-service  :8087            │  PostgreSQL + pgvector
-      └── /api/ai/**     ──▶ ai-service    :8086 (FastAPI) ─┘
+Spring Cloud Gateway :8080 ── JWT 鉴权 · 剥离伪造身份头 · 注入 X-User-Id / X-User-Role
+      │
+      ├── /api/user/**    ──▶ user-service    :8083     MySQL petverse_user
+      ├── /api/pet/**     ──▶ pet-service     :8081     MySQL petverse_pet
+      ├── /api/space/**   ──▶ space-service   :8082     MySQL petverse_space
+      ├── /api/social/**  ──▶ social-service  :8084     MySQL petverse_social
+      ├── /api/remark/**  ──▶ remark-service  :8085     MySQL petverse_remark + Redis
+      ├── /api/shop/**    ──▶ shop-service    :8087     MySQL petverse_shop
+      └── /api/ai/**      ──▶ ai-service      :8086     PostgreSQL + pgvector
+                                                  （FastAPI / LangGraph，见 ai-service/README.md）
+
+共享基础设施：Nacos(8848 注册+配置) · Redis · RocketMQ(9876) · Elasticsearch(9200) · 阿里云 OSS · MySQL · PostgreSQL
 ```
 
-公共能力（结果封装、全局异常、JWT 上下文、MQ 发布/去重、OSS 上传、雪花序列化为字符串等）统一下沉在 `petverse-common` 模块，各业务服务依赖复用。
+前端只访问网关 `http://localhost:8080/api/**`，网关路由带 `StripPrefix=1`，业务服务内部路径不含 `/api` 前缀。
 
-## 模块说明
+## 模块一览
 
-```
-PetVerse/
-├── petverse-common/     # 公共模块：result/exception/context/mq/oss/entity/enums/dto/vo/util
-├── gateway-service/     # 网关：路由 + 鉴权 + 跨域
-├── user-service/        # 用户与认证
-├── pet-service/         # 宠物档案 / 养成 / 健康
-├── space-service/       # 宠域空间动态
-├── social-service/      # 好友与私聊
-├── remark-service/      # 点赞 / 评论 / 通知
-├── shop-service/        # 商城：商品 / 购物车 / 订单 / 商家 / 评价
-├── ai-service/          # Python AI 服务（详见 ai-service/README.md）
-├── db / */resources/db/ # 各服务建表脚本 schema.sql
-└── docs/                # 后端开发规范、配置与密钥说明、项目介绍
-```
+| 模块 | 端口 | 数据存储 | 职责 |
+|---|---|---|---|
+| `gateway-service` | 8080 | — | 路由转发、JWT 鉴权、身份头注入、CORS、内部接口拦截与角色校验 |
+| `user-service` | 8083 | MySQL `petverse_user` | 注册 / 登录（签发 JWT）、用户资料、角色（用户 / 商家 / 管理员）、头像上传 |
+| `pet-service` | 8081 | MySQL `petverse_pet` | 虚拟宠物养成（等级 / 经验）、真实宠物档案与身份卡、品种图鉴、健康信息 |
+| `space-service` | 8082 | MySQL `petverse_space` + ES | 宠域空间动态（图文 / 视频，三层可见性）、点赞评论聚合、热度榜、全文检索 |
+| `social-service` | 8084 | MySQL `petverse_social` | 好友关系（申请 / 同意 / 拉黑）、私聊会话与消息、聊天附件上传 |
+| `remark-service` | 8085 | MySQL + Redis(db2) | 面向多业务域的通用点赞 / 评论 / 站内通知；点赞走 Redis 缓冲 + 定时批量落库 |
+| `shop-service` | 8087 | MySQL `petverse_shop` + ES | 商户入驻审核、店铺 / 商品管理、购物车、订单（延迟消息超时取消）、商品评价、全文检索 |
+| `petverse-common` | — | — | **所有** DO / DTO / VO、统一返回与异常、JWT 上下文、MQ 发布与去重、OSS 封装、通用配置 |
+| `ai-service` | 8086 | PostgreSQL `petverse_ai` | Python 服务：对话（SSE 流式 + RAG + 记忆）、健康评估、评论摘要、个性化推荐 |
+
+## 环境准备
+
+| 依赖 | 版本 | 本地默认 | 必须性 |
+|---|---|---|---|
+| JDK | 21 | — | ✅ 必须 |
+| Maven | 3.9+ | — | ✅ 必须（仓库未带 mvnw，用本机 mvn） |
+| Nacos | 2.x | `localhost:8848` | ✅ 必须（服务注册与发现） |
+| MySQL | 8 | `localhost:3306`，root / 123456 | ✅ 必须（6 个业务库，见下） |
+| Redis | 5+ | `localhost:6379`，密码 123456 | 点赞 / AI 缓存需要 |
+| PostgreSQL + pgvector | 含 `vector` 扩展 | `localhost:5432`，库 `petverse_ai` | AI 会话、对话记忆、RAG 需要 |
+| RocketMQ | — | `localhost:9876` | 可选，异步链路（缺失自动降级） |
+| Elasticsearch | 8.15.5 | `localhost:9200` | 可选，搜索（缺失降级 MySQL） |
+| Python | 3.12 | — | 仅 ai-service |
+| 阿里云 OSS | — | bucket `petverse-me` | 上传类功能需要 |
+| Node.js | ^18 或 >=20 | — | 仅前端仓库 |
+
+仓库不含中间件部署脚本，请自行准备（本地裸装或自建容器均可）。
 
 ## 快速开始
 
-### 环境要求
+### 1. 初始化数据库
 
-- JDK 21、Maven 3.9+（或项目自带 `mvnw`）
-- Python 3.12（运行 ai-service）
-- 中间件：MySQL 8、Redis、Nacos 2.x、RocketMQ 5.x（可选，未启动时相关能力自动降级）
-- 可选：Elasticsearch 8.15.5（全文检索）、PostgreSQL + pgvector（AI 服务）
+MySQL 建 6 个库（utf8mb4），再执行各服务自带的建表脚本：
 
-### 1. 启动中间件
-
-先启动 MySQL、Redis、Nacos（默认 `localhost:8848`）；RocketMQ（`localhost:9876`）、Elasticsearch（`localhost:9200`）可按需启动，未启动时系统会自动降级（消息发送记日志、搜索回落数据库模糊查询）。
-
-### 2. 初始化数据库
-
-见 [数据库初始化](#数据库初始化)，为每个服务创建独立库并执行对应 `schema.sql`。
-
-### 3. 配置密钥 / 环境变量
-
-Java 服务通过环境变量注入敏感配置，Python AI 服务通过 `.env` 文件。详见 [配置与环境变量](#配置与环境变量) 与 [docs/配置与密钥说明.md](docs/配置与密钥说明.md)。
-
-### 4. 编译并安装公共模块
-
-`petverse-common` 是所有服务的依赖，需先安装到本地仓库（先父 pom，再 common）：
-
-```powershell
-# 在 PetVerse/ 目录下
-mvn -N install              # 安装父 pom
-mvn -pl petverse-common install   # 安装公共模块
+```sql
+CREATE DATABASE petverse_user   DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE petverse_pet    DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE petverse_space  DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE petverse_social DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE petverse_remark DEFAULT CHARACTER SET utf8mb4;
+CREATE DATABASE petverse_shop   DEFAULT CHARACTER SET utf8mb4;
 ```
 
-### 5. 启动 Java 服务
-
-在各自目录下启动（或 IDE 中运行对应 `*Application`），建议先启动 user-service 与 gateway-service：
-
-```powershell
-mvn -pl user-service   spring-boot:run
-mvn -pl pet-service    spring-boot:run
-mvn -pl space-service  spring-boot:run
-mvn -pl social-service spring-boot:run
-mvn -pl remark-service spring-boot:run
-mvn -pl shop-service   spring-boot:run
-mvn -pl gateway-service spring-boot:run
+```bash
+mysql -u root -p petverse_user   < user-service/src/main/resources/db/schema.sql
+mysql -u root -p petverse_pet    < pet-service/src/main/resources/db/schema.sql
+mysql -u root -p petverse_space  < space-service/src/main/resources/db/schema.sql
+mysql -u root -p petverse_social < social-service/src/main/resources/db/schema.sql
+mysql -u root -p petverse_remark < remark-service/src/main/resources/db/schema.sql
+mysql -u root -p petverse_shop   < shop-service/src/main/resources/db/schema.sql
 ```
 
-### 6. 启动 AI 服务
+PostgreSQL（仅 AI 服务）：先 `CREATE DATABASE petverse_ai;`，再执行 `psql -U postgres -d petverse_ai -f ai-service/db/schema_pgvector.sql`（建扩展与表；会话 / 消息、checkpoint 表服务启动时也会幂等补建）。详见 [ai-service/README.md](ai-service/README.md)。
 
-详见 [ai-service/README.md](ai-service/README.md)：
+> 各服务 `db/schema.sql` 是表结构的唯一事实来源：改表结构时同步更新该文件，并把存量库迁移用的 `ALTER` 语句以注释形式补在同文件头部。
 
-```powershell
-cd ai-service
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-copy .env.example .env    # 填入真实密钥（.env 已被 .gitignore 忽略）
-.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
-```
+### 2. 配置密钥（OSS）
 
-## 配置与环境变量
-
-为便于开源，所有密钥与连接信息均已从 `application.yml` 中移除，改为「环境变量 + 开发默认值」的形式（`${VAR:default}`）。生产环境通过环境变量覆盖即可。
-
-**本地开发**：真实密钥放在各服务的 `src/main/resources/secrets-local.yml`（**已被 `.gitignore` 忽略，不会提交**），由 `spring.config.import: optional:classpath:secrets-local.yml` 自动加载，作为占位符的本地默认值，本地迭代不受影响：
+把 `secrets-local.yml` 放到需要的服务 `src/main/resources/` 下（已被 `.gitignore` 忽略，**禁止提交**）：
 
 ```yaml
 local:
   oss:
-    access-key-id: <AccessKey Id>
-    access-key-secret: <AccessKey Secret>
+    access-key-id: your-access-key-id
+    access-key-secret: your-access-key-secret
 ```
 
-OSS 密钥取值优先级：**环境变量 > secrets-local.yml > 空**。涉及 OSS 的 5 个服务（user / pet / space / social / shop）各保留一份该文件；克隆本仓库后如需上传功能，按上述格式新建并填入自己的 AccessKey 即可（密钥获取：阿里云控制台 → RAM 访问控制 → AccessKey 管理），不创建也不影响启动与其它功能。
+也可用环境变量 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` 覆盖（优先级更高）。没有 OSS 密钥时服务仍可启动，仅上传类功能不可用。
 
-| 变量 | 用途 | 默认值 |
+### 3. 启动中间件与服务
+
+```bash
+# 启动顺序：Nacos → MySQL / Redis / PostgreSQL（+ 可选 RocketMQ、Elasticsearch）→ 各微服务
+mvn clean install -DskipTests          # 首次：构建全部模块（petverse-common 会被安装到本地仓库）
+
+# 方式一：IDE 直接运行各模块 *Application 主类
+# 方式二：命令行运行
+java -jar user-service/target/user-service-0.0.1-SNAPSHOT.jar
+java -jar pet-service/target/pet-service-0.0.1-SNAPSHOT.jar
+# ……其余服务同理；网关最后启动（或先启动亦可，路由在请求时解析）
+java -jar gateway-service/target/gateway-service-0.0.1-SNAPSHOT.jar
+```
+
+验证：`curl http://localhost:8080/api/user/...` 能返回统一报文即链路通畅。各服务也会尝试从 Nacos 读取同名配置（bootstrap.yml），本地 `application.yml` 已含全部默认值，**无需在 Nacos 建配置即可跑通**。
+
+### 4. 启动 AI 服务与前端
+
+- AI 服务：见 [ai-service/README.md](ai-service/README.md)（复制 `.env.example` 为 `.env`，`python -m uvicorn app.main:app --host 127.0.0.1 --port 8086`；未配 LLM Key 时 `MOCK_CHAT=true` 走内置 mock）。
+- 前端（PetVerse-web 仓库）：`npm install && npm run dev`，访问 `http://localhost:5173`。
+
+## 配置与环境变量
+
+所有密钥类配置都提供「环境变量 > 本地密钥文件 > 开发默认值」的取值顺序，生产环境请用环境变量覆盖。
+
+| 变量 | 作用范围 | 说明 |
 |---|---|---|
-| `MYSQL_URL` | 各服务 JDBC 连接串 | 各自 `localhost:3306/petverse_*` |
-| `MYSQL_USERNAME` | MySQL 用户名 | `root` |
-| `MYSQL_PASSWORD` | MySQL 密码 | `123456` |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Redis 连接（remark-service 等） | `localhost` / `6379` / `123456` |
-| `JWT_SECRET` | JWT 签名密钥，**所有服务必须一致**，生产环境务必覆盖 | 开发占位值 |
-| `OSS_ENDPOINT` | 阿里云 OSS 节点 | `oss-cn-beijing.aliyuncs.com` |
-| `OSS_ACCESS_KEY_ID` | OSS AccessKey Id | 本地由 `secrets-local.yml` 提供；未配置时上传抛业务异常 |
-| `OSS_ACCESS_KEY_SECRET` | OSS AccessKey Secret | 同上 |
-| `OSS_BUCKET_NAME` | OSS 桶名 | `petverse-me` |
-| `OSS_DOMAIN` | 可选自定义 / CDN 域名 | 空 |
+| `MYSQL_URL` / `MYSQL_USERNAME` / `MYSQL_PASSWORD` | 各 Java 服务 | 库名不同，URL 默认值各自内置 |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | remark-service | 点赞缓冲，db=2 |
+| `JWT_SECRET` | 网关 + 所有 Java 服务 | **必须一致**，否则令牌校验失败；默认值仅供开发 |
+| `JWT_EXPIRE_SECONDS` | user-service | 令牌有效期，默认 86400 秒 |
+| `OSS_ENDPOINT` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_BUCKET_NAME` | user / pet / space / social / shop | 共用同一 bucket |
+| `OSS_DOMAIN` | user-service / space-service | 自定义 / CDN 域名（含协议），为空时按桶默认域名拼接 |
+| `petverse.search.enabled` | space-service / shop-service | 搜索总开关，`false` 时全部走 MySQL 模糊查询 |
+| `petverse.order.pay-timeout-minutes` | shop-service | 支付超时分钟数，内部映射 RocketMQ 延迟档位 |
 
-AI 服务（Python）密钥通过 `ai-service/.env` 管理，仓库仅提交 `.env.example` 模板（`LLM_API_KEY`、`EMBEDDING_API_KEY` 等默认为空，`LLM_API_KEY` 留空进入 mock 模式；Embedding 留空则知识检索不可用）。完整清单见 [docs/配置与密钥说明.md](docs/配置与密钥说明.md)。
+AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 TTL 等），见 [ai-service/README.md](ai-service/README.md)。
 
-## 数据库初始化
+## 关键约定（动手前必读）
 
-每个 Java 服务拥有独立库，建表脚本位于各服务 `src/main/resources/db/schema.sql`：
+1. **实体类集中在 `petverse-common`**：DO / DTO / VO 一律按业务域建子包放在公共模块，业务模块禁止新建实体类；命名与分层规则见 [docs/后端开发规范.md](docs/后端开发规范.md)。
+2. **统一报文**：接口返回 `Result<T>` / `Result<PageResult<T>>`（`{code,msg,data}`），异常统一由 `GlobalExceptionHandler` 处理，业务模块不要自己拼错误响应。
+3. **鉴权与身份透传**：`gateway-service` 的 `AuthGlobalFilter` 先剥离客户端自带的 `X-User-Id` / `X-User-Role` 防伪造，再校验 JWT 并重新注入；白名单 `auth.whitelist-paths`（默认登录 / 注册），`/api/shop/admin`、`/api/shop/merchant` 做角色校验，`/internal/**` 禁止从网关外部访问。下游服务通过 `UserContext` 取当前用户，Feign 调用由 `FeignUserContextConfig` 自动透传身份头 —— 业务代码不需要手写用户 ID 参数传递。
+4. **服务间调用**：同步用 OpenFeign（各模块 `feign/` 包，被调方的服务间接口放 `/internal/` 路径）；异步用 RocketMQ，topic / tag 常量统一维护在 `petverse-common` 的 `MqTopics`，发布用 `MqEventPublisher`（**事务提交后才发送**，无 Broker 时降级为记日志），消费端自行保证幂等。
+5. **表结构规范**：所有表继承 `BaseEntity` 约定 —— 雪花 `id`、`create_time` / `update_time` 自动填充、`deleted` 逻辑删除（MyBatis-Plus 全局生效，查询不必手写过滤）。雪花 ID 为 19 位 Long，已由 Jackson 统一序列化为字符串，避免前端精度截断 —— 前端传回的 ID 也是字符串。
+6. **文件上传**：统一走 `petverse-common` 的 OSS 封装，各服务已配置各自的 `multipart` 大小上限（pet-service 头像 3MB、social-service 聊天文件 21MB、shop-service 单文件 51MB、space-service 视频 55MB，均含冗余），调整上限时同步改对应 `application.yml`。
 
-| 库 | 脚本 |
+## 中间件缺失时的行为
+
+本地开发可以只起必须项，其余能力自动降级（详见各服务配置注释）：
+
+| 未启动 | 影响 |
 |---|---|
-| `petverse_user` | `user-service/src/main/resources/db/schema.sql` |
-| `petverse_pet` | `pet-service/src/main/resources/db/schema.sql` |
-| `petverse_space` | `space-service/src/main/resources/db/schema.sql` |
-| `petverse_social` | `social-service/src/main/resources/db/schema.sql` |
-| `petverse_remark` | `remark-service/src/main/resources/db/schema.sql` |
-| `petverse_shop` | `shop-service/src/main/resources/db/schema.sql` |
-| `petverse_ai`（PostgreSQL + pgvector） | `ai-service/db/schema_pgvector.sql` |
+| Nacos / MySQL | 服务无法启动或注册失败 —— 必须启动 |
+| Redis | remark-service 点赞不可用（点赞读写走 Redis，定时批量落库）；ai-service 结果缓存退化为重新计算 |
+| RocketMQ | 宠物经验发放、ES 索引同步、订单超时自动取消、商家角色升级等异步链路失效；主流程正常（发消息降级为记日志） |
+| Elasticsearch | 动态 / 商品搜索降级为 MySQL `LIKE`（60s 熔断窗口后自动重试）；也可用 `petverse.search.enabled=false` 全局关闭 |
+| PostgreSQL | ai-service 会话持久化与对话记忆降级、知识类提问明确报错 |
+| OSS | 头像 / 动态媒体 / 商品图 / 聊天附件等上传功能不可用 |
 
-```powershell
-# 先建库，再导入对应脚本
-mysql -u root -p -e "CREATE DATABASE petverse_user DEFAULT CHARSET utf8mb4;"
-mysql -u root -p petverse_user < user-service/src/main/resources/db/schema.sql
-# ... 其余服务同理
-```
+## 新增一个功能的落地步骤
 
-> AI 服务的会话 / 消息表与 LangGraph checkpoint 表在服务启动时会自动幂等创建，`schema_pgvector.sql` 为手动入口与表结构文档。
+1. 改表：更新目标模块 `src/main/resources/db/schema.sql`（新表或 `ALTER` 注释），并在本地库执行。
+2. 公共实体：在 `petverse-common` 对应业务域子包下新增 DO / DTO / VO（命名规范见开发规范文档）。
+3. 业务实现：在目标服务按 `mapper → service → controller` 顺序补齐；Controller 只接收 DTO、只返回 `Result<VO>`，DO 不得越过 Service 暴露。
+4. 跨服务数据：优先复用已有 Feign Client（`user / social / remark` 等），新增内部接口放 `/internal/`。
+5. 异步链路：在 `MqTopics` 加常量，用 `MqEventPublisher` 发布，消费端做幂等。
+6. 自测：仓库**暂无自动化测试模块**，请通过 `curl` / 前端联调手工验证正常与异常分支后再提交。
 
-## API 概览
+## 文档索引
 
-统一响应结构 `{ code, msg, data }`；除 `/api/user/login`、`/api/user/register` 白名单外，其余接口需携带 JWT（网关鉴权后注入 `X-User-Id`）。各服务控制器基础路径：
+| 文档 | 内容 |
+|---|---|
+| [docs/后端开发规范.md](docs/后端开发规范.md) | 模块职责、包结构、命名、分层调用、表结构规范（新人必读） |
+| [docs/AI模块功能说明.md](docs/AI模块功能说明.md) | AI 模块功能说明书：编排结构、接口契约、存储、配置、降级策略 |
+| [ai-service/README.md](ai-service/README.md) | AI 服务启动、环境变量、接口列表、生产韧性设计 |
+| [docs/秋招项目介绍.md](docs/秋招项目介绍.md) | 项目亮点与设计取舍（了解关键设计意图的来龙去脉） |
 
-| 服务 | 路径前缀（网关） | 说明 |
-|---|---|---|
-| user | `/api/user` | 注册、登录、资料、头像上传 |
-| pet | `/api/pet` | 宠物档案、养成、健康信息 |
-| space | `/api/space` | 动态发布/查询、可见性、热度、媒体 |
-| social | `/api/social/friend`、`/api/social/chat` | 好友、私聊会话与消息 |
-| remark | `/api/remark/like`、`/api/remark/comment`、`/api/remark/notification` | 点赞、评论、通知 |
-| shop | `/api/shop/product`、`/cart`、`/order`、`/review`、`/merchant`、`/apply`、`/admin`、`/store`、`/file` | 商城与商家 |
-| ai | `/api/ai/chat/stream`、`/api/ai/health/assess`、`/api/ai/shop/review/summary`、`/api/ai/recommend/feed` | AI 能力（SSE 流式对话等，详见 ai-service README） |
+## 协作提醒
 
-## 项目亮点
-
-1. **独立设计实现 AI 对话编排引擎**：基于 LangGraph StateGraph 将「意图识别 → RAG 检索 / Agent 工具调用 → Prompt 组装 → 流式生成」编排为条件路由状态图；Agent 通过 6 个工具查询用户真实数据作答；命中急症意图时强制注入「就医提示」安全护栏。
-2. **高可用 SSE 流式对话链路**：自定义 `meta → delta → done` 事件协议 + 15s 心跳防掐断；全局信号量限流实现过载保护；用户中途停止生成时问题与部分回复双路收尾，避免内容丢失与记忆断裂。
-3. **基于 LangGraph 官方 checkpoint 的可恢复对话记忆**：图状态 messages 按「用户 + 会话」线程自动持久化到 PostgreSQL，跨轮自动恢复上下文；被中断的轮次同样进入后续记忆。
-4. **基于 pgvector 的 RAG 知识库**：语义检索（余弦相似度阈值过滤 + 来源引用注入）；Embedding 未配置或向量库故障时明确报错，不做关键词降级。
-5. **跨大模型厂商的结构化输出兼容**：`json_schema → function_calling → json_mode` 三级自动探测降级，规避不同服务商能力差异导致的「静默降级」。
-6. **事件驱动的微服务基础设施**：RocketMQ 解耦异步链路（ES 索引同步、订单超时取消回补库存、点赞落库 + 通知、商家审核角色升级）；ES 故障 60s 熔断窗口自动降级；网关统一 JWT 鉴权与内部信任头注入，支撑跨语言身份透传。
-
-更多细节见 [docs/秋招项目介绍.md](docs/秋招项目介绍.md) 与 [docs/后端开发规范.md](docs/后端开发规范.md)。
-
-## 安全与密钥说明
-
-- **本仓库不含任何真实密钥**：OSS AccessKey、JWT 密钥、数据库密码等均改为环境变量占位符；本地真实密钥放于各服务 `secrets-local.yml`（已忽略、不提交），运行时可正常加载。
-- **AI 服务密钥**：真实 `LLM_API_KEY` / `EMBEDDING_API_KEY` 仅存于本地 `ai-service/.env`，该文件已被 `.gitignore` 忽略，仓库只提交 `.env.example` 模板。
-- **生产部署务必**：
-  1. 通过环境变量注入真实的 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `JWT_SECRET`（所有服务 `JWT_SECRET` 保持一致）；
-  2. 为 OSS 子账号配置最小权限（仅限目标桶读写）；
-  3. 若仓库历史中曾提交过密钥，请立即到对应服务商控制台 **轮换（重新生成并作废旧密钥）**，并清理 Git 历史（如 `git filter-repo`）。
-- `.gitignore` 已忽略 `secrets-local.yml`、`ai-service/.env` 等本地密钥文件，请勿删除忽略规则或使用 `git add -f` 强制提交。
-
-## 常见问题
-
-- **上传头像/图片报错「OSS 未配置」？** 当前服务的 `src/main/resources/secrets-local.yml` 不存在或未填密钥（克隆仓库后默认没有），补上后重启即可；也可用环境变量注入。
-- **登录后 token 校验失败？** 确认所有服务（含 gateway）的 `JWT_SECRET` 完全一致。
-- **搜索很慢或结果不准？** 未启动 Elasticsearch 时会自动降级为 MySQL 模糊查询，属预期行为；需要全文检索请启动 ES。
-- **AI 对话返回 mock 回复？** `LLM_API_KEY` 为空或 `MOCK_CHAT=true` 时进入 mock 模式，配置真实 Key 即可。
-- **修改 `petverse-common` 后其他服务没生效？** 需重新 `mvn -pl petverse-common install` 后再编译依赖服务。
-
-## 许可证
-
-本项目仅用于学习与交流用途。第三方组件遵循其各自的开源许可证。
+- **不要提交** `ai-service/.env`、`**/secrets-local.yml`：内含真实密钥，已在 `.gitignore` 中忽略；若曾误提交请立即轮换密钥。
+- 新增环境变量时，记得给 `application.yml` 配一个 `localhost` 开发默认值，并在本 README 的变量表中登记。
+- 改动公共模块（`petverse-common`）会影响全部服务，请本地构建全量模块通过后再提交。

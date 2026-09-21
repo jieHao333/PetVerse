@@ -1,394 +1,296 @@
 # PetVerse AI 模块功能说明
 
-> 版本：v1.0 ｜ 对应服务：`ai-service`（Python FastAPI）｜ 编排框架：LangChain + LangGraph
-
-本文档介绍 PetVerse 项目 AI 模块的整体架构、四大核心能力、LangGraph 编排细节、RAG 知识库、存储设计、容错降级策略与接入方式，供开发、联调与验收参考。
-
----
+> 本文档描述 `ai-service`（Python / FastAPI）的功能范围、编排结构、接口契约、数据存储与容错策略。
+> 面向读者：项目使用者、二次开发者、面试评审。启动与部署见 [../ai-service/README.md](../ai-service/README.md)。
 
 ## 一、模块定位
 
-PetVerse AI 模块是一个**独立的 Python AI 微服务**（`ai-service`），以 FastAPI 构建，启动后注册进 Nacos，由 Spring Cloud Gateway 通过 `lb://ai-service` 统一路由，对外仅暴露网关前缀 `/api/ai/**`（StripPrefix=1）。
+AI 模块是整个平台的智能能力层，**独立部署为 Python 微服务**，与 Java 服务同构接入现有基础设施：
 
-它承担园区内所有 AI 能力：**养宠顾问对话、宠物健康智能评估、商品评论摘要、个性化推荐**，全部由 **LangGraph** 显式编排，对话与 Embedding 均采用 **OpenAI 兼容协议**，切换模型服务商无需改代码。
+- **统一入口**：注册进 Nacos（服务名 `ai-service`），由 Spring Cloud Gateway 以 `lb://ai-service` + `Path=/api/ai/**` 路由，`StripPrefix=1` 后到达本服务；
+- **统一鉴权**：网关完成 JWT 校验后剥离外部伪造头、注入 `X-User-Id`，本服务直接读取该头识别用户，**无需自行实现一套鉴权**；
+- **统一报文**：所有业务响应为 HTTP 200 + `{code, msg, data}`，与 Java 侧 `GlobalExceptionHandler` 行为对齐，前端一套错误处理逻辑通吃；
+- **反向调用**：本服务按需直连各 Java 服务（`/pet/my-list`、`/shop/order/page` 等），复用同一套内部信任头机制拉取用户真实数据。
 
-### 为什么独立成 Python 服务
+```
+前端 ──▶ 网关(/api/ai/** + JWT) ──▶ ai-service :8086
+                                      │
+                                      ├──▶ Java 业务服务（注入 X-User-Id 拉取宠物/订单/购物车/评论/动态）
+                                      ├──▶ LLM 服务商（OpenAI 兼容：DeepSeek / 阿里云百炼 / ...）
+                                      ├──▶ Embedding 服务商（RAG 向量化）
+                                      ├──▶ PostgreSQL + pgvector（会话消息 / 对话记忆 / 长期记忆 / 知识库 / 报告 / 缓存）
+                                      ├──▶ Redis（结果缓存热层）
+                                      └──▶ 阿里云 OSS（多模态附件）
+```
 
-| 考量 | 说明 |
-|---|---|
-| 生态 | LangChain / LangGraph 生态在 Python 侧最完整，Agent、结构化输出、向量库集成成熟 |
-| 隔离 | AI 依赖重、迭代快，独立服务避免污染 Java 业务模块的构建与依赖 |
-| 复用 | 通过 Nacos 服务发现与网关鉴权，完全复用现有微服务体系，不新增网关配置 |
+## 二、技术选型
 
-### 与 Java 微服务的关系
-
-- **不修改任何 Java 代码**：ai-service 通过 `httpx` 直连各业务服务拉取上下文，注入内部请求头 `X-User-Id`；Java 侧 `UserContextInterceptor` 在无 JWT 时信任该内部头（外部请求的该头已被网关剥离），天然具备用户隔离。
-- 所有新接口都落在 `/api/ai/**` 下，网关路由无需改动。
-
----
-
-## 二、技术栈
-
-| 层次 | 技术 | 用途 |
+| 分类 | 选型 | 说明 |
 |---|---|---|
-| Web 框架 | FastAPI + Uvicorn | HTTP / SSE 接口 |
-| 编排引擎 | **LangGraph** | 四张状态图（对话 / 健康 / 摘要 / 推荐） |
-| LLM 框架 | **LangChain**（v1）+ langchain-openai | 模型调用、结构化输出、工具、RAG |
-| 对话模型 | OpenAI 兼容（DeepSeek / 阿里云百炼等） | 可配 `base_url` + `model` |
-| Embedding | OpenAI 兼容 | RAG 向量化 |
-| 向量库 | PostgreSQL + **pgvector** | 语义检索 |
-| 对话记忆 | LangGraph checkpoint（PostgreSQL） | 图状态持久化、跨轮恢复与中断补写 |
-| 对话持久化 | PostgreSQL（`petverse_ai`） | 会话与消息（与 checkpoint 同库） |
-| 结果缓存 | Redis（db=3）+ PG `ai_cache` | 评论摘要 / 推荐等（两级降级） |
-| 结果持久化 | PostgreSQL（`petverse_ai`） | 健康报告 + 结果缓存温层 |
-| 服务发现 | Nacos | 注册为 `ai-service` |
+| Web 框架 | FastAPI + Uvicorn | 原生 async，SSE 流式输出友好 |
+| 编排框架 | **LangGraph**（StateGraph / checkpoint / runtime store） | 显式状态图编排，替代手写流程 |
+| 模型接入 | langchain-openai（ChatOpenAI / OpenAIEmbeddings） | **OpenAI 兼容格式**，改 `base_url` + `model` 即可切换服务商 |
+| 向量库 | PostgreSQL + **pgvector**（langchain-postgres `PGVector`） | 与业务数据同库，少维护一个中间件 |
+| 业务持久化 | psycopg3 同步连接池 + `asyncio.to_thread` | 规避 Windows `ProactorEventLoop` 对 psycopg 异步连接的限制 |
+| 缓存 | redis-py（asyncio，db=3） | 结果缓存热层 |
+| 对象存储 | oss2（阿里云 OSS） | 多模态附件直传 |
+| 注册中心 | nacos-sdk-python + OpenAPI 兜底 | 双保险注册与心跳保活 |
+| 配置 | pydantic-settings（`.env`） | 集中式、可校验、支持兼容回落 |
 
----
+## 三、能力总览
 
-## 三、整体架构
-
-```mermaid
-flowchart TB
-    FE["前端 PetVerse-web<br/>Vue3"] -->|"/api/ai/**"| GW["网关 gateway-service<br/>JWT 鉴权 + X-User-Id"]
-    GW -->|"lb://ai-service"| AI["ai-service<br/>FastAPI :8086"]
-
-    subgraph AI_INNER ["ai-service 内部"]
-        ROUTERS["路由层<br/>chat / health / review / recommend"]
-        GRAPHS["LangGraph 编排层<br/>4 张 StateGraph"]
-        INFRA["基础设施层<br/>llm / vectorstore / clients / tools / checkpoint / memory / persistence / pg_store"]
-        ROUTERS --> GRAPHS --> INFRA
-    end
-
-    AI --> AI_INNER
-    INFRA -->|"RAG / 会话消息 / 对话记忆"| PG[("PostgreSQL<br/>pgvector + chat + checkpoint")]
-    INFRA -->|"结果缓存"| RD[("Redis<br/>db=3")]
-    INFRA -->|"X-User-Id 直连"| BIZ["Java 业务服务<br/>pet / shop / space ..."]
-    GRAPHS -->|"OpenAI 兼容"| LLM["大模型服务<br/>LLM + Embedding"]
-```
-
-### 目录结构
-
-```
-ai-service/
-├── app/
-│   ├── main.py              # FastAPI 入口 + lifespan（Redis/PG/Nacos）
-│   ├── config.py            # pydantic-settings 配置中心
-│   ├── llm.py               # LLM / Embedding 客户端 + 结构化输出助手
-│   ├── vectorstore.py       # pgvector 语义检索（不可用即报错，无降级）
-│   ├── clients.py           # 业务微服务 HTTP 客户端
-│   ├── tools.py             # LangGraph Agent 工具集
-│   ├── memory.py            # Redis 通用缓存（评论摘要 / 推荐）
-│   ├── cache.py             # 结果缓存门面（Redis 热 + ai_cache 温两级）
-│   ├── persistence.py       # PostgreSQL 会话/消息持久化
-│   ├── checkpoint.py        # LangGraph checkpoint 对话记忆（官方 PostgresSaver）
-│   ├── pg_store.py          # PostgreSQL 健康报告 + 结果缓存温层
-│   ├── persona.py           # 系统提示词组装
-│   ├── schemas.py           # 数据模型 + 结构化输出 Schema
-│   ├── chat.py              # 对话路由（SSE）
-│   ├── health.py            # 健康评估路由
-│   ├── review.py            # 评论摘要路由
-│   ├── recommend.py         # 个性化推荐路由
-│   ├── graph/               # 四张 LangGraph 编排图
-│   ├── knowledge/           # RAG 知识库 Markdown 语料
-│   └── logging_setup.py     # 统一日志
-├── scripts/ingest_knowledge.py       # 知识库导入脚本
-├── scripts/migrate_mysql_to_pg.py    # 存量数据迁移（MySQL → PostgreSQL）
-├── db/
-│   └── schema_pgvector.sql           # PostgreSQL 业务表 + pgvector（含会话/消息）
-└── requirements.txt
-```
-
----
-
-## 四、核心能力
-
-| 能力 | 网关接口 | 编排图 | 存储 |
+| # | 能力 | 编排图 | 入口接口 |
 |---|---|---|---|
-| AI 养宠顾问对话 | `POST /api/ai/chat/stream`（SSE） | `chat_graph` | PostgreSQL（checkpoint + 会话消息） |
-| 会话历史 / 列表 / 删除 | `GET/DELETE /api/ai/chat/*` | — | PostgreSQL |
-| AI 健康智能评估 | `POST /api/ai/health/assess` | `health_graph` | PostgreSQL |
-| 健康评估历史 | `GET /api/ai/health/history` | — | PostgreSQL |
-| 商品评论摘要 | `POST /api/ai/shop/review/summary` | `review_graph` | 两级缓存（Redis + ai_cache） |
-| 个性化推荐 | `GET /api/ai/recommend/feed` | `recommend_graph` | 两级缓存（Redis + ai_cache） |
+| 1 | AI 养宠顾问对话（SSE 流式） | `app/graph/chat_graph.py` | `POST /api/ai/chat/stream` |
+| 2 | 宠物健康智能评估 | `app/graph/health_graph.py` | `POST /api/ai/health/assess` |
+| 3 | 商品评论智能摘要 | `app/graph/review_graph.py` | `POST /api/ai/shop/review/summary` |
+| 4 | 个性化推荐流 | `app/graph/recommend_graph.py` | `GET /api/ai/recommend/feed` |
+| 5 | 多模态附件上传 | —（`app/media.py` + `app/oss.py`） | `POST /api/ai/chat/upload` |
+| 6 | 会话管理 / 历史回放 | —（`app/persistence.py`） | `GET|DELETE /api/ai/chat/sessions*`、`GET /api/ai/chat/history` |
+| 7 | 长期记忆管理 | —（`app/longterm.py` + `app/memstore.py`） | `GET /api/ai/chat/memories`、`DELETE /api/ai/chat/memories/{key}` |
 
----
+## 四、核心能力详解
 
-## 五、LangGraph 编排详解
+### 4.1 AI 养宠顾问对话
 
-### 5.1 对话编排（chat_graph）
+#### 4.1.1 编排结构（chat_graph）
 
-一条消息进入后，先**意图识别**，再按意图走不同分支，最后统一组装 Prompt 并流式生成：
-
-```mermaid
-flowchart LR
-    S([START]) --> CI["classify_intent<br/>意图识别"]
-    CI -->|knowledge / health / medical_urgent| RK["retrieve_knowledge<br/>RAG 检索"]
-    CI -->|tool_query| TA["tool_action<br/>Agent 工具调用"]
-    CI -->|chitchat| CP["compose<br/>组装 Prompt"]
-    RK -->|tool_query| TA
-    RK -->|其余| CP
-    TA --> CP
-    CP --> G["generate<br/>流式生成"]
-    G --> E([END])
+```
+START → classify_intent ──┬─(knowledge / health / medical_urgent)─→ retrieve_knowledge ──┬─→ recall_memory → compose → generate → END
+                          ├─(tool_query)──────────────────────────────────────────────────┤
+                          └─(chitchat)────────────────────────────────────────────────────→
 ```
 
-**五类意图**：
-
-| 意图 | 含义 | 处理 |
+| 节点 | 职责 | 关键实现 |
 |---|---|---|
-| `chitchat` | 打招呼、闲聊 | 跳过检索与工具，直接生成 |
-| `knowledge` | 养宠知识咨询 | 走 RAG 检索知识库 |
-| `health` | 健康评估、体检、养护 | 走 RAG 检索 |
-| `medical_urgent` | 疑似疾病、用药、急症 | 走 RAG + **强制医疗安全护栏** |
-| `tool_query` | 查询用户真实数据 | 走 Agent 工具调用 |
+| `classify_intent` | 意图识别 | 真实模式用 LLM 结构化输出 5 类意图（`chitchat` / `knowledge` / `health` / `medical_urgent` / `tool_query`）；失败降级关键词规则；**纯附件消息（无文字）直接归 `knowledge`**，不浪费一次分类调用 |
+| `retrieve_knowledge` | RAG 语义检索 | 仅对 `knowledge` / `health` / `medical_urgent` 三类生效；命中相似度阈值的结果带来源注入 Prompt；链路不可用时抛 `RagUnavailable` 直接报错 |
+| `tool_action` | Agent 工具调用 | 仅 `tool_query` 生效；`create_agent` 驱动 ReAct 工具调用，查询用户真实数据（6 个工具，见下） |
+| `recall_memory` | 长期记忆召回 | 从 LangGraph runtime store 读取「用户级 + 当前宠物级」记忆渲染为 bullet 文本；store 不可用 / 开关关闭时降级为空 |
+| `compose` | Prompt 组装 | 拼接最终 System Prompt（见 4.1.3），裁剪最近 `HISTORY_MAX_MESSAGES` 条历史；当前轮带图时组装多模态分片 |
+| `generate` | 生成 | 调 LLM 流式生成并把回复写回图状态 `messages`（随 checkpoint 自动持久化）；含图时切换视觉模型客户端 |
 
-**节点职责**：
+> 顺序说明：`retrieve_knowledge` 与 `tool_action` 按意图二选一（知识类走 RAG、工具类走 Agent），两者均会串接 `recall_memory`——即**长期记忆块始终参与组装**，与知识上下文 / 工具数据可叠加注入；各块内容为空时对应模板块整体省略，Prompt 始终可完整渲染。
 
-- `classify_intent`：真实模式用 LLM 结构化输出分类；mock / 失败时降级为关键词规则（含急症词表：抽搐、中毒、尿闭、误食、车祸等）。
-- `retrieve_knowledge`：pgvector 语义检索，带相似度阈值过滤，拼成带来源引用的知识块。
-- `tool_action`：`create_agent` + 工具集运行 ReAct，查询用户真实数据。
-- `compose`：组装 System Prompt = 人设 + 宠物档案 + 参考知识 + 用户数据 + 医疗护栏。
-- `generate`：真实模式调用 LLM；mock 模式由路由层走打字机 mock 流。
+#### 4.1.2 Agent 工具集（`app/tools.py`）
 
-**医疗安全护栏**：命中 `medical_urgent` 时，Prompt 强制注入「明确说明无法替代兽医诊断，务必尽快到正规宠物医院就诊，不要仅凭线上建议自行用药」。
+工具按请求动态构建，**闭包捕获 `user_id`**，因此天然具备用户隔离；全部只读，失败返回空提示不影响主流程；单次返回内容截断 2000 字符控制上下文规模。
 
-**流式实现**：路由层用 `graph.astream(state, stream_mode="messages")`，只透传 `generate` 节点的助手文本增量，保留 token 级流式；前端 SSE 协议保持 `meta → delta* → done` 不变。
+| 工具名 | 用途 | 数据来源 |
+|---|---|---|
+| `get_my_pets` | 我的宠物档案与健康信息 | pet-service `/pet/my-list` |
+| `get_my_orders` | 我的近期订单（含自提码） | shop-service `/shop/order/page` |
+| `get_my_cart` | 我的购物车 | shop-service `/shop/cart` |
+| `get_product_reviews` | 指定商品的用户评论 | shop-service `/shop/review/page` |
+| `get_hot_posts` | 社区当前热门动态 | space-service `/space/page?sort=hot` |
+| `search_products` | 关键词搜索在售商品 | shop-service `/shop/product/page` |
 
-### 5.2 健康评估（health_graph）
+#### 4.1.3 Prompt 组装与安全护栏（`app/persona.py`）
 
-```mermaid
-flowchart LR
-    S([START]) --> LP["load_profile<br/>整理档案"] --> AN["analyze<br/>LLM 结构化评估"] --> PE["persist<br/>落库"] --> E([END])
-```
+System Prompt 由「基础人设 + 五个可选上下文块 + 要求」构成，各块为空则整体省略：
 
-- `load_profile`：整理宠物档案与健康字段，标记缺失项。
-- `analyze`：LLM 结构化输出；mock / 失败时用规则评分（按档案完整度、疫苗驱虫记录、病史关键词扣分）。
-- `persist`：写入 `pet_health_report`。
+| 块 | 内容来源 | 作用 |
+|---|---|---|
+| 宠物档案块 | 前端传入的 `pet`（名字/物种/品种/年龄 + 7 项健康字段） | 让建议与宠物个体匹配 |
+| 长期记忆块 | runtime store（用户偏好 / 宠物习性 / 病史） | 跨会话个性化，回答中不暴露「记忆」实现细节 |
+| 知识块 | RAG 检索结果（含来源标注） | 降低幻觉，支持引用 |
+| 用户数据块 | Agent 工具查询到的真实业务数据 | 杜绝凭空猜测订单 / 购物车 / 口碑 |
+| 医疗护栏块 | 命中 `medical_urgent` 时强制注入 | 明确声明「不能替代兽医诊断」，必须引导就医、禁止自行用药 |
 
-**输出结构**（`PetHealthReport`）：
+人设定位为**中立的养宠顾问**（不扮演宠物、不使用拟人化语气），并要求「档案未提供的信息先向用户确认再作答」。
 
-| 字段 | 说明 |
-|---|---|
-| `score` | 健康评分 0–100 |
-| `level` | `excellent` / `good` / `fair` / `warning` |
-| `summary` | 一句话总评 |
-| `risks[]` | 风险点 |
-| `suggestions[]` | 养护建议 |
-| `care_plan[]` | 近期养护计划 |
-| `reminders[]` | 疫苗 / 驱虫 / 体检提醒（含紧急度） |
-| `disclaimer` | 免责声明 |
+#### 4.1.4 对话记忆（双层）
 
-**评分标准**：信息完整各项正常 85–100；轻微需改善 70–84；明显风险 50–69；严重/紧急风险 <50。
-
-### 5.3 商品评论摘要（review_graph）
-
-```mermaid
-flowchart LR
-    S([START]) --> FR["fetch_reviews<br/>拉取评论"] --> SM["summarize<br/>map-reduce 摘要"] --> PC["persist_cache<br/>两级缓存"] --> E([END])
-```
-
-- 先查两级缓存（`ai:review:summary:{productId}`，默认 6 小时；Redis 未命中自动回落 `ai_cache`）。
-- 拉取真实评论 → LLM 结构化摘要；评论为空或 LLM 失败时降级为规则摘要（评分均值定情感、正负词抽句）。
-- 输出：`sentiment`（positive/neutral/negative）、`one_line`、`pros[]`、`cons[]`、`keywords[]`、`count`。
-
-### 5.4 个性化推荐（recommend_graph）
-
-```mermaid
-flowchart LR
-    S([START]) --> GP["gather_profile<br/>并发拉画像"] --> RC["recall_candidates<br/>关键词召回"] --> RR["rerank<br/>LLM 重排 + 理由"] --> PC["persist_cache<br/>缓存"] --> E([END])
-```
-
-- `gather_profile`：并发拉取宠物、订单、购物车、评价、我的动态（任一失败不影响其余）。
-- `recall_candidates`：用宠物物种/品种 + 交互商品的名称作为关键词搜索商品，再补热门商品与热门动态，去重规范化。
-- `rerank`：LLM 结合画像从候选里挑选并生成推荐理由（限用候选内 id，防幻觉）；失败时启发式排序。
-- `persist_cache`：按「用户 + 场景」写两级缓存（默认 10 分钟，Redis 热 + ai_cache 温），`refresh=true` 可跳过。
-
----
-
-## 六、RAG 知识库
-
-### 语义检索
-
-1. **pgvector + OpenAI 兼容 Embedding**：余弦距离检索，理解同义表达；召回片段受 `RAG_SCORE_THRESHOLD`（默认 0.35）过滤，低于阈值的片段直接丢弃。
-2. **不可用时明确失败**：Embedding 未配置或向量库不可用时抛 `RagUnavailable`（对话侧转 `error` 事件），**不做关键词降级**——避免拿低质上下文诱导模型编造答案。
-
-### 知识语料
-
-内置 5 篇 Markdown（`app/knowledge/`）：疫苗与免疫、驱虫、科学喂养、常见疾病与就医信号、行为训练与日常护理。
-
-导入命令：
-
-```powershell
-.venv\Scripts\python -m scripts.ingest_knowledge
-```
-
-脚本用 `RecursiveCharacterTextSplitter`（中文分隔符优先）切分，**幂等重建**集合后写入 pgvector；Embedding 未配置或向量库不可用时脚本报错退出（不降级）。
-
-### 向量库接入
-
-- 集合由 `langchain-postgres.PGVector` 自动管理（`langchain_pg_collection` / `langchain_pg_embedding`），无需手工建表。
-- 仅需数据库提前 `CREATE EXTENSION vector`（已含在 `db/schema_pgvector.sql`）。
-- **维度必须与 `EMBEDDING_DIM` 一致**（默认 1024），切换模型需重建集合。
-
----
-
-## 七、存储设计
-
-| 存储 | 内容 | Key / 表 | 生命周期 |
+| 层 | 载体 | 生命周期 | 说明 |
 |---|---|---|---|
-| Redis db=3（热） | 评论摘要缓存 | `ai:review:summary:{productId}` | 6 小时 |
-| Redis db=3（热） | 推荐缓存 | `ai:recommend:{scene}:{userId}` | 10 分钟 |
-| PostgreSQL | 会话 | `chat_session`（用户+宠物+会话三级隔离） | 永久 |
-| PostgreSQL | 消息 | `chat_message`（`interrupted` 标记被中止的回复） | 永久 |
-| PostgreSQL | 对话记忆 | LangGraph checkpoint（thread = 用户+会话） | 永久（随会话删除清理） |
-| PostgreSQL | 健康报告 | `pet_health_report` | 永久（保留历史） |
-| PostgreSQL | 结果缓存温层 | `ai_cache`（Redis 未命中 / 故障时兜底） | 与 Redis 同 TTL |
+| 短期记忆（上下文） | LangGraph 官方 `PostgresSaver` checkpoint | 跟随会话 | 图状态 `messages` 按 `thread_id = petverse-chat:{userId}:{sessionId}` 在每个超级步自动落库；`compose` 时只取最近 `HISTORY_MAX_MESSAGES`（默认 40）条控制 token 成本 |
+| 长期记忆（跨会话） | LangGraph 官方 `PostgresStore` runtime store | 跨会话、与删除会话解耦 | 命名空间两级隔离：`petverse/user_mem/{userId}` 与 `petverse/pet_mem/{userId}/{petId}`；每轮正常结束后后台抽取（见 4.1.5） |
 
-**对话记忆与会话消息**：LLM 上下文记忆由 LangGraph 官方 checkpoint 按 thread（用户 + 会话）自动持久化到 PostgreSQL，跨轮自动恢复，上下文窗口从记忆裁剪最近 `HISTORY_MAX_MESSAGES` 条；`chat_session` / `chat_message` 为会话与消息持久层（前端历史展示 / 会话管理）。用户停止生成时双路收尾——`aupdate_state` 把问题与已产出的部分回复（`interrupted` 标记）补写回图状态成为后续记忆，`save_turn_if_exists` 条件写入消息表（会话已删则跳过，不复活历史），并以 `asyncio.shield` 保证取消路径的写入落地。
+**中断补写机制**（解决「用户点停止后 AI 失忆」）：用户中止生成时，取消路径在 `asyncio.shield` 保护下把「用户问题 + 已产出的部分回复（标记 `interrupted`）」经 `graph.aupdate_state(as_node="generate")` 补写回图状态——图状态就此收尾（`next` 为空），下一轮从 START 重新展开，不会重放未完成节点；同时兜底写入 PostgreSQL 供前端历史回放（`save_turn_if_exists` 在会话已被删除时原子跳过，不复活历史）。用户消息无条件落库，即使中止时零产出，首轮提问也不会丢。
 
----
+**存量会话回填**：升级前仅有历史消息、checkpoint 中无记录的会话，首次对话时用 PG 最近 N 条历史回填一次；回填消息 id 为确定性值（`bf-{序号}-{时间戳}`），`add_messages` 按 id 覆盖，重复触发不产生重复消息。
 
-## 八、容错与降级设计
+#### 4.1.5 长期记忆抽取（`app/longterm.py`）
 
-模块的每个外部依赖都有明确的降级路径，**任何单点故障都不会让 AI 主流程报错**：
+每轮正常结束后（真实模式 + 回复非空）由后台任务异步执行，不阻塞 `done` 事件：
 
-| 依赖 | 故障表现 | 降级策略 |
+1. 读取现有记忆清单（用户级 + 宠物级各限 20 条）作为比对依据；
+2. LLM 结构化输出 `MemoryUpdateResult`（操作列表）；
+3. 逐条应用：`add` 用新 uuid key、`update` 复用原 key 并保留 `createdAt`、`delete` 按 key 删除。
+
+抽取原则（写进 System Prompt）：只记录**长期有效**的养宠信息（用户偏好、宠物习性、病史过敏等），忽略一次性细节与寒暄；重复或演进的信息必须输出 `update` 而非 `add`（**防抖机制**）；无有效信息时输出 `none`。安全阀：单轮操作数上限 8 条、单条内容 50 字截断。中断轮（partial 回复）不触发抽取——不完整信息易产出误导性记忆。
+
+前端可查看与删除长期记忆（`GET /ai/chat/memories`、`DELETE /ai/chat/memories/{key}`），删除接口按「用户 ID + scope + petId」定位命名空间，**天然隔离越权**（他人无法猜 key 删除别人的记忆）。
+
+#### 4.1.6 SSE 流式协议与并发控制（`app/chat.py`）
+
+**事件协议**：
+
+| 事件 | 载荷 | 时机 |
 |---|---|---|
-| LLM API | 超时 / 报错 | 对话：发 `error` 事件；健康 / 摘要 / 推荐：降级为规则逻辑 |
-| 结构化输出 | 服务商不支持 json_schema | 自动按 `json_schema → function_calling → json_mode` 探测降级 |
-| Embedding | 未配置 / 不可用 | 知识检索抛 `RagUnavailable` 明确报错（不降级） |
-| pgvector | 连接失败 | 同上：知识类提问直接报错，不做关键词兜底 |
-| 业务服务 | 未启动 / 超时 | 相应上下文返回空，推荐退化为热门 |
-| Redis | 不可用 | 读写静默降级；评论摘要 / 推荐缓存自动回落 PG `ai_cache`（温层） |
-| PostgreSQL | 不可用 | 会话操作回业务错误；消息 / 对话记忆 / 报告静默降级（恢复后自动重试） |
-| 并发过载 | 信号量 3 秒超时 | 返回 `error` 事件（全局并发上限 20） |
+| `meta` | `{sessionId}` | 首帧，前端据此绑定自动新建的会话并刷新列表 |
+| `delta` | `{content}` | 生成过程中的文本增量 |
+| `done` | — | 正常结束（此时两侧存储均已写入） |
+| `error` | `{msg}` | 异常 / 过载 / 并发超限，发出后结束流 |
 
-> **关键点**：`structured output` 的跨服务商降级是必须的。例如 DeepSeek 思考模型既不支持 `json_schema` 也不支持 `tool_choice`，若不做降级，意图识别、健康评估、评论摘要、推荐重排会全部**静默退化**为规则逻辑（接口仍返回 200，难以察觉）。
+SSE 响应头固定 `Cache-Control: no-cache`、`X-Accel-Buffering: no`（禁 Nginx 反代缓冲）、`Connection: keep-alive`；超过 15s 无 token 产出即发送注释行 `: ping` 心跳防断连。
 
----
+**并发与限流**：
 
-## 九、配置说明
-
-配置集中在 `ai-service/.env`，由 `pydantic-settings` 读取。核心项：
-
-| 类别 | 配置项 | 说明 |
+| 机制 | 参数 | 说明 |
 |---|---|---|
-| 对话模型 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | OpenAI 兼容；`LLM_*` 留空时回落 `DEEPSEEK_*` |
-| Embedding | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 不配置则知识检索不可用（明确报错） |
-| 模式 | `MOCK_CHAT` | `true` 走内置模拟回复，无需真实调用 |
-| PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB` | 会话/消息 + checkpoint + 向量库 + 健康报告 |
-| RAG | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | 检索开关与参数 |
-| 业务服务 | `PET_/SPACE_/USER_/SOCIAL_/REMARK_/SHOP_SERVICE_URL` | 直连地址 |
-| 缓存 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（Redis 热层与 ai_cache 温层共用） |
-| 记忆 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口（从 checkpoint 记忆裁剪） |
-| 生成 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
+| 全局并发闸 | 20 路，3s 获取超时 | 超时返回过载提示，保护 LLM 调用与信号量池 |
+| 单用户并发闸 | 2 路 | 预检查在会话创建之前（避免超限请求白建空会话），正式登记在流生成器内 `finally` 释放 |
+| 消息长度 | 2000 字符 | 超长直接拒绝，保护上下文窗口与 token 成本 |
+| 附件数量 | 4 个 / 轮 | 可经 `.env` 调整 |
+| 首帧前重试 | 最多 2 次尝试 | 仅在**未产出任何内容**时静默重建流重试；已产出后失败不重试，避免重复输出 |
 
-**服务商切换示例**：
+**会话模型**：按「用户 + 宠物 + 会话」三级隔离——一只宠物可有多个会话；切换宠物 / 新建对话进入待创建态，**会话在用户发出首条消息时才落库**（避免频繁切换堆积空会话）；首轮消息自动作为会话标题（仍为「新会话」时刷新）；侧栏跨宠物统一展示全部历史会话。
 
-```ini
-# DeepSeek
-LLM_BASE_URL=https://api.deepseek.com/v1
-LLM_MODEL=deepseek-chat
-
-# 阿里云百炼
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL=qwen-plus
-EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_MODEL=text-embedding-v3
-EMBEDDING_DIM=1024
-```
-
----
-
-## 十、接口清单
-
-所有业务响应统一为 HTTP 200 + `{code, msg, data}`，鉴权由网关注入 `X-User-Id`，缺失返回 `401`。
-
-### 10.1 对话
-
-`POST /api/ai/chat/stream` — SSE 流式对话
-
-```json
-// 请求体
-{ "message": "我家猫该多久驱虫？", "pet": { "id": 1, "name": "咪咪", "species": "猫", "age": 2,
-  "health": { "weight": "4.2kg", "vaccine": "已打三联" } }, "sessionId": null }
-```
+### 4.2 宠物健康智能评估（health_graph）
 
 ```
-// SSE 事件流
-data: {"type":"meta","sessionId":123}     // 首帧：会话元信息
-data: {"type":"delta","content":"成年猫"}  // 增量内容（多次）
-data: {"type":"done"}                      // 正常结束
-data: {"type":"error","msg":"..."}         // 异常
+START → load_profile → analyze → persist → END
 ```
+
+- **load_profile**：整理宠物档案与 7 项健康字段为文本，标记缺失项（物种、年龄、疫苗、驱虫等）；
+- **analyze**：LLM 结构化输出 `PetHealthReport`——综合评分（0-100）、评级（excellent / good / fair / warning）、一句话总结、风险点、改进建议、近期养护计划、疫苗/驱虫/体检提醒（含紧急程度）、免责声明。评分标准显式写进 Prompt（信息完整且正常 85-100，有风险项依次下探），并明确「不得做医疗诊断，仅基于用户填写信息评估」；
+- **persist**：报告落 `pet_health_report` 表（同库历史留存）。
+
+**降级**：LLM 失败或 mock 模式走规则评估（`_rule_report`）——按档案缺失项、病史关键词、特殊时期、疫苗/驱虫记录缺项扣分，产出同样结构完整的可演示报告。`GET /ai/health/history?petId=` 可查询某宠物历史评估（时间倒序）。
+
+### 4.3 商品评论智能摘要（review_graph）
+
+```
+START → fetch_reviews → summarize → persist_cache → END
+```
+
+- 拉取商品评论（最多 50 条，参与摘要 40 条、单条截断 300 字控制上下文）；
+- LLM 结构化输出 `ReviewSummary`：情感倾向、一句话总结、优点、缺点、3-6 个高频关键词；Prompt 强制「优缺点必须来自评论内容，不要编造」；
+- 结果写两级缓存（TTL 6 小时，有新增评论自然过期重建），无评论时返回明确占位摘要且**不写缓存**；
+- **降级**：LLM 失败时用规则摘要——按评分均值定情感、情感词表挑代表性短句作优缺点、中文 n-gram（2-4 字）词频提关键词。
+
+### 4.4 个性化推荐流（recommend_graph）
+
+```
+START → gather_profile → recall_candidates → rerank → persist_cache → END
+```
+
+- **gather_profile**：`asyncio.gather` 并发拉取五路画像（宠物 / 订单 / 购物车 / 评价 / 我的动态），任一失败降级为空不影响其余；
+- **recall_candidates**：从画像提取关键词（宠物物种品种 + 交互过的商品名），关键词搜商品 + 泛化在售商品 + 热门动态，去重规范化后作为候选（商品 ≤16 + 动态 ≤8）；
+- **rerank**：LLM 结合画像压缩文本重排，产出至多 8 条「内容 + 推荐理由（≤30 字）」；**防幻觉约束**：只能用候选列表中出现过的 id，模型编造的 id 在合并阶段被过滤；重排结果为空或失败时降级启发式排序（商品优先、动态按点赞数）；
+- **persist_cache**：按 `用户 + 场景` 写两级缓存（TTL 10 分钟）；`refresh=true` 跳过缓存强制刷新。
+
+### 4.5 多模态附件（`app/media.py` / `app/oss.py`）
+
+| 类型 | 处理方式 | 大小上限 |
+|---|---|---|
+| 图片 | 当前轮以 `image_url` 分片直发视觉模型（如百炼 qwen-vl） | 10 MB |
+| 音频 | 经 OpenAI 兼容 ASR（如 paraformer-v2）转写为文本，并优先作为意图识别 / RAG 检索的信号 | 20 MB |
+| 视频 | 无法直接理解，生成明确的文字引导（建议截取关键画面以图片发送） | 50 MB |
+
+- **上传**：`POST /ai/chat/upload` 直传 OSS，对象 key 为 `ai-chat/{userId}/{yyyyMMdd}/{uuid}.ext`，URL 由浏览器回放与视觉模型回源拉取共用，**不占本服务带宽**；类型按 MIME 主类型判定、扩展名兜底，大小边读边累计、超限立即中断不产生上传流量；
+- **降级**：视觉模型未配置时图片降级为文字占位提示（引导用户文字描述）；ASR 未配置或转写失败时同样降级为提示，绝不阻断对话主流程；
+- **安全**：服务端读取附件字节（转写用）只接受**本人命名空间**的对象 key，且只按 key 取值、不按用户提交的 URL 抓取（防 SSRF）；转写结果回填 `transcript` 字段，消息通道中只保存文本描述（避免图片分片进 checkpoint 撑爆记忆存储）。
+
+## 五、接口清单
+
+> 以下均为经网关的对外路径（网关 `StripPrefix=1`）；除上传接口外，所有接口需携带 JWT，网关注入 `X-User-Id`，缺失 / 非法统一返回 `{"code":401,"msg":"未登录"}`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/ai/chat/history?sessionId=` | 会话历史（时间正序） |
-| GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物） |
-| DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与缓存） |
+| POST | `/api/ai/chat/stream` | SSE 流式对话，体 `{"message","pet":{...},"sessionId","attachments":[...]}`；首帧 `meta` 回传 sessionId |
+| POST | `/api/ai/chat/upload` | 上传多模态附件（multipart），返回 attachment 信息供前端原样放入 `attachments` |
+| GET | `/api/ai/chat/history?sessionId=` | 会话历史（时间正序，含 `interrupted` 标记与附件） |
+| GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物，最近活跃在前，每条带 petId） |
+| DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint 记忆） |
+| GET | `/api/ai/chat/memories` | 用户全部长期记忆（用户级 + 所有宠物级，最近更新在前） |
+| DELETE | `/api/ai/chat/memories/{key}?scope=&petId=` | 删除单条长期记忆 |
+| POST | `/api/ai/health/assess` | 宠物健康评估，体为宠物档案（含 `health`），返回结构化报告 |
+| GET | `/api/ai/health/history?petId=` | 宠物历史健康评估（时间倒序） |
+| POST | `/api/ai/shop/review/summary` | 商品评论摘要，体 `{"productId"}` |
+| GET | `/api/ai/recommend/feed?scene=home\|shop&refresh=` | 个性化推荐流（`refresh=true` 跳过缓存） |
 
-### 10.2 健康评估
+**SSE 事件序列**：`meta` → `delta * n` → `done`；异常时 `error` 后结束流。业务错误（参数 / 会话不存在 / 过载）以 `{code, msg, data}` JSON 报文返回，HTTP 状态码恒为 200。
 
-`POST /api/ai/health/assess` — 请求体为宠物档案（含 `health`），返回结构化报告。
+## 六、数据存储
 
-`GET /api/ai/health/history?petId=&limit=` — 返回 `{reports: [...]}`。
+全部业务数据落在 PostgreSQL 库 `petverse_ai`（与 Java 服务的 MySQL 体系独立）：
 
-### 10.3 评论摘要
+| 存储 | 表 / 结构 | 用途 | 建表方式 |
+|---|---|---|---|
+| 会话管理 | `chat_session` | 会话（user_id + pet_id 隔离，标题、活跃时间） | 启动时幂等自动创建 |
+| 消息历史 | `chat_message` | 前端历史回放（`interrupted` 标记、`attachments` JSONB） | 启动时幂等自动创建 |
+| 短期记忆 | LangGraph checkpoint 表 | LLM 上下文记忆（图状态持久化） | `PostgresSaver.setup()` 幂等创建 |
+| 长期记忆 | LangGraph store 表 | 跨会话用户 / 宠物偏好与事实 | `PostgresStore.setup()` 幂等创建 |
+| 知识库 | pgvector 集合 `petverse_kb` | RAG 向量检索 | 导入脚本重建 |
+| 健康报告 | `pet_health_report` | 历史评估报告（含 payload JSONB） | `db/schema_pgvector.sql` |
+| 结果缓存温层 | `ai_cache` | Redis 故障时的缓存兜底（UPSERT + 过期时间） | `db/schema_pgvector.sql` |
+| 结果缓存热层 | Redis db=3 | 评论摘要 / 推荐结果 | 运行时写入 |
 
-`POST /api/ai/shop/review/summary` — 请求体 `{"productId": 1}`。
+> 服务启动时 `lifespan` 依次初始化 Redis、PG 连接池、checkpoint、store、Nacos 注册；停机时反注册并释放各连接池。存量数据迁移（MySQL → PostgreSQL）用 `scripts/migrate_mysql_to_pg.py`（一次性、幂等、保留原会话 ID）。
 
-### 10.4 个性化推荐
+## 七、配置项（`.env`）
 
-`GET /api/ai/recommend/feed?scene=home|shop&refresh=false` — 返回 `{items:[...], summary}`，item 含 `id/type/title/image/price/reason/score`。
-
----
-
-## 十一、前端接入
-
-| 页面 | 能力 | 交互 |
+| 配置组 | 关键项 | 说明 |
 |---|---|---|
-| `PetChat.vue` | AI 养宠对话 | 原生 `fetch` + ReadableStream 解析 SSE，支持停止生成 |
-| `PetIdentity.vue` | AI 健康评估 | 身份卡下方卡片，评分环 + 风险 / 建议 / 计划 / 提醒 |
-| `ProductDetail.vue` | AI 评论总结 | 评价区「生成总结」，展示情感 / 优缺点 / 关键词 |
-| `Home.vue` | 为你推荐 | 首页推荐网格 |
-| `Shop.vue` | 猜你喜欢 | 商城推荐网格 |
+| 服务与注册 | `AI_SERVICE_NAME/IP/PORT`、`NACOS_SERVER_ADDR` | 默认 127.0.0.1:8086，注册名 `ai-service` |
+| 对话模型 | `LLM_API_KEY/BASE_URL/MODEL` | OpenAI 兼容；留空或 `MOCK_CHAT=true` 进入 mock 模式 |
+| 视觉模型 | `LLM_VISION_MODEL/API_KEY/BASE_URL` | Key / BaseURL 缺省时自动回落 `LLM_*`；模型未配置时图片走文字占位 |
+| 语音转写 | `ASR_API_KEY/BASE_URL/MODEL` | 三项齐全才启用，否则音频降级为文字提示 |
+| Embedding | `EMBEDDING_API_KEY/BASE_URL/MODEL/DIM` | 不配置则知识检索不可用（知识类提问明确报错）；`DIM` 必须与 pgvector 维度一致 |
+| RAG | `RAG_ENABLED / RAG_TOP_K / RAG_SCORE_THRESHOLD / RAG_COLLECTION` | 默认开关开、召回 4 条、阈值 0.35、集合 `petverse_kb` |
+| 记忆 | `MEMORY_ENABLED`、`MEMORY_MAX_ITEMS`、`HISTORY_MAX_MESSAGES` | 长期记忆总开关、注入条数上限 20、上下文窗口 40 条 |
+| PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB`、`PG_POOL_MIN/MAX` | 库 `petverse_ai` |
+| Redis | `REDIS_HOST/PORT/PASSWORD/DB` | db=3 为 AI 结果缓存专用 |
+| OSS | `OSS_ENDPOINT/ACCESS_KEY_ID/ACCESS_KEY_SECRET/BUCKET_NAME/DOMAIN` | 与 Java 侧共用同一个桶；缺任一项上传接口明确报错 |
+| 附件 | `CHAT_MAX_ATTACHMENTS`、`MEDIA_MAX_IMAGE_MB/AUDIO_MB/VIDEO_MB` | 4 个 / 10MB / 20MB / 50MB |
+| 业务服务 | `PET/SHOP/SPACE/USER/SOCIAL/REMARK_SERVICE_URL`、`HTTP_TIMEOUT` | 直连拉取上下文，失败降级为空 |
+| 缓存 TTL | `REVIEW_SUMMARY_TTL`、`RECOMMEND_CACHE_TTL` | 6 小时 / 10 分钟 |
+| 生成参数 | `LLM_MAX_TOKENS`、`LLM_TEMPERATURE` | 默认 512 / 0.8 |
 
-- 对话用原生 `fetch`（axios 有 10s 超时且只解包 JSON，与 SSE 不兼容）。
-- 其余 JSON 接口统一走 `src/api/ai.js` 的 axios 封装。
-- 所有新增区域均带**加载 / 空态 / 降级**处理，推荐与摘要失败自动隐藏。
+## 八、容错与降级策略汇总
 
----
+设计原则：**按业务语义分级**——记忆与上下文类能力「宁可降级不可中断」，会话管理与知识检索类能力「宁可失败不可静默」。
 
-## 十二、部署与初始化
+| 环节 | 故障场景 | 策略 |
+|---|---|---|
+| 对话记忆（checkpoint） | PG 不可用 | 读降级为「无历史」、写静默失败；建表失败 30s 冷却重试，PG 恢复后无需重启自动启用 |
+| 长期记忆（store） | PG 不可用 | 读降级为空、写静默；同上冷却重试自愈 |
+| 会话管理 | PG 不可用 / 会话不存在 | **明确抛错**转业务报文（对话前提不允许静默降级） |
+| 消息持久化 | PG 写入失败 | 仅记日志，不影响本次对话 |
+| RAG 检索 | Embedding 未配置 / 向量库异常 | **抛 `RagUnavailable` 明确报错**，不降级关键词检索 |
+| 意图识别 | LLM 失败 / mock | 降级关键词规则（含医疗急症词表） |
+| 工具调用 | 业务服务异常 | 跳过真实数据上下文，对话继续 |
+| 健康评估 | LLM 失败 / mock | 降级规则评分报告 |
+| 评论摘要 | LLM 失败 / mock / 无评论 | 降级规则摘要；无评论返回占位且不写缓存 |
+| 推荐 | 画像拉取失败 / LLM 失败 | 画像缺失退化通用结果；重排失败降级启发式排序 |
+| 结果缓存 | Redis 故障 | 读自动回落 `ai_cache` 温层，写仅落温层；两级都不可用才重新计算 |
+| 音频转写 | ASR 未配置 / 失败 | 降级为文字占位提示，不阻断对话 |
+| 图片理解 | 视觉模型未配置 | 降级为文字占位提示，引导用户文字描述 |
+| 附件上传 | OSS 未配置 / 上传失败 | **明确报错**（不静默降级，避免附件悄悄丢失）；上传内部含 1 次抖动重试 |
+| LLM 流式输出 | 首帧前失败 / 中途异常 | 首帧前静默重建重试一轮；已产出内容后失败发 `error` 事件收尾 |
+| 前端连接 | 网络闪断 / 链路静默 | 心跳注释行保活；前端侧配连接看门狗（10s）与流看门狗（25s）、失败气泡可一键重发 |
+| Nacos 注册 | SDK 失败 / 实例丢失 | OpenAPI 兜底注册；自建 5s 心跳线程，检测到实例丢失自动重注册（30s 节流） |
+| 无 Key 联调 | 未配置 LLM Key | mock 模式：编排逻辑照常执行，回复由内置语料按打字机节奏输出，跨轮记忆一致 |
+
+## 九、知识库语料与导入
+
+- 语料位于 `app/knowledge/*.md`：`vaccine.md`（疫苗）、`deworming.md`（驱虫）、`feeding.md`（喂养）、`disease.md`（常见病）、`behavior.md`（行为护理）；
+- 导入：`.venv\Scripts\python -m scripts.ingest_knowledge` —— 按中文标点递归切分（chunk 280 / overlap 40），**先清空集合再全量写入**（幂等，可反复执行，以文件为唯一事实来源）；
+- Embedding 未配置或向量库不可用时脚本报错退出（RAG 只有 pgvector 一条链路，不做关键词降级）。
+
+## 十、本地运行与联调
 
 ```powershell
-# 1. 初始化数据库（PostgreSQL；会话/消息与 checkpoint 表由服务启动时自动创建）
-psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 需先 CREATE DATABASE petverse_ai
-
-# 2. 安装依赖
+cd ai-service
+python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-
-# 3. 配置 .env（参照 .env.example）
-
-# 4. 导入知识库（配置了 Embedding 时）
-.venv\Scripts\python -m scripts.ingest_knowledge
-
-# 5. 启动
+copy .env.example .env          # 留空 LLM_API_KEY 即进入 mock 模式，可无 Key 全流程联调
+psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 库需先 CREATE DATABASE petverse_ai
 .venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
 ```
 
-需预先启动：Nacos、Redis、PostgreSQL（含 pgvector）、各 Java 业务服务。
-
----
-
-## 十三、设计亮点小结
-
-1. **统一编排**：四类能力全部用 LangGraph 显式状态图驱动，节点职责单一、可观测、易扩展。
-2. **按需执行**：对话按意图条件路由，闲聊不触发检索与工具，节省 token 与延迟。
-3. **Agent 真实数据**：工具让 AI 能查用户的宠物 / 订单 / 购物车 / 评论 / 商品 / 动态，而非凭空作答。
-4. **RAG 单一链路**：只走 pgvector 语义检索，链路不可用时明确报错——宁可检索失败，也不拿低质上下文诱导模型编造答案。
-5. **跨服务商结构化输出**：三级自动降级，规避不同模型对 `json_schema` / `tool_choice` 的支持差异。
-6. **安全护栏**：医疗 / 急症意图强制就医提示，健康评估报告含免责声明。
-7. **契约稳定**：存储层从「Redis + MySQL」演进为「LangGraph checkpoint + PostgreSQL」过程中，SSE 协议、会话隔离与全部接口契约保持不变，前端零改动。
-8. **可控降级边界**：外部依赖故障时能兜底的兜底（缓存 / 记忆 / 上下文）、该报错的报错——知识检索不做降级，避免"答得像真的却无依据"。
+- **最小依赖**：无 Nacos / Redis / PG 也可启动，各能力按上表自动降级（会话管理与 RAG 除外，会明确报错）；
+- **mock 模式**：`MOCK_CHAT=true` 或未配置 `LLM_API_KEY`，无需任何外部模型服务即可演示对话、记忆、会话管理全链路；
+- **切换服务商**：改 `.env` 中 `LLM_BASE_URL` + `LLM_MODEL` 即可（如 DeepSeek `https://api.deepseek.com/v1` + `deepseek-chat`，百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus`），代码零改动。
