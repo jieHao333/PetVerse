@@ -21,7 +21,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * 好友服务实现类
@@ -85,8 +90,12 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
                 .orderByDesc(FriendRequest::getCreateTime)
                 .last("limit 50"));
         List<FriendRequestVO> result = new ArrayList<>();
+        // 申请人资料一次批量查询，申请记录逐条聚合
+        Map<Long, UserVO> users = loadUsersQuietly(requests.stream()
+                .map(FriendRequest::getFromUserId)
+                .collect(Collectors.toSet()));
         for (FriendRequest request : requests) {
-            UserVO fromUser = getUserQuietly(request.getFromUserId());
+            UserVO fromUser = users.get(request.getFromUserId());
             FriendRequestVO vo = new FriendRequestVO();
             vo.setId(request.getId());
             if (fromUser != null) {
@@ -135,8 +144,12 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
                 .eq(Friendship::getUserId, userId)
                 .orderByDesc(Friendship::getCreateTime));
         List<FriendVO> result = new ArrayList<>();
+        // 好友资料一次批量查询，关系记录逐条聚合
+        Map<Long, UserVO> users = loadUsersQuietly(friendships.stream()
+                .map(Friendship::getFriendUserId)
+                .collect(Collectors.toSet()));
         for (Friendship friendship : friendships) {
-            UserVO friendUser = getUserQuietly(friendship.getFriendUserId());
+            UserVO friendUser = users.get(friendship.getFriendUserId());
             FriendVO vo = new FriendVO();
             if (friendUser != null) {
                 vo.setUserId(friendUser.getId());
@@ -218,22 +231,34 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
         friendshipMapper.insert(friendship);
     }
 
-    /** 调用用户服务获取用户资料，失败或不存在时返回 null，不阻断主流程 */
-    private UserVO getUserQuietly(Long userId) {
+    /** 批量查询用户资料：一次请求聚合整页用户，失败或用户已注销时返回空表，由调用方降级展示 */
+    private Map<Long, UserVO> loadUsersQuietly(Collection<Long> userIds) {
+        List<Long> ids = userIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
         try {
-            Result<UserVO> result = userFeignClient.getUserById(userId);
+            Result<List<UserVO>> result = userFeignClient.listByIds(ids);
             if (result == null) {
-                log.warn("用户服务返回空结果，userId={}", userId);
-                return null;
+                log.warn("用户服务返回空结果，用户数={}", ids.size());
+                return Map.of();
             }
             if (result.getCode() != ResultCode.SUCCESS.getCode()) {
-                log.warn("用户服务返回异常状态码，userId={}, code={}, msg={}", userId, result.getCode(), result.getMsg());
-                return null;
+                log.warn("用户服务返回异常状态码，用户数={}, code={}, msg={}", ids.size(), result.getCode(), result.getMsg());
+                return Map.of();
             }
-            return result.getData();
+            if (result.getData() == null) {
+                return Map.of();
+            }
+            return result.getData().stream()
+                    .filter(user -> user.getId() != null)
+                    .collect(Collectors.toMap(UserVO::getId, Function.identity(), (a, b) -> a));
         } catch (Exception e) {
-            log.warn("调用用户服务获取用户资料失败，userId={}", userId, e);
-            return null;
+            log.warn("批量查询用户资料失败，用户数={}", ids.size(), e);
+            return Map.of();
         }
     }
 }

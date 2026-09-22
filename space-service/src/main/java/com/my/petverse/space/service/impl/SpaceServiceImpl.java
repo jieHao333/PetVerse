@@ -44,6 +44,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -244,21 +245,21 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         return List.of();
     }
 
-    /** 聚合作者用户名/昵称/头像：同页作者去重后逐个查询，失败或已注销时降级展示，不阻断列表 */
+    /** 聚合作者用户名/昵称/头像：整页作者去重后一次批量查询，失败或已注销时降级展示，不阻断列表 */
     private void fillAuthor(List<SpaceVO> vos) {
         if (vos.isEmpty()) {
             return;
         }
-        Map<Long, UserVO> userCache = new HashMap<>();
+        Map<Long, UserVO> users = loadUsersQuietly(vos.stream()
+                .map(SpaceVO::getUserId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet()));
         for (SpaceVO vo : vos) {
             Long authorId = vo.getUserId();
             if (authorId == null) {
                 continue;
             }
-            if (!userCache.containsKey(authorId)) {
-                userCache.put(authorId, getUserQuietly(authorId));
-            }
-            UserVO author = userCache.get(authorId);
+            UserVO author = users.get(authorId);
             if (author != null) {
                 vo.setAuthorUsername(author.getUsername());
                 vo.setAuthorNickname(author.getNickname());
@@ -269,17 +270,22 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         }
     }
 
-    /** 调用用户服务获取用户资料，失败或不存在时返回 null */
-    private UserVO getUserQuietly(Long userId) {
+    /** 批量查询用户资料，用户服务不可用时返回空表，由调用方降级展示 */
+    private Map<Long, UserVO> loadUsersQuietly(Collection<Long> userIds) {
+        if (userIds.isEmpty()) {
+            return Map.of();
+        }
         try {
-            Result<UserVO> result = userFeignClient.getUserById(userId);
-            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode()) {
-                return result.getData();
+            Result<List<UserVO>> result = userFeignClient.listByIds(new ArrayList<>(userIds));
+            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
+                return result.getData().stream()
+                        .filter(user -> user.getId() != null)
+                        .collect(Collectors.toMap(UserVO::getId, Function.identity(), (a, b) -> a));
             }
         } catch (Exception e) {
-            log.warn("调用用户服务获取作者信息失败，userId={}", userId, e);
+            log.warn("批量查询用户资料失败，用户数={}", userIds.size(), e);
         }
-        return null;
+        return Map.of();
     }
 
     /** 批量填充媒体列表：按动态ID一次查出，按 sortOrder 升序分组 */

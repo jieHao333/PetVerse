@@ -23,6 +23,9 @@ public class PetSignInVO implements Serializable {
     /** 连续签到天数 */
     private int signStreak;
 
+    /** 当月已签到天数（由签到 BitMap 统计） */
+    private long monthSignedDays;
+
     /** 每只宠物的签到结果 */
     private List<Item> pets;
 

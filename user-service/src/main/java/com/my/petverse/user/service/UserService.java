@@ -41,6 +41,14 @@ public interface UserService extends IService<User> {
     UserVO getUserById(Long id);
 
     /**
+     * 批量查询用户信息（内部接口，供各服务列表页聚合昵称头像，一次查询代替逐条调用）
+     *
+     * @param ids 用户ID集合，内部去重并截断到单次上限
+     * @return 存在的用户信息列表
+     */
+    List<UserVO> listUserByIds(List<Long> ids);
+
+    /**
      * 按用户名或昵称模糊搜索用户（加好友场景），排除搜索者本人，最多返回 10 条
      *
      * @param keyword 搜索关键词

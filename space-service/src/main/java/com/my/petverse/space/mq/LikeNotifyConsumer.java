@@ -29,7 +29,8 @@ import java.util.Objects;
 @RequiredArgsConstructor
 @RocketMQMessageListener(topic = MqTopics.LIKE_CHANGED,
         selectorExpression = MqTopics.TAG_LIKE_CHANGED,
-        consumerGroup = "space-like-notify-consumer")
+        consumerGroup = "space-like-notify-consumer",
+        consumeThreadMax = 32, maxReconsumeTimes = 5)
 public class LikeNotifyConsumer implements RocketMQListener<MessageExt> {
 
     private final SpaceMapper spaceMapper;

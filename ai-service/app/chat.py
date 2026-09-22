@@ -32,7 +32,7 @@ from fastapi import APIRouter, File, Header, Path, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app import checkpoint, llm, longterm, memstore, media, oss, persistence
+from app import checkpoint, limits, llm, longterm, memstore, media, oss, persistence
 from app.config import settings
 from app.graph.chat_graph import get_chat_graph, initial_state
 from app.schemas import (
@@ -53,14 +53,15 @@ router = APIRouter(prefix="/ai")
 _semaphore = asyncio.Semaphore(20)
 # 获取并发闸的超时（秒）：超时视为过载，向前端发 error 事件
 _SEMAPHORE_TIMEOUT = 3.0
-# 单用户并发上限：防止个别用户刷脚本占满全局 20 路并发，挤占其他用户
+# 单用户并发上限：防止个别用户刷脚本占满全局 20 路并发，挤占其他用户；
+# 额度计数由 app/limits.py 维护，多实例部署时经 Redis 共享
 _USER_MAX_CONCURRENT = 2
-# 单用户当前并发的流式对话数（user_id -> 计数），随流的 finally 释放
-_user_active: dict = {}
 # SSE 心跳间隔（秒）：超过该时间没有 token 产出就发一行注释 ping，防止代理断连
 _HEARTBEAT_INTERVAL = 15.0
 # 单条用户消息长度上限（字符）：超长消息会稀释上下文、烧 token，直接拒绝
 _MAX_MESSAGE_LEN = 2000
+# 归还并发额度的最长等待（秒）：超过即放弃等待，额度由计数 TTL 回收
+_SLOT_RELEASE_TIMEOUT = 2.0
 # 流式生成的最大尝试次数：首帧前失败（LLM 网络抖动 / 服务端瞬时故障）自动静默重试一轮
 _STREAM_ATTEMPTS = 2
 # 对外统一兑底话术
@@ -69,15 +70,6 @@ _USER_BUSY_MSG = "您有正在生成的咨询回复，请等它结束后再发�
 
 # 后台长期记忆抽取任务集合（持引用防 GC；done 回调自动移除）
 _bg_memory_tasks: set = set()
-
-
-def _release_user_slot(user_id: int) -> None:
-    """释放单用户并发槽位（计数归零时移除键，避免字典无限膨胀）"""
-    left = _user_active.get(user_id, 0) - 1
-    if left > 0:
-        _user_active[user_id] = left
-    else:
-        _user_active.pop(user_id, None)
 
 
 def _sse(data: dict) -> str:
@@ -288,17 +280,17 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
     collected = []          # 已累计的回复片段
     appended = False        # 本轮是否已收尾写入（防止取消分支重复补写）
     producer: Optional[asyncio.Task] = None
-    user_slot_taken = False # 是否已登记单用户并发槽位（finally 按此决定是否释放）
+    user_slot: Optional[bool] = None  # 已占用的并发额度是否走 Redis 计数；None 表示未占用
     graph = None            # 在首个 await 前完成赋值，保证取消分支可安全引用
     config: Optional[dict] = None
     human_msg: Optional[HumanMessage] = None
     try:
-        # 1.5 单用户并发登记：与路由层的预检查配合（非严格原子，竞态窗口极小）
-        _user_active[user_id] = _user_active.get(user_id, 0) + 1
-        user_slot_taken = True
-        if _user_active[user_id] > _USER_MAX_CONCURRENT:
+        # 1.5 单用户并发登记：额度计数走 Redis（多实例共享），拿不到则拒绝本轮
+        acquired, via_redis = await limits.try_acquire(user_id, _USER_MAX_CONCURRENT)
+        if not acquired:
             yield _sse({"type": "error", "msg": _USER_BUSY_MSG})
-            return   # finally 负责释放信号量与用户槽位
+            return   # finally 负责释放信号量与用户额度
+        user_slot = via_redis
     
         # 2. 构造本轮对话的图引用 / 线程配置 / 输入消息（全部同步，先于任何 await 完成）：
         #    首帧 meta 一旦发出，用户随时可能点停止，
@@ -446,8 +438,14 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
     finally:
         if producer is not None:
             producer.cancel()   # 生产者可能仍在跑（如消费端已退出），主动取消防泄漏
-        if user_slot_taken:
-            _release_user_slot(user_id)
+        if user_slot is not None:
+            # 取消路径下用 shield 保护归还操作并限制等待时间，避免 Redis 无响应时拖住流的收尾；
+            # 归还失败或超时由额度计数的 TTL 自动回收
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(limits.release(user_id, user_slot)), timeout=_SLOT_RELEASE_TIMEOUT)
+            except BaseException:
+                pass
         _semaphore.release()
 
 
@@ -477,9 +475,9 @@ async def chat_stream(
         return JSONResponse(status_code=200, content=fail(
             400, f"单条消息最多携带 {settings.CHAT_MAX_ATTACHMENTS} 个附件"))
     
-    # 2.5 单用户并发闸：同一用户最多同时 _USER_MAX_CONCURRENT 路流式对话（预检查在会话创建前，
-    # 避免超限请求白建空会话；正式登记在流生成器内完成，二者非严格原子但竞态窗口极小）
-    if _user_active.get(user_id, 0) >= _USER_MAX_CONCURRENT:
+    # 2.5 单用户并发闸预检查：只读判断当前额度是否已满（不占用额度），
+    # 放在会话创建之前，避免超限请求白建空会话；正式占用在流生成器内完成
+    if await limits.is_busy(user_id, _USER_MAX_CONCURRENT):
         return JSONResponse(status_code=200, content=fail(429, _USER_BUSY_MSG))
 
     # 3. 会话解析：校验已有会话归属，或按宠物自动新建会话

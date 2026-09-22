@@ -12,6 +12,16 @@ spring:
       discovery:
         locator:
           enabled: false
+      # 下游 HTTP 客户端：连接池复用连接并按需扩容，限制单次请求耗时
+      httpclient:
+        connect-timeout: 2000
+        response-timeout: 60s
+        compression: true
+        pool:
+          type: elastic
+          max-connections: 1000
+          max-idle-time: 30s
+          acquire-timeout: 5000
       routes:
         - id: user-service
           uri: lb://user-service
@@ -62,6 +72,26 @@ spring:
 auth:
   # 免鉴权路径白名单，逗号分隔，支持前缀匹配
   whitelist-paths: /api/user/login,/api/user/register
+
+petverse:
+  gateway:
+    rate-limit:
+      # 令牌桶限流：已登录按用户ID、未登录按来源IP，AI 流式接口单独使用更小的桶
+      enabled: true
+      capacity: 100
+      refill-per-second: 50
+      ai-capacity: 10
+      ai-refill-per-second: 2
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      # 健康探针供负载均衡与容器编排判断实例可用性，不对外暴露细节
+      show-details: never
 
 jwt:
   # 与 user-service 保持一致；生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值

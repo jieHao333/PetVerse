@@ -1,6 +1,6 @@
 """LangGraph Agent 工具集
 
-工具让 AI 对话能够查询用户的真实业务数据（而非凭空回答）：
+工具让 AI 对话基于用户的真实业务数据作答：
   - 我的宠物：get_my_pets
   - 我的订单：get_my_orders
   - 我的购物车：get_my_cart

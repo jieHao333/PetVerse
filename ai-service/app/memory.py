@@ -31,6 +31,9 @@ def init() -> None:
         db=settings.REDIS_DB,
         decode_responses=True,                     # 直接返回 str，免去手动 decode
         max_connections=50,
+        # 读写与建连超时：Redis 无响应时快速失败并进入降级分支，请求线程不被挂住
+        socket_timeout=3,
+        socket_connect_timeout=2,
     )
     _client = aredis.Redis(connection_pool=_pool)
 
@@ -84,3 +87,30 @@ async def cache_delete(key: str) -> None:
         await _client.delete(key)
     except Exception:
         logger.warning("删除 Redis 缓存失败（忽略）: %s", key, exc_info=True)
+
+
+# ---------- 原子计数（用户级并发额度等跨实例共享的计数） ----------
+
+def available() -> bool:
+    """Redis 是否已初始化并可用"""
+    return _client is not None
+
+
+async def eval_script(script: str, key: str, *args) -> Optional[int]:
+    """执行 Lua 脚本并返回整数结果
+
+    计数类操作需要「读 + 写 + 设置过期」在多实例间保持原子，故以脚本形式下发；
+    未初始化返回 None，执行异常向上抛出，由调用方决定降级方式。
+    """
+    if _client is None:
+        return None
+    result = await _client.eval(script, 1, key, *args)
+    return int(result) if result is not None else None
+
+
+async def get_int(key: str) -> Optional[int]:
+    """读取整数计数键；键不存在返回 None，异常向上抛出"""
+    if _client is None:
+        return None
+    raw = await _client.get(key)
+    return int(raw) if raw is not None else None

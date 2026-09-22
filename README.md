@@ -22,7 +22,7 @@ Spring Cloud Gateway :8080 ── JWT 鉴权 · 剥离伪造身份头 · 注入 
       ├── /api/social/**  ──▶ social-service  :8084     MySQL petverse_social
       ├── /api/remark/**  ──▶ remark-service  :8085     MySQL petverse_remark + Redis
       ├── /api/shop/**    ──▶ shop-service    :8087     MySQL petverse_shop
-      └── /api/ai/**      ──▶ ai-service      :8086     PostgreSQL + pgvector
+      └── /api/ai/**      ──▶ ai-service      :8086     PostgreSQL + pgvector + Redis
                                                   （FastAPI / LangGraph，见 ai-service/README.md）
 
 共享基础设施：Nacos(8848 注册+配置) · Redis · RocketMQ(9876) · Elasticsearch(9200) · 阿里云 OSS · MySQL · PostgreSQL
@@ -36,13 +36,13 @@ Spring Cloud Gateway :8080 ── JWT 鉴权 · 剥离伪造身份头 · 注入 
 |---|---|---|---|
 | `gateway-service` | 8080 | — | 路由转发、JWT 鉴权、身份头注入、CORS、内部接口拦截与角色校验 |
 | `user-service` | 8083 | MySQL `petverse_user` | 注册 / 登录（签发 JWT）、用户资料、角色（用户 / 商家 / 管理员）、头像上传 |
-| `pet-service` | 8081 | MySQL `petverse_pet` | 虚拟宠物养成（等级 / 经验）、真实宠物档案与身份卡、品种图鉴、健康信息 |
+| `pet-service` | 8081 | MySQL `petverse_pet` + Redis(db1) | 虚拟宠物养成（等级 / 经验 / 每日签到 BitMap）、真实宠物档案与身份卡、品种图鉴、健康信息 |
 | `space-service` | 8082 | MySQL `petverse_space` + ES | 宠域空间动态（图文 / 视频，三层可见性）、点赞评论聚合、热度榜、全文检索 |
 | `social-service` | 8084 | MySQL `petverse_social` | 好友关系（申请 / 同意 / 拉黑）、私聊会话与消息、聊天附件上传 |
 | `remark-service` | 8085 | MySQL + Redis(db2) | 面向多业务域的通用点赞 / 评论 / 站内通知；点赞走 Redis 缓冲 + 定时批量落库 |
 | `shop-service` | 8087 | MySQL `petverse_shop` + ES | 商户入驻审核、店铺 / 商品管理、购物车、订单（延迟消息超时取消）、商品评价、全文检索 |
 | `petverse-common` | — | — | **所有** DO / DTO / VO、统一返回与异常、JWT 上下文、MQ 发布与去重、OSS 封装、通用配置 |
-| `ai-service` | 8086 | PostgreSQL `petverse_ai` | Python 服务：对话（SSE 流式 + RAG + 记忆）、健康评估、评论摘要、个性化推荐 |
+| `ai-service` | 8086 | PostgreSQL `petverse_ai` + Redis(db3) | Python 服务：对话（SSE 流式 + RAG + 记忆）、健康评估、评论摘要、个性化推荐 |
 
 ## 环境准备
 
@@ -52,7 +52,7 @@ Spring Cloud Gateway :8080 ── JWT 鉴权 · 剥离伪造身份头 · 注入 
 | Maven | 3.9+ | — | ✅ 必须（仓库未带 mvnw，用本机 mvn） |
 | Nacos | 2.x | `localhost:8848` | ✅ 必须（服务注册与发现） |
 | MySQL | 8 | `localhost:3306`，root / 123456 | ✅ 必须（6 个业务库，见下） |
-| Redis | 5+ | `localhost:6379`，密码 123456 | 点赞 / AI 缓存需要 |
+| Redis | 5+ | `localhost:6379`，密码 123456 | 点赞（db2）/ 签到 BitMap（db1）/ AI 缓存与并发计数（db3）需要 |
 | PostgreSQL + pgvector | 含 `vector` 扩展 | `localhost:5432`，库 `petverse_ai` | AI 会话、对话记忆、RAG 需要 |
 | RocketMQ | — | `localhost:9876` | 可选，异步链路（缺失自动降级） |
 | Elasticsearch | 8.15.5 | `localhost:9200` | 可选，搜索（缺失降级 MySQL） |
@@ -122,6 +122,7 @@ java -jar gateway-service/target/gateway-service-0.0.1-SNAPSHOT.jar
 ### 4. 启动 AI 服务与前端
 
 - AI 服务：见 [ai-service/README.md](ai-service/README.md)（复制 `.env.example` 为 `.env`，`python -m uvicorn app.main:app --host 127.0.0.1 --port 8086`；未配 LLM Key 时 `MOCK_CHAT=true` 走内置 mock）。
+- 健康探针：各服务与网关均暴露 `/actuator/health`（仅健康与信息端点，不经网关对外路由）。
 - 前端（PetVerse-web 仓库）：`npm install && npm run dev`，访问 `http://localhost:5173`。
 
 ## 配置与环境变量
@@ -138,6 +139,7 @@ java -jar gateway-service/target/gateway-service-0.0.1-SNAPSHOT.jar
 | `OSS_DOMAIN` | user-service / space-service | 自定义 / CDN 域名（含协议），为空时按桶默认域名拼接 |
 | `petverse.search.enabled` | space-service / shop-service | 搜索总开关，`false` 时全部走 MySQL 模糊查询 |
 | `petverse.order.pay-timeout-minutes` | shop-service | 支付超时分钟数，内部映射 RocketMQ 延迟档位 |
+| `petverse.gateway.rate-limit.*` | gateway-service | 令牌桶限流开关与桶参数（普通接口 / AI 流式接口分别配置） |
 
 AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 TTL 等），见 [ai-service/README.md](ai-service/README.md)。
 
@@ -146,7 +148,7 @@ AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 T
 1. **实体类集中在 `petverse-common`**：DO / DTO / VO 一律按业务域建子包放在公共模块，业务模块禁止新建实体类；命名与分层规则见 [docs/后端开发规范.md](docs/后端开发规范.md)。
 2. **统一报文**：接口返回 `Result<T>` / `Result<PageResult<T>>`（`{code,msg,data}`），异常统一由 `GlobalExceptionHandler` 处理，业务模块不要自己拼错误响应。
 3. **鉴权与身份透传**：`gateway-service` 的 `AuthGlobalFilter` 先剥离客户端自带的 `X-User-Id` / `X-User-Role` 防伪造，再校验 JWT 并重新注入；白名单 `auth.whitelist-paths`（默认登录 / 注册），`/api/shop/admin`、`/api/shop/merchant` 做角色校验，`/internal/**` 禁止从网关外部访问。下游服务通过 `UserContext` 取当前用户，Feign 调用由 `FeignUserContextConfig` 自动透传身份头 —— 业务代码不需要手写用户 ID 参数传递。
-4. **服务间调用**：同步用 OpenFeign（各模块 `feign/` 包，被调方的服务间接口放 `/internal/` 路径）；异步用 RocketMQ，topic / tag 常量统一维护在 `petverse-common` 的 `MqTopics`，发布用 `MqEventPublisher`（**事务提交后才发送**，无 Broker 时降级为记日志），消费端自行保证幂等。
+4. **服务间调用**：同步用 OpenFeign（各模块 `feign/` 包，被调方的服务间接口放 `/internal/` 路径；**列表聚合一律走批量接口**，如 `GET /user/internal/batch?ids=`，避免逐条调用）；异步用 RocketMQ，topic / tag 常量统一维护在 `petverse-common` 的 `MqTopics`，发布用 `MqEventPublisher`（**事务提交后才发送**，无 Broker 时降级为记日志），消费端自行保证幂等。
 5. **表结构规范**：所有表继承 `BaseEntity` 约定 —— 雪花 `id`、`create_time` / `update_time` 自动填充、`deleted` 逻辑删除（MyBatis-Plus 全局生效，查询不必手写过滤）。雪花 ID 为 19 位 Long，已由 Jackson 统一序列化为字符串，避免前端精度截断 —— 前端传回的 ID 也是字符串。
 6. **文件上传**：统一走 `petverse-common` 的 OSS 封装，各服务已配置各自的 `multipart` 大小上限（pet-service 头像 3MB、social-service 聊天文件 21MB、shop-service 单文件 51MB、space-service 视频 55MB，均含冗余），调整上限时同步改对应 `application.yml`。
 
@@ -157,7 +159,7 @@ AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 T
 | 未启动 | 影响 |
 |---|---|
 | Nacos / MySQL | 服务无法启动或注册失败 —— 必须启动 |
-| Redis | remark-service 点赞不可用（点赞读写走 Redis，定时批量落库）；ai-service 结果缓存退化为重新计算 |
+| Redis | remark-service 点赞不可用（点赞读写走 Redis，定时批量落库）；pet-service 签到改由宠物档案的最近签到日期判断（并发窗口内可能重复签到）；ai-service 结果缓存退化为重新计算、并发额度降级为进程内计数 |
 | RocketMQ | 宠物经验发放、ES 索引同步、订单超时自动取消、商家角色升级等异步链路失效；主流程正常（发消息降级为记日志） |
 | Elasticsearch | 动态 / 商品搜索降级为 MySQL `LIKE`（60s 熔断窗口后自动重试）；也可用 `petverse.search.enabled=false` 全局关闭 |
 | PostgreSQL | ai-service 会话持久化与对话记忆降级、知识类提问明确报错 |

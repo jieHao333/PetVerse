@@ -6,7 +6,7 @@
 
 为什么用同步连接池：与 pg_store / checkpoint / vectorstore 同一约束——psycopg 的
 异步连接在 Windows 默认的 ProactorEventLoop 下不可用；同步池 + asyncio.to_thread
-跨平台一致，且 psycopg_pool 自带断线重连与坏连接淘汰，无需手写池重建逻辑。
+跨平台一致，断线重连与坏连接淘汰由 psycopg_pool 内部完成。
 
 设计要点：
   1. 本层是对话历史的持久层（前端展示 / 会话管理从这里读）；LLM 上下文记忆

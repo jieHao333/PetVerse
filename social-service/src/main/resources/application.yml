@@ -12,6 +12,15 @@ spring:
     username: ${MYSQL_USERNAME:root}
     password: ${MYSQL_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池：限制单实例数据库连接数，连接耗尽时快速失败而不是长时间排队
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+      idle-timeout: 600000
+      # 小于 MySQL wait_timeout，避免使用到已被服务端关闭的连接
+      max-lifetime: 1800000
+      pool-name: social-pool
   servlet:
     multipart:
       # 单个聊天文件上限（20MB + 冗余）

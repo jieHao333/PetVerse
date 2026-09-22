@@ -75,4 +75,10 @@ public class UserController {
                                        @RequestParam("role") String role) {
         return Result.success(userService.upgradeRole(userId, role));
     }
+
+    /** 批量查询用户信息（内部接口，供各服务列表页聚合昵称头像，一次请求代替逐条调用） */
+    @GetMapping("/internal/batch")
+    public Result<List<UserVO>> listByIds(@RequestParam("ids") List<Long> ids) {
+        return Result.success(userService.listUserByIds(ids));
+    }
 }

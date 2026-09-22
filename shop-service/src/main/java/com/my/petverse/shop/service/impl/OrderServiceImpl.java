@@ -41,10 +41,12 @@ import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /**
@@ -98,11 +100,13 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     @Override
     @Transactional(rollbackFor = Exception.class)
     public OrderVO createOrder(Long userId, OrderCreateDTO dto) {
+        // 请求内的重复条目先去重，避免同一购物车条目被重复扣减库存
+        List<Long> cartItemIds = dto.getCartItemIds().stream().distinct().collect(Collectors.toList());
         // 校验购物车条目归属，防止越权结算他人购物车
-        List<CartItem> cartItems = cartItemMapper.selectBatchIds(dto.getCartItemIds()).stream()
+        List<CartItem> cartItems = cartItemMapper.selectBatchIds(cartItemIds).stream()
                 .filter(item -> Objects.equals(item.getUserId(), userId))
                 .collect(Collectors.toList());
-        if (cartItems.size() != dto.getCartItemIds().size()) {
+        if (cartItems.size() != cartItemIds.size()) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "部分购物车条目不存在，请刷新后重试");
         }
         // 校验商品有效性
@@ -133,8 +137,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
             buyItems.add(new long[]{item.getProductId(), item.getQuantity()});
         }
         OrderVO vo = buildOrder(userId, merchant, products, buyItems, dto.getRemark());
-        // 已结算条目移出购物车
-        cartItemMapper.deleteBatchIds(dto.getCartItemIds());
+        // 已结算条目移出购物车（物理删除，释放 (user_id, product_id) 唯一索引）
+        cartItemMapper.physicalDeleteBatch(userId, cartItemIds);
         return vo;
     }
 
@@ -157,19 +161,25 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     /**
      * 统一下单流程（购物车结算与直接购买共用）：
-     * 原子扣减库存 → 生成待支付订单与商品快照明细 → 事务提交后发送支付超时延迟消息
+     * 合并购买行并按商品ID升序扣减库存 → 生成待支付订单与商品快照明细 → 事务提交后发送支付超时延迟消息
      *
-     * @param buyItems 购买清单，每项为 {商品ID, 数量}
+     * @param buyItems 购买清单，每项为 {商品ID, 数量}，同一商品的多行会先合并
      */
     private OrderVO buildOrder(Long userId, Merchant merchant, Map<Long, Product> products,
                                List<long[]> buyItems, String remark) {
-        // 原子扣减库存（stock >= quantity 才更新），并发下防止超卖
+        // 合并同一商品的购买行并用有序表按商品ID升序迭代：并发下单时各事务以相同顺序持有行锁，避免互相等待
+        Map<Long, Integer> mergedItems = new TreeMap<>();
         for (long[] buyItem : buyItems) {
-            Product product = products.get(buyItem[0]);
+            mergedItems.merge(buyItem[0], (int) buyItem[1], Integer::sum);
+        }
+        // 原子扣减库存（stock >= quantity 才更新），并发下防止超卖
+        for (Map.Entry<Long, Integer> entry : mergedItems.entrySet()) {
+            Product product = products.get(entry.getKey());
+            int quantity = entry.getValue();
             int updated = productMapper.update(null, new LambdaUpdateWrapper<Product>()
                     .eq(Product::getId, product.getId())
-                    .ge(Product::getStock, (int) buyItem[1])
-                    .setSql("stock = stock - {0}", (int) buyItem[1]));
+                    .ge(Product::getStock, quantity)
+                    .setSql("stock = stock - {0}", quantity));
             if (updated == 0) {
                 throw new BusinessException(ResultCode.BAD_REQUEST,
                         "商品「" + product.getName() + "」库存不足，请调整数量");
@@ -184,22 +194,22 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         order.setPickupType(PickupType.SELF_PICKUP.getCode());
         order.setRemark(remark);
         BigDecimal totalAmount = BigDecimal.ZERO;
-        for (long[] buyItem : buyItems) {
-            Product product = products.get(buyItem[0]);
-            totalAmount = totalAmount.add(product.getPrice().multiply(BigDecimal.valueOf(buyItem[1])));
+        for (Map.Entry<Long, Integer> entry : mergedItems.entrySet()) {
+            Product product = products.get(entry.getKey());
+            totalAmount = totalAmount.add(product.getPrice().multiply(BigDecimal.valueOf(entry.getValue())));
         }
         order.setTotalAmount(totalAmount);
         save(order);
-        for (long[] buyItem : buyItems) {
-            Product product = products.get(buyItem[0]);
+        for (Map.Entry<Long, Integer> entry : mergedItems.entrySet()) {
+            Product product = products.get(entry.getKey());
             ShopOrderItem orderItem = new ShopOrderItem();
             orderItem.setOrderId(order.getId());
             orderItem.setProductId(product.getId());
             orderItem.setProductName(product.getName());
             orderItem.setProductImage(product.getImageUrl());
             orderItem.setPrice(product.getPrice());
-            orderItem.setQuantity((int) buyItem[1]);
-            orderItem.setAmount(product.getPrice().multiply(BigDecimal.valueOf(buyItem[1])));
+            orderItem.setQuantity(entry.getValue());
+            orderItem.setAmount(product.getPrice().multiply(BigDecimal.valueOf(entry.getValue())));
             orderItemMapper.insert(orderItem);
         }
         // 事务提交后发送超时延迟消息，到期后若仍未支付由消费者自动取消并回补库存，防止库存被永久占用；
@@ -214,8 +224,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     @Override
     public OrderVO payOrder(Long userId, Long orderId) {
         ShopOrder order = getOwnOrder(userId, orderId);
-        // 支付超时：当场取消订单并拒绝支付（惰性取消），即使延迟消息延迟或丢失也不会让超时订单支付成功；
-        // 支付成功后再次超时取消会被乐观锁拦截（状态已非待支付），两者不会冲突
+        // 支付超时：当场取消订单并拒绝支付（惰性取消），延迟消息延迟或丢失时超时订单也不会支付成功；
+        // 支付成功后再次超时取消会被状态条件更新拦截（状态已非待支付），两者不会冲突
         if (Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode()) && isPayExpired(order)) {
             doCancelOrder(order);
             throw new BusinessException(ResultCode.BAD_REQUEST, "订单支付已超时，已自动取消，请重新下单");
@@ -224,7 +234,7 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
             throw new BusinessException(ResultCode.BAD_REQUEST, "订单不是待支付状态，无法支付");
         }
         // 模拟支付成功，生成取货码作为到店核销凭证；
-        // 乐观锁限制仅待支付状态可支付，并发下与超时取消互斥，不会出现支付后又被取消
+        // 状态条件更新限制仅待支付可支付，与超时取消互斥，不会出现支付后又被取消
         int updated = baseMapper.update(null, new LambdaUpdateWrapper<ShopOrder>()
                 .eq(ShopOrder::getId, order.getId())
                 .eq(ShopOrder::getStatus, OrderStatus.PENDING_PAYMENT.getCode())
@@ -254,8 +264,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     @Transactional(rollbackFor = Exception.class)
     public boolean timeoutCancelOrder(Long orderId) {
         ShopOrder order = getById(orderId);
-        // 订单不存在或已非待支付状态（已支付/已取消/已核销），无需处理，重复消费安全；
-        // 支付超时后由支付接口惰性取消的订单同样会被这里幂等跳过（乐观锁双保险）
+        // 订单不存在或已非待支付状态（已支付/已取消/已核销）时直接跳过，重复消费安全；
+        // 支付超时后由支付接口惰性取消的订单同样会被这里幂等跳过（状态条件更新双保险）
         if (order == null || !Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode())) {
             return false;
         }
@@ -264,7 +274,7 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     /**
      * 取消待支付订单并回补库存（用户主动取消、超时延迟消息、支付接口惰性取消共用）。
-     * 状态变更采用乐观锁（仅待支付可改已取消），并发下只有一个调用者成功，
+     * 状态变更为条件更新（仅待支付可改已取消），并发下只有一个调用者成功，
      * 成功者才回补库存，保证不重复回补；返回 false 表示订单已被其他路径处理
      */
     private boolean doCancelOrder(ShopOrder order) {
@@ -276,8 +286,11 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         if (updated == 0) {
             return false;
         }
-        // 回补扣减的库存（仅乐观锁抢占成功的一方执行，不会重复回补）
-        for (ShopOrderItem item : listOrderItems(order.getId())) {
+        // 回补扣减的库存（仅条件更新抢占成功的一方执行，不会重复回补）；
+        // 按商品ID升序回补，与下单扣减保持同一加锁顺序
+        List<ShopOrderItem> items = listOrderItems(order.getId());
+        items.sort(Comparator.comparing(ShopOrderItem::getProductId));
+        for (ShopOrderItem item : items) {
             productMapper.update(null, new LambdaUpdateWrapper<Product>()
                     .eq(Product::getId, item.getProductId())
                     .setSql("stock = stock + {0}", item.getQuantity()));

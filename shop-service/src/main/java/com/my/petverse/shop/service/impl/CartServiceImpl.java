@@ -15,7 +15,9 @@ import com.my.petverse.shop.mapper.MerchantMapper;
 import com.my.petverse.shop.mapper.ProductMapper;
 import com.my.petverse.shop.service.CartService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Map;
@@ -39,31 +41,35 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
     private static final int MAX_QUANTITY = 999;
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public CartItemVO addItem(Long userId, CartAddDTO dto) {
         Product product = productMapper.selectById(dto.getProductId());
         if (product == null || product.getStatus() == null || product.getStatus() != 1) {
             throw new BusinessException(ResultCode.NOT_FOUND, "商品不存在或已下架");
         }
-        // 已加购同一商品则累加数量，避免购物车出现重复条目
-        CartItem item = getOne(new LambdaQueryWrapper<CartItem>()
-                .eq(CartItem::getUserId, userId)
-                .eq(CartItem::getProductId, dto.getProductId()));
-        int quantity = dto.getQuantity() + (item == null ? 0 : item.getQuantity());
-        if (quantity > MAX_QUANTITY) {
-            throw new BusinessException(ResultCode.BAD_REQUEST, "单个商品加购数量不能超过" + MAX_QUANTITY);
-        }
-        if (product.getStock() != null && quantity > product.getStock()) {
-            throw new BusinessException(ResultCode.BAD_REQUEST, "加购数量超过库存，当前库存 " + product.getStock());
-        }
-        if (item == null) {
-            item = new CartItem();
+        // 原子累加数量：并发加购同一商品由唯一索引与条件更新兜底，不会产生重复条目或数量覆盖
+        if (baseMapper.accumulateQuantity(userId, dto.getProductId(), dto.getQuantity(), MAX_QUANTITY) == 0) {
+            // 累加未生效：条目已存在说明到达数量上限，不存在则新增
+            if (getOne(itemQuery(userId, dto.getProductId())) != null) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "单个商品加购数量不能超过" + MAX_QUANTITY);
+            }
+            CartItem item = new CartItem();
             item.setUserId(userId);
             item.setProductId(dto.getProductId());
-            item.setQuantity(quantity);
-            save(item);
-        } else {
-            item.setQuantity(quantity);
-            updateById(item);
+            item.setQuantity(dto.getQuantity());
+            try {
+                save(item);
+            } catch (DuplicateKeyException e) {
+                // 并发请求已插入同一商品，回退为累加；累加仍失败即到达上限
+                if (baseMapper.accumulateQuantity(userId, dto.getProductId(), dto.getQuantity(), MAX_QUANTITY) == 0) {
+                    throw new BusinessException(ResultCode.BAD_REQUEST, "单个商品加购数量不能超过" + MAX_QUANTITY);
+                }
+            }
+        }
+        // 回读库内累加结果：返回给前端的数量与实际存储一致，并做库存预校验（最终以结算时的原子扣减为准）
+        CartItem item = getOne(itemQuery(userId, dto.getProductId()));
+        if (product.getStock() != null && item.getQuantity() > product.getStock()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "加购数量超过库存，当前库存 " + product.getStock());
         }
         Merchant merchant = merchantMapper.selectById(product.getMerchantId());
         return toVO(item, product, merchant == null ? null : merchant.getShopName());
@@ -112,8 +118,16 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
 
     @Override
     public boolean removeItem(Long userId, Long itemId) {
-        CartItem item = getOwnItem(userId, itemId);
-        return removeById(item.getId());
+        getOwnItem(userId, itemId);
+        // 物理删除：移除后的条目不再占用 (user_id, product_id) 唯一索引，可直接重新加购
+        return baseMapper.physicalDelete(itemId, userId) > 0;
+    }
+
+    /** 定位同一用户同一商品的购物车条目 */
+    private LambdaQueryWrapper<CartItem> itemQuery(Long userId, Long productId) {
+        return new LambdaQueryWrapper<CartItem>()
+                .eq(CartItem::getUserId, userId)
+                .eq(CartItem::getProductId, productId);
     }
 
     /** 查询购物车条目并校验归属，防止越权操作他人购物车 */

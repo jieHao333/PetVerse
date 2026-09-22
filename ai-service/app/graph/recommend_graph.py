@@ -268,12 +268,22 @@ def get_recommend_graph():
 
 
 async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -> Dict[str, Any]:
-    """生成个性化推荐（优先读两级缓存），返回 {items, summary}"""
+    """生成个性化推荐（优先读两级缓存），返回 {items, summary}
+
+    未命中时进入单飞：同一用户同一场景的并发请求只放行一次真实计算
+    （五路画像拉取 + 召回 + LLM 重排），其余请求等锁后直接取缓存结果。
+    """
     cache_key = f"ai:recommend:{scene}:{user_id}"
     if use_cache:
         cached = await cache.get_cached(cache_key)
         if cached is not None:
             return cached
-    state: RecommendState = {"user_id": user_id, "scene": scene}
-    result = await get_recommend_graph().ainvoke(state)
-    return {"items": result.get("items") or [], "summary": result.get("summary") or ""}
+    async with cache.single_flight(cache_key):
+        # 等锁期间可能已由其他请求计算并写入缓存
+        if use_cache:
+            cached = await cache.get_cached(cache_key)
+            if cached is not None:
+                return cached
+        state: RecommendState = {"user_id": user_id, "scene": scene}
+        result = await get_recommend_graph().ainvoke(state)
+        return {"items": result.get("items") or [], "summary": result.get("summary") or ""}

@@ -27,7 +27,8 @@ import java.nio.charset.StandardCharsets;
 @RequiredArgsConstructor
 @RocketMQMessageListener(topic = MqTopics.LIKE_CHANGED,
         selectorExpression = MqTopics.TAG_LIKE_CHANGED,
-        consumerGroup = "space-like-count-consumer")
+        consumerGroup = "space-like-count-consumer",
+        consumeThreadMax = 32, maxReconsumeTimes = 5)
 public class LikeCountConsumer implements RocketMQListener<MessageExt> {
 
     private final SpaceMapper spaceMapper;

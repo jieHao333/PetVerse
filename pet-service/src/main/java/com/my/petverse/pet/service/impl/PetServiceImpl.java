@@ -30,6 +30,7 @@ import com.my.petverse.common.vo.pet.PetVO;
 import com.my.petverse.pet.mapper.PetMapper;
 import com.my.petverse.pet.service.PetCatalogService;
 import com.my.petverse.pet.service.PetService;
+import com.my.petverse.pet.support.SignInBitMap;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
@@ -73,6 +74,8 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
     private final PetCatalogService petCatalogService;
 
     private final OssService ossService;
+
+    private final SignInBitMap signInBitMap;
 
     /** 根据ID查询宠物 */
     @Override
@@ -302,7 +305,8 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
 
     /**
      * 每日签到
-     * 每天限签一次，为用户所有虚拟宠物统一发放递增经验并累计连续天数
+     * 先用 Redis BitMap 抢占当日签到位（SETBIT 返回值判重，并发请求只有一个成功），
+     * 再为用户所有虚拟宠物统一发放递增经验并累计连续天数；
      * 真实宠物为纯档案，不参与签到
      */
     @Override
@@ -313,8 +317,12 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             throw new BusinessException(ResultCode.NOT_FOUND, "用户尚未领养虚拟宠物");
         }
         LocalDate today = LocalDate.now();
-        // 签到为整体行为，任一宠物已记录当天签到即拒绝
+        // 宠物档案上的最近签到日期先做一次判断：已签到直接返回，避免无效的 Redis 写入
         if (pets.stream().anyMatch(p -> today.equals(p.getLastSignDate()))) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "今天已签到，请明天再来");
+        }
+        // BitMap 闸门：并发请求中只有一个能把今天的 bit 从 0 置为 1
+        if (!signInBitMap.claim(dto.getUserId(), today)) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "今天已签到，请明天再来");
         }
         // 所有宠物同步签到，连续天数一致，任取一只计算即可
@@ -339,12 +347,14 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             item.setLeveledUp(pet.getLevel() > levelBefore);
             items.add(item);
         }
+        // 全部宠物一次批量更新，避免逐只写库
         updateBatchById(pets);
 
         PetSignInVO vo = new PetSignInVO();
         vo.setUserId(dto.getUserId());
         vo.setGainedExp(gainedExp);
         vo.setSignStreak(streak);
+        vo.setMonthSignedDays(signInBitMap.monthSignedDays(dto.getUserId(), today));
         vo.setPets(items);
         return vo;
     }
@@ -373,7 +383,6 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             int levelBefore = pet.getLevel() == null ? 1 : pet.getLevel();
             // 累加经验并处理升级，满级后不再累积
             PetLevelCalculator.gainExp(pet, source.getExp());
-            updateById(pet);
             // 返回值仅内部使用（MQ 消费者忽略），以第一只虚拟宠物的结果为准
             if (vo == null) {
                 vo = new PetExpGainVO();
@@ -385,6 +394,8 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
                 vo.setLeveledUp(pet.getLevel() > levelBefore);
             }
         }
+        // 全部宠物一次批量更新，避免逐只写库
+        updateBatchById(pets);
         return vo;
     }
 

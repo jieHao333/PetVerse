@@ -31,10 +31,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -161,25 +161,39 @@ public class MerchantApplyServiceImpl extends ServiceImpl<MerchantApplyMapper, M
         }
     }
 
-    /** 批量聚合申请人昵称，用户服务不可用时降级为不展示 */
+    /** 批量聚合申请人昵称：整页申请去重后一次查询，用户服务不可用时降级为不展示 */
     private void fillApplicantNickname(List<MerchantApplyVO> vos) {
         if (vos.isEmpty()) {
             return;
         }
-        Map<Long, MerchantApplyVO> pending = vos.stream()
-                .collect(Collectors.toMap(MerchantApplyVO::getUserId, Function.identity(), (a, b) -> a));
-        pending.forEach((userId, vo) -> {
-            try {
-                Result<UserVO> result = userFeignClient.getUserById(userId);
-                if (result != null && result.getCode() == ResultCode.SUCCESS.getCode()
-                        && result.getData() != null) {
-                    String nickname = result.getData().getNickname();
-                    vos.stream()
-                            .filter(item -> Objects.equals(item.getUserId(), userId))
-                            .forEach(item -> item.setApplicantNickname(nickname));
-                }
-            } catch (Exception e) {
-                log.warn("查询申请人信息失败 userId={}", userId, e);
+        List<Long> userIds = vos.stream()
+                .map(MerchantApplyVO::getUserId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (userIds.isEmpty()) {
+            return;
+        }
+        Map<Long, String> nicknames = new HashMap<>();
+        try {
+            Result<List<UserVO>> result = userFeignClient.listByIds(userIds);
+            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
+                result.getData().forEach(user -> {
+                    if (user.getId() != null) {
+                        nicknames.put(user.getId(), user.getNickname());
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("批量查询申请人信息失败，用户数={}", userIds.size(), e);
+        }
+        if (nicknames.isEmpty()) {
+            return;
+        }
+        vos.forEach(item -> {
+            String nickname = nicknames.get(item.getUserId());
+            if (nickname != null) {
+                item.setApplicantNickname(nickname);
             }
         });
     }

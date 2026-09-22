@@ -12,6 +12,29 @@ spring:
     username: ${MYSQL_USERNAME:root}
     password: ${MYSQL_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池：限制单实例数据库连接数，连接耗尽时快速失败而不是长时间排队
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+      idle-timeout: 600000
+      # 小于 MySQL wait_timeout，避免使用到已被服务端关闭的连接
+      max-lifetime: 1800000
+      pool-name: pet-pool
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:123456}
+      # 签到 BitMap 专用库，与点赞（db2）、AI 缓存（db3）隔离
+      database: 1
+      lettuce:
+        pool:
+          # 连接池：控制单实例 Redis 连接数，取连接超时后快速失败
+          max-active: 32
+          max-idle: 16
+          min-idle: 4
+          max-wait: 2000ms
   servlet:
     multipart:
       # 单个头像文件上限（2MB + 冗余）

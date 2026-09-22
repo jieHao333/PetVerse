@@ -30,8 +30,8 @@ public class LikeSyncTask {
     /** 脏标记集合 Key：like:dirty:{targetType} */
     private static final String DIRTY_KEY = "like:dirty:%d";
 
-    /** 单轮最多处理的脏对象数量 */
-    private static final int BATCH_SIZE = 500;
+    /** 单轮最多处理的脏对象数量：限制单轮数据库写入量，剩余脏标记留待下一轮 */
+    private static final int MAX_TARGETS_PER_ROUND = 200;
 
     @Scheduled(fixedDelay = 30_000)
     public void syncDirtyLikes() {
@@ -44,14 +44,15 @@ public class LikeSyncTask {
         }
     }
 
-    /** 消费指定类型的脏标记集合，逐个对象落库 */
+    /** 消费指定类型的脏标记集合，逐个对象落库；失败的对象放回脏标记集合下轮重试 */
     private void syncType(int targetType) {
         String dirtyKey = String.format(DIRTY_KEY, targetType);
-        // SPOP 原子弹出，弹出后新写入的脏标记会留待下一轮，不会丢
-        List<String> dirtyIds = redis.opsForSet().pop(dirtyKey, BATCH_SIZE);
+        // SPOP 原子弹出：本轮未取到的脏标记留在集合中由下一轮处理，不会丢
+        List<String> dirtyIds = redis.opsForSet().pop(dirtyKey, MAX_TARGETS_PER_ROUND);
         if (dirtyIds == null || dirtyIds.isEmpty()) {
             return;
         }
+        int synced = 0;
         for (String idStr : dirtyIds) {
             Long targetId = Long.valueOf(idStr);
             try {
@@ -61,11 +62,13 @@ public class LikeSyncTask {
                     redisUsers = Collections.emptySet();
                 }
                 likeDbSyncer.syncTarget(targetType, targetId, redisUsers);
+                synced++;
             } catch (Exception e) {
                 // 落库失败将脏标记放回，下一轮重试，避免变更丢失
                 log.error("点赞落库失败，targetType={}, targetId={}", targetType, targetId, e);
                 redis.opsForSet().add(dirtyKey, idStr);
             }
         }
+        log.info("点赞落库完成，targetType={}, 成功={}, 本轮取出={}", targetType, synced, dirtyIds.size());
     }
 }

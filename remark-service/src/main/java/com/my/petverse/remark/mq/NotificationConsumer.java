@@ -23,7 +23,8 @@ import java.nio.charset.StandardCharsets;
 @RequiredArgsConstructor
 @RocketMQMessageListener(topic = MqTopics.NOTIFY,
         selectorExpression = MqTopics.TAG_NOTIFY_CREATED,
-        consumerGroup = "remark-notification-consumer")
+        consumerGroup = "remark-notification-consumer",
+        consumeThreadMax = 32, maxReconsumeTimes = 5)
 public class NotificationConsumer implements RocketMQListener<MessageExt> {
 
     private final NotificationService notificationService;

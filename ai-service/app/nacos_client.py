@@ -157,7 +157,7 @@ class NacosRegistrar:
         """实例疑似丢失后的自动重注册（带节流，两次重注册至少间隔 30 秒）
 
         复用注册双保险路径（SDK 优先、OpenAPI 降级）；节流是为了避免
-        心跳每 5 秒触发一次注册请求打爆 Nacos。线程内串行调用，无需加锁。
+        心跳每 5 秒触发一次注册请求打爆 Nacos。心跳线程内串行调用，同一时刻只有一个请求在途。
         """
         now = time.monotonic()
         if now - self._last_reregister_ts < _REREGISTER_MIN_INTERVAL_SECONDS:

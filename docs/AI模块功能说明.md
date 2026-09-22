@@ -19,7 +19,7 @@ AI 模块是整个平台的智能能力层，**独立部署为 Python 微服务*
                                       ├──▶ LLM 服务商（OpenAI 兼容：DeepSeek / 阿里云百炼 / ...）
                                       ├──▶ Embedding 服务商（RAG 向量化）
                                       ├──▶ PostgreSQL + pgvector（会话消息 / 对话记忆 / 长期记忆 / 知识库 / 报告 / 缓存）
-                                      ├──▶ Redis（结果缓存热层）
+                                      ├──▶ Redis（结果缓存热层 / 跨实例并发计数）
                                       └──▶ 阿里云 OSS（多模态附件）
 ```
 
@@ -32,7 +32,7 @@ AI 模块是整个平台的智能能力层，**独立部署为 Python 微服务*
 | 模型接入 | langchain-openai（ChatOpenAI / OpenAIEmbeddings） | **OpenAI 兼容格式**，改 `base_url` + `model` 即可切换服务商 |
 | 向量库 | PostgreSQL + **pgvector**（langchain-postgres `PGVector`） | 与业务数据同库，少维护一个中间件 |
 | 业务持久化 | psycopg3 同步连接池 + `asyncio.to_thread` | 规避 Windows `ProactorEventLoop` 对 psycopg 异步连接的限制 |
-| 缓存 | redis-py（asyncio，db=3） | 结果缓存热层 |
+| 缓存与并发计数 | redis-py（asyncio，db=3） | 结果缓存热层；单用户并发额度计数跨实例共享 |
 | 对象存储 | oss2（阿里云 OSS） | 多模态附件直传 |
 | 注册中心 | nacos-sdk-python + OpenAPI 兜底 | 双保险注册与心跳保活 |
 | 配置 | pydantic-settings（`.env`） | 集中式、可校验、支持兼容回落 |
@@ -140,7 +140,7 @@ SSE 响应头固定 `Cache-Control: no-cache`、`X-Accel-Buffering: no`（禁 Ng
 | 机制 | 参数 | 说明 |
 |---|---|---|
 | 全局并发闸 | 20 路，3s 获取超时 | 超时返回过载提示，保护 LLM 调用与信号量池 |
-| 单用户并发闸 | 2 路 | 预检查在会话创建之前（避免超限请求白建空会话），正式登记在流生成器内 `finally` 释放 |
+| 单用户并发闸 | 2 路 | 额度计数存于 Redis（`ai:conc:user:{userId}`，Lua 原子占用/归还，TTL 5 分钟自愈），多实例部署时跨实例生效；建会话前做只读预检查（避免超限请求白建空会话），正式占用在流生成器内完成、`finally` 归还 |
 | 消息长度 | 2000 字符 | 超长直接拒绝，保护上下文窗口与 token 成本 |
 | 附件数量 | 4 个 / 轮 | 可经 `.env` 调整 |
 | 首帧前重试 | 最多 2 次尝试 | 仅在**未产出任何内容**时静默重建流重试；已产出后失败不重试，避免重复输出 |
@@ -180,6 +180,7 @@ START → gather_profile → recall_candidates → rerank → persist_cache → 
 - **recall_candidates**：从画像提取关键词（宠物物种品种 + 交互过的商品名），关键词搜商品 + 泛化在售商品 + 热门动态，去重规范化后作为候选（商品 ≤16 + 动态 ≤8）；
 - **rerank**：LLM 结合画像压缩文本重排，产出至多 8 条「内容 + 推荐理由（≤30 字）」；**防幻觉约束**：只能用候选列表中出现过的 id，模型编造的 id 在合并阶段被过滤；重排结果为空或失败时降级启发式排序（商品优先、动态按点赞数）；
 - **persist_cache**：按 `用户 + 场景` 写两级缓存（TTL 10 分钟）；`refresh=true` 跳过缓存强制刷新。
+- **单飞防击穿**：缓存未命中时同一 key 只放行一次真实计算（五路画像 + 召回 + LLM 重排），其余并发请求等锁后直接取结果；写入 TTL 附加 0~10% 随机抖动，避免同批缓存同时过期。
 
 ### 4.5 多模态附件（`app/media.py` / `app/oss.py`）
 
@@ -227,6 +228,7 @@ START → gather_profile → recall_candidates → rerank → persist_cache → 
 | 健康报告 | `pet_health_report` | 历史评估报告（含 payload JSONB） | `db/schema_pgvector.sql` |
 | 结果缓存温层 | `ai_cache` | Redis 故障时的缓存兜底（UPSERT + 过期时间） | `db/schema_pgvector.sql` |
 | 结果缓存热层 | Redis db=3 | 评论摘要 / 推荐结果 | 运行时写入 |
+| 并发额度计数 | Redis db=3 `ai:conc:user:{userId}` | 单用户并发额度（多实例共享，TTL 5 分钟兜底回收） | 运行时写入 |
 
 > 服务启动时 `lifespan` 依次初始化 Redis、PG 连接池、checkpoint、store、Nacos 注册；停机时反注册并释放各连接池。存量数据迁移（MySQL → PostgreSQL）用 `scripts/migrate_mysql_to_pg.py`（一次性、幂等、保留原会话 ID）。
 
@@ -266,6 +268,8 @@ START → gather_profile → recall_candidates → rerank → persist_cache → 
 | 评论摘要 | LLM 失败 / mock / 无评论 | 降级规则摘要；无评论返回占位且不写缓存 |
 | 推荐 | 画像拉取失败 / LLM 失败 | 画像缺失退化通用结果；重排失败降级启发式排序 |
 | 结果缓存 | Redis 故障 | 读自动回落 `ai_cache` 温层，写仅落温层；两级都不可用才重新计算 |
+| 并发额度计数 | Redis 故障 | 降级为进程内计数（单实例上限仍生效）；按占用时的计数方式归还，两套计数不错位 |
+| 缓存击穿 / 雪崩 | 热点 key 过期瞬间并发未命中 | 同 key 单飞只放行一次计算；写入 TTL 加随机抖动错开过期时间 |
 | 音频转写 | ASR 未配置 / 失败 | 降级为文字占位提示，不阻断对话 |
 | 图片理解 | 视觉模型未配置 | 降级为文字占位提示，引导用户文字描述 |
 | 附件上传 | OSS 未配置 / 上传失败 | **明确报错**（不静默降级，避免附件悄悄丢失）；上传内部含 1 次抖动重试 |

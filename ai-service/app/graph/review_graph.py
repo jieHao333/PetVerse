@@ -164,12 +164,22 @@ def get_review_graph():
 
 
 async def summarize_product(product_id: int, use_cache: bool = True) -> Dict[str, Any]:
-    """生成商品评论摘要（优先读两级缓存），返回摘要 dict"""
+    """生成商品评论摘要（优先读两级缓存），返回摘要 dict
+
+    未命中时进入单飞：同一商品的并发请求只放行一次真实计算，其余请求等锁后
+    直接取缓存结果，避免热点商品在缓存过期瞬间被并发打穿（多次 LLM 调用）。
+    """
     cache_key = f"ai:review:summary:{product_id}"
     if use_cache:
         cached = await cache.get_cached(cache_key)
         if cached is not None:
             return cached
-    state: ReviewState = {"product_id": product_id}
-    result = await get_review_graph().ainvoke(state)
-    return result.get("summary") or {}
+    async with cache.single_flight(cache_key):
+        # 等锁期间可能已由其他请求计算并写入缓存
+        if use_cache:
+            cached = await cache.get_cached(cache_key)
+            if cached is not None:
+                return cached
+        state: ReviewState = {"product_id": product_id}
+        result = await get_review_graph().ainvoke(state)
+        return result.get("summary") or {}

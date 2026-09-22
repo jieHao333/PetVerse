@@ -26,6 +26,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -95,6 +96,26 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     public UserVO getUserById(Long id) {
         User user = getById(id);
         return user == null ? null : toVO(user);
+    }
+
+    /** 批量查询一次最多返回的用户数，限制 IN 列表长度与响应体大小 */
+    private static final int MAX_BATCH_QUERY = 200;
+
+    /** 批量查询用户信息：去重截断后一次 IN 查询，返回不存在的ID自动缺省 */
+    @Override
+    public List<UserVO> listUserByIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        List<Long> queryIds = ids.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(MAX_BATCH_QUERY)
+                .collect(Collectors.toList());
+        if (queryIds.isEmpty()) {
+            return List.of();
+        }
+        return listByIds(queryIds).stream().map(this::toVO).collect(Collectors.toList());
     }
 
     /** 按用户名或昵称模糊搜索，仅返回正常状态用户，排除本人，最多 10 条 */

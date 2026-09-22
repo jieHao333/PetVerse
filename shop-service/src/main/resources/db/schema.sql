@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS product
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='商品';
 
--- 购物车条目（同一商品重复加购时累加数量）
+-- 购物车条目（同一商品重复加购时累加数量；移除走物理删除，避免已删条目占用唯一索引）
 CREATE TABLE IF NOT EXISTS cart_item
 (
     id          BIGINT   NOT NULL COMMENT '主键(雪花ID)',
@@ -76,9 +76,15 @@ CREATE TABLE IF NOT EXISTS cart_item
     update_time DATETIME DEFAULT NULL COMMENT '更新时间',
     deleted     TINYINT  DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
     PRIMARY KEY (id),
-    KEY idx_user_id (user_id)
+    -- (user_id, product_id) 唯一：并发加购由数据库兜底，同一用户同一商品只会存在一行
+    UNIQUE KEY uk_user_product (user_id, product_id)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='购物车条目';
+
+-- 存量库升级（唯一索引建立前需先清理历史逻辑删除行，否则已删条目会占用索引槽位）：
+-- DELETE FROM cart_item WHERE deleted = 1;
+-- ALTER TABLE cart_item ADD UNIQUE KEY uk_user_product (user_id, product_id);
+-- ALTER TABLE cart_item DROP INDEX idx_user_id;   -- 已被 uk_user_product 前缀覆盖，减少一次索引维护
 
 -- 订单（order 为 MySQL 保留字，表名加 shop_ 前缀；目前仅支持到店自取，pickup_type 预留配送扩展）
 CREATE TABLE IF NOT EXISTS shop_order

@@ -5,7 +5,7 @@
 
 配置分三块：
   1. 对话模型（LLM）：统一 OpenAI 格式，任意兼容服务（DeepSeek / 阿里云百炼等）
-     只需改 LLM_BASE_URL + LLM_MODEL + LLM_API_KEY，无需改代码；保留 DEEPSEEK_*
+     只需改 LLM_BASE_URL + LLM_MODEL + LLM_API_KEY 三个配置项；保留 DEEPSEEK_*
      作为向后兼容别名（LLM_* 未显式配置时自动回落）。
   2. Embedding：OpenAI 格式，供 RAG 检索使用（DeepSeek 无 embedding 接口，必须另配）。
   3. pgvector：RAG 向量存储，复用本机 PostgreSQL + pgvector 插件。

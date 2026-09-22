@@ -21,6 +21,11 @@
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-gateway</artifactId>
         </dependency>
+        <!-- 健康探针：供负载均衡 / 容器编排判断实例是否可接流量 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
         <dependency>
             <!-- lb:// 负载均衡路由必需，缺失会导致所有下游路由 503 -->
             <groupId>org.springframework.cloud</groupId>

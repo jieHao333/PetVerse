@@ -1,7 +1,7 @@
 """LLM / Embedding 客户端封装
 
 - 真实模式：langchain-openai 接任意 OpenAI 兼容服务（DeepSeek / 阿里云百炼等），
-  只认 LLM_BASE_URL + LLM_MODEL + LLM_API_KEY，切换服务商无需改代码；
+  只认 LLM_BASE_URL + LLM_MODEL + LLM_API_KEY 三个配置项，切换服务商只改配置；
 - Embedding：同样 OpenAI 格式，供 RAG 向量检索使用（DeepSeek 无 embedding 接口，需另配）；
 - mock 模式：不依赖任何外部服务，按打字机节奏输出内置的养宠咨询回复。
 """
@@ -74,7 +74,7 @@ def get_embeddings():
     """获取 OpenAIEmbeddings 单例（RAG 向量化用）
 
     Embedding 未配置时抛出异常，由 vectorstore 转为 RagUnavailable——检索链路
-    明确失败，不做关键词降级。
+    明确失败并向上抛出，由调用方转为错误事件。
     """
     global _embeddings
     if _embeddings is None:

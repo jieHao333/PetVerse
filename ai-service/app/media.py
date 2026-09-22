@@ -192,7 +192,7 @@ def describe_for_prompt(attachments: list, vision_ready: bool, asr_ready: bool) 
 
     - 图片 + 视觉可用：不生成文字描述（图片以 image_url 分片直发模型）
     - 图片 + 视觉不可用：提示模型当前无法看图，引导用户文字描述
-    - 音频已转写：转写文本已并入 query，无需占位
+    - 音频已转写：转写文本已并入 query，不再生成占位提示
     - 音频未转写 / 视频：占位提示模型附件类型与文件名
     """
     lines: list = []

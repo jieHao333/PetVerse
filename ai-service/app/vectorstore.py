@@ -57,7 +57,7 @@ async def retrieve(query: str, k: Optional[int] = None) -> List[dict]:
     """语义检索：返回 [{content, source, category, score}]，score 为 0-1 相似度（越大越相关）
 
     向量库不可用或检索异常时抛 RagUnavailable；相似度低于 RAG_SCORE_THRESHOLD 的
-    片段直接丢弃（不做无依据召回）。
+    片段直接丢弃，只保留达到阈值的召回结果。
     """
     top_k = k or settings.RAG_TOP_K
     store = get_store()

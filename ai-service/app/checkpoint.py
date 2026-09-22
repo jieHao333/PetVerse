@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # checkpoint 连接池参数:读写均为毫秒级短操作,小池足够(全局对话并发闸 20 路)
 _POOL_MIN = 1
 _POOL_MAX = 4
-# 从池取连接的等待上限(秒):超过视为 PG 不可用,快速降级而不是拖住对话
+# 从池取连接的等待上限(秒):超过即视为 PG 不可用并立即降级
 _POOL_TIMEOUT = 5.0
 # setup(建表)失败后的重试冷却(秒):PG 未就绪期间不反复打建表请求
 _SETUP_RETRY_COOLDOWN = 30.0

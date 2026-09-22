@@ -28,12 +28,12 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -139,31 +139,26 @@ public class CommentServiceImpl extends ServiceImpl<CommentMapper, Comment> impl
         }
     }
 
-    /** Feign 查询用户信息，用户服务不可用时降级返回 null（评论列表不展示昵称头像） */
-    private UserVO loadUserInfo(Long userId) {
-        if (userId == null) {
-            return null;
+    /** 批量查询用户信息：整页评论人与被回复人去重后一次 Feign 请求聚合，失败时返回空表由调用方降级 */
+    private Map<Long, UserVO> loadUserInfos(Collection<Long> userIds) {
+        List<Long> ids = userIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (ids.isEmpty()) {
+            return Map.of();
         }
         try {
-            Result<UserVO> result = userFeignClient.getUserById(userId);
-            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode()) {
-                return result.getData();
+            Result<List<UserVO>> result = userFeignClient.listByIds(ids);
+            if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
+                return result.getData().stream()
+                        .filter(user -> user.getId() != null)
+                        .collect(Collectors.toMap(UserVO::getId, Function.identity(), (a, b) -> a));
             }
         } catch (Exception e) {
-            log.warn("查询评论人信息失败 userId={}", userId, e);
+            log.warn("批量查询评论人信息失败，用户数={}", ids.size(), e);
         }
-        return null;
-    }
-
-    /** 批量查询用户信息（去重 + 逐个 Feign + 降级容错），供评论列表聚合使用 */
-    private Map<Long, UserVO> loadUserInfos(Collection<Long> userIds) {
-        Map<Long, UserVO> users = new HashMap<>();
-        for (Long userId : userIds) {
-            if (userId != null) {
-                users.put(userId, loadUserInfo(userId));
-            }
-        }
-        return users;
+        return Map.of();
     }
 
     /** 评论 DO 转 VO，从聚合结果中附加评论人与被回复人昵称头像 */
