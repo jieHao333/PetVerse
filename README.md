@@ -50,7 +50,7 @@ Spring Cloud Gateway :8080 ── JWT 鉴权 · 剥离伪造身份头 · 注入 
 |---|---|---|---|
 | JDK | 21 | — | ✅ 必须 |
 | Maven | 3.9+ | — | ✅ 必须（仓库未带 mvnw，用本机 mvn） |
-| Nacos | 2.x | `localhost:8848` | ✅ 必须（服务注册与发现） |
+| Nacos | 2.x | `localhost:8848` | ✅ 必须（服务注册发现 + 配置中心，全部业务配置由此下发） |
 | MySQL | 8 | `localhost:3306`，root / 123456 | ✅ 必须（6 个业务库，见下） |
 | Redis | 5+ | `localhost:6379`，密码 123456 | 点赞（db2）/ 签到 BitMap（db1）/ AI 缓存与并发计数（db3）需要 |
 | PostgreSQL + pgvector | 含 `vector` 扩展 | `localhost:5432`，库 `petverse_ai` | AI 会话、对话记忆、RAG 需要 |
@@ -90,18 +90,22 @@ PostgreSQL（仅 AI 服务）：先 `CREATE DATABASE petverse_ai;`，再执行 `
 
 > 各服务 `db/schema.sql` 是表结构的唯一事实来源：改表结构时同步更新该文件，并把存量库迁移用的 `ALTER` 语句以注释形式补在同文件头部。
 
-### 2. 配置密钥（OSS）
+### 2. 导入配置到 Nacos（含 OSS 密钥）
 
-把 `secrets-local.yml` 放到需要的服务 `src/main/resources/` 下（已被 `.gitignore` 忽略，**禁止提交**）：
+所有 Java 服务的业务配置（端口 / 数据库 / Redis / OSS / JWT / RocketMQ / 网关路由等）已全部迁移到 **Nacos 配置中心**。各服务本地仅保留：`bootstrap.yml`（应用名 + Nacos 地址 + 服务发现）与一个极简 `application.yml`（仅 `spring.config.import: nacos:{应用名}` 一行导入声明）。**dataId 不带 `.yml` 后缀**（如 `gateway-service`、`shop-service`），group=`DEFAULT_GROUP`，格式 YAML（客户端靠 `spring.cloud.nacos.config.file-extension=yml` 按 YAML 解析）。
 
-```yaml
-local:
-  oss:
-    access-key-id: your-access-key-id
-    access-key-secret: your-access-key-secret
+仓库 `nacos-config/` 下提供了 7 份可直接导入的配置模板（文件名 `*-service.yml` 仅供本地编辑，导入时 dataId 取文件名去掉 `.yml`）。**模板中 OSS / JWT 等密钥已脱敏为 `***********************`，可随项目安全提交**；真实密钥请通过环境变量或 Nacos 控制台注入（详见 [docs/Nacos配置中心接入教程.md](docs/Nacos配置中心接入教程.md)）。启动服务前必须先导入到 Nacos：
+
+```bash
+# Nacos 已启动（localhost:8848）时，执行导入脚本把 nacos-config/*.yml 发布到 Nacos（dataId 去 .yml 后缀）
+powershell -ExecutionPolicy Bypass -File ./nacos-config/push-to-nacos.ps1
+# 自定义命名空间：先设环境变量 NACOS_NAMESPACE=<命名空间id> 再执行；并同步在各服务 bootstrap.yml 的 discovery/config 下加 namespace: <id>
+# 或登录 Nacos 控制台（http://localhost:8848/nacos）手动新建 dataId（不带 .yml，group=DEFAULT_GROUP，格式 YAML）并粘贴内容
 ```
 
-也可用环境变量 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` 覆盖（优先级更高）。没有 OSS 密钥时服务仍可启动，仅上传类功能不可用。
+模板中 `aliyun.oss.access-key-*` 与 `jwt.secret` 均为脱敏占位，写法是 `${环境变量:****}`：**运行时给服务进程设置环境变量 `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `JWT_SECRET` 即可覆盖占位**，无需把真实密钥写进仓库（三种填法见教程 3.2）。
+
+> ⚠️ **持久化提醒**：Nacos 用外置 MySQL 持久化时，`conf/application.properties` 需配 `spring.sql.init.platform=mysql`（新版）或 `spring.datasource.platform=mysql`（旧版）+ `db.num/db.url.0/db.user.0/db.password.0`。**改完配置必须先停 Nacos 再重启**——若在 Nacos 启动过程中修改，可能仍以旧的嵌入式 Derby 启动，配置不会落到 MySQL（可看 `logs/nacos-persistence.log`：`use StandaloneDatabaseOperateImpl` = Derby，`[master-db] jdbc:mysql://...` = MySQL）。
 
 ### 3. 启动中间件与服务
 
@@ -117,7 +121,7 @@ java -jar pet-service/target/pet-service-0.0.1-SNAPSHOT.jar
 java -jar gateway-service/target/gateway-service-0.0.1-SNAPSHOT.jar
 ```
 
-验证：`curl http://localhost:8080/api/user/...` 能返回统一报文即链路通畅。各服务也会尝试从 Nacos 读取同名配置（bootstrap.yml），本地 `application.yml` 已含全部默认值，**无需在 Nacos 建配置即可跑通**。
+验证：`curl http://localhost:8080/api/user/...` 能返回统一报文即链路通畅。各服务启动时**必须**能从 Nacos 读取到同名 dataId 配置（见「2. 导入配置到 Nacos」），否则会因缺少端口 / 数据源等配置而启动失败。
 
 ### 4. 启动 AI 服务与前端
 
@@ -127,7 +131,7 @@ java -jar gateway-service/target/gateway-service-0.0.1-SNAPSHOT.jar
 
 ## 配置与环境变量
 
-所有密钥类配置都提供「环境变量 > 本地密钥文件 > 开发默认值」的取值顺序，生产环境请用环境变量覆盖。
+所有配置由 Nacos 配置中心下发，密钥类配置提供「环境变量 > Nacos 配置内默认值」的取值顺序，生产环境请用环境变量覆盖。
 
 | 变量 | 作用范围 | 说明 |
 |---|---|---|
@@ -150,7 +154,7 @@ AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 T
 3. **鉴权与身份透传**：`gateway-service` 的 `AuthGlobalFilter` 先剥离客户端自带的 `X-User-Id` / `X-User-Role` 防伪造，再校验 JWT 并重新注入；白名单 `auth.whitelist-paths`（默认登录 / 注册），`/api/shop/admin`、`/api/shop/merchant` 做角色校验，`/internal/**` 禁止从网关外部访问。下游服务通过 `UserContext` 取当前用户，Feign 调用由 `FeignUserContextConfig` 自动透传身份头 —— 业务代码不需要手写用户 ID 参数传递。
 4. **服务间调用**：同步用 OpenFeign（各模块 `feign/` 包，被调方的服务间接口放 `/internal/` 路径；**列表聚合一律走批量接口**，如 `GET /user/internal/batch?ids=`，避免逐条调用）；异步用 RocketMQ，topic / tag 常量统一维护在 `petverse-common` 的 `MqTopics`，发布用 `MqEventPublisher`（**事务提交后才发送**，无 Broker 时降级为记日志），消费端自行保证幂等。
 5. **表结构规范**：所有表继承 `BaseEntity` 约定 —— 雪花 `id`、`create_time` / `update_time` 自动填充、`deleted` 逻辑删除（MyBatis-Plus 全局生效，查询不必手写过滤）。雪花 ID 为 19 位 Long，已由 Jackson 统一序列化为字符串，避免前端精度截断 —— 前端传回的 ID 也是字符串。
-6. **文件上传**：统一走 `petverse-common` 的 OSS 封装，各服务已配置各自的 `multipart` 大小上限（pet-service 头像 3MB、social-service 聊天文件 21MB、shop-service 单文件 51MB、space-service 视频 55MB，均含冗余），调整上限时同步改对应 `application.yml`。
+6. **文件上传**：统一走 `petverse-common` 的 OSS 封装，各服务已配置各自的 `multipart` 大小上限（pet-service 头像 3MB、social-service 聊天文件 21MB、shop-service 单文件 51MB、space-service 视频 55MB，均含冗余），调整上限时同步改对应 Nacos 配置（`nacos-config/{服务}.yml` 并重新导入）。
 
 ## 中间件缺失时的行为
 
@@ -179,12 +183,13 @@ AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 T
 | 文档 | 内容 |
 |---|---|
 | [docs/后端开发规范.md](docs/后端开发规范.md) | 模块职责、包结构、命名、分层调用、表结构规范（新人必读） |
+| [docs/Nacos配置中心接入教程.md](docs/Nacos配置中心接入教程.md) | Nacos 配置中心接入：MySQL 持久化、脱敏密钥填写、导入脚本、命名空间、FAQ |
 | [docs/AI模块功能说明.md](docs/AI模块功能说明.md) | AI 模块功能说明书：编排结构、接口契约、存储、配置、降级策略 |
 | [ai-service/README.md](ai-service/README.md) | AI 服务启动、环境变量、接口列表、生产韧性设计 |
 | [docs/秋招项目介绍.md](docs/秋招项目介绍.md) | 项目亮点与设计取舍（了解关键设计意图的来龙去脉） |
 
 ## 协作提醒
 
-- **不要提交** `ai-service/.env`、`**/secrets-local.yml`：内含真实密钥，已在 `.gitignore` 中忽略；若曾误提交请立即轮换密钥。
-- 新增环境变量时，记得给 `application.yml` 配一个 `localhost` 开发默认值，并在本 README 的变量表中登记。
+- **不要提交真实密钥**：`ai-service/.env`、`nacos-config/*-local.yml` 已在 `.gitignore` 忽略；`nacos-config/*.yml` 是脱敏模板（密钥为 `****`）可提交，真实密钥请用环境变量或 Nacos 控制台注入。若曾误提交真实密钥请立即轮换。
+- 业务配置统一在 Nacos 管理：改动配置请更新 `nacos-config/{服务}.yml` 并重新导入 Nacos；新增配置项时给一个 `localhost` 开发默认值，并在本 README 的变量表中登记。
 - 改动公共模块（`petverse-common`）会影响全部服务，请本地构建全量模块通过后再提交。

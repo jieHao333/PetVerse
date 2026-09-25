@@ -1,0 +1,71 @@
+# =============================================================
+# Nacos 配置：dataId=shop-service  group=DEFAULT_GROUP  type=yaml
+# 商城/商户服务全部配置，由 Nacos 配置中心统一下发
+# =============================================================
+server:
+  port: 8087
+
+spring:
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:3306/petverse_shop?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池：限制单实例数据库连接数，连接耗尽时快速失败而不是长时间排队
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+      idle-timeout: 600000
+      # 小于 MySQL wait_timeout，避免使用到已被服务端关闭的连接
+      max-lifetime: 1800000
+      pool-name: shop-pool
+  servlet:
+    multipart:
+      # 单文件上限（营业执照/商品主图 5MB；评价晒单视频 50MB + 余量）
+      max-file-size: 51MB
+      max-request-size: 60MB
+  # Elasticsearch 8.15.5，用于商品全文检索；未启动时搜索自动降级为数据库模糊查询
+  elasticsearch:
+    uris: http://localhost:9200
+    connection-timeout: 2s
+    socket-timeout: 5s
+
+# 搜索开关，置为 false 则全部走数据库模糊查询
+petverse:
+  search:
+    enabled: true
+  order:
+    # 支付超时时长（分钟），超时未支付自动取消并回补库存；
+    # 内部映射为 RocketMQ 延迟档位（支持 1~10/20/30/60/120，其他值向上取最近档位），前端倒计时与实际取消时间一致
+    pay-timeout-minutes: 5
+
+# RocketMQ：订单超时延迟消息、商户审批事件、商品索引事件的生产与消费；
+# 未启动 Broker 时发送自动降级为记日志，不影响下单主流程（仅失去超时自动取消能力）
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: shop-producer
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+jwt:
+  # 生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值（需与 user-service 一致）
+  secret: ${JWT_SECRET:***********************}
+
+# 阿里云 OSS 存储配置（与 user-service/space-service 共用同一个桶）
+aliyun:
+  oss:
+    endpoint: ${OSS_ENDPOINT:oss-cn-beijing.aliyuncs.com}
+    access-key-id: ${OSS_ACCESS_KEY_ID:***********************}
+    access-key-secret: ${OSS_ACCESS_KEY_SECRET:***********************}
+    bucket-name: ${OSS_BUCKET_NAME:petverse-me}

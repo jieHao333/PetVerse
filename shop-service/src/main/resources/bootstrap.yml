@@ -3,9 +3,14 @@ spring:
     name: shop-service
   cloud:
     nacos:
-      server-addr: localhost:8848
+      server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
+      # 服务发现
       discovery:
         enabled: true
+      # 配置中心：dataId=${spring.application.name}（无 .yml 后缀，导入声明见 application.yml 的 spring.config.import）；file-extension 决定内容按 YAML 解析
       config:
         enabled: true
         file-extension: yml
+        group: DEFAULT_GROUP
+        # 配置变更自动刷新（配合 @RefreshScope 生效）
+        refresh-enabled: true

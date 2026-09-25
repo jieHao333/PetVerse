@@ -3,7 +3,6 @@ target/
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
-
 ### STS ###
 .apt_generated
 .classpath
@@ -40,3 +39,7 @@ ai-service/*.log
 
 ### 本地密钥文件（含真实 OSS 密钥，禁止提交）###
 secrets-local.yml
+
+### Nacos 配置模板 nacos-config/*.yml 已脱敏（密钥为 ***********************），可随项目开源提交 ###
+### 若需在本地保存填入真实密钥的副本，请命名为 *-local.yml，已被忽略、禁止提交 ###
+nacos-config/*-local.yml

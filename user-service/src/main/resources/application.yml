@@ -1,56 +1,6 @@
-server:
-  port: 8083
-
 spring:
   config:
-    # 本地密钥文件（已在 .gitignore 中忽略，不会提交）：存在时自动加载，为 OSS 密钥提供本地默认值
-    import: optional:classpath:secrets-local.yml
-  application:
-    name: user-service
-  datasource:
-    url: ${MYSQL_URL:jdbc:mysql://localhost:3306/petverse_user?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
-    username: ${MYSQL_USERNAME:root}
-    password: ${MYSQL_PASSWORD:123456}
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    hikari:
-      # 连接池：限制单实例数据库连接数，连接耗尽时快速失败而不是长时间排队
-      maximum-pool-size: 20
-      minimum-idle: 5
-      connection-timeout: 3000
-      idle-timeout: 600000
-      # 小于 MySQL wait_timeout，避免使用到已被服务端关闭的连接
-      max-lifetime: 1800000
-      pool-name: user-pool
-
-mybatis-plus:
-  mapper-locations: classpath:mapper/*.xml
-  configuration:
-    map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
-  global-config:
-    db-config:
-      logic-delete-field: deleted
-      logic-delete-value: 1
-      logic-not-delete-value: 0
-
-jwt:
-  # 生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值
-  secret: ${JWT_SECRET:petverse-jwt-secret-key-please-change-in-production-2026}
-  expire-seconds: ${JWT_EXPIRE_SECONDS:86400}
-
-# RocketMQ：消费商户入驻审批通过事件，异步升级用户角色；未启动 Broker 时消费不可用，不影响其他功能
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: user-producer
-
-# 阿里云 OSS 存储配置
-aliyun:
-  oss:
-    endpoint: ${OSS_ENDPOINT:oss-cn-beijing.aliyuncs.com}
-    # 密钥优先级：环境变量 > 本地密钥文件 secrets-local.yml（local.oss.*）> 空
-    access-key-id: ${OSS_ACCESS_KEY_ID:${local.oss.access-key-id:}}
-    access-key-secret: ${OSS_ACCESS_KEY_SECRET:${local.oss.access-key-secret:}}
-    bucket-name: ${OSS_BUCKET_NAME:petverse-me}
-    # 可选：自定义/CDN 域名（含协议），为空时按桶默认域名拼接
-    domain: ${OSS_DOMAIN:}
+    # 全部业务配置由 Nacos 配置中心下发（连接地址与 group 见 bootstrap.yml）
+    # dataId=user-service，group=DEFAULT_GROUP，格式 YAML
+    import:
+      - nacos:user-service
