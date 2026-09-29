@@ -1,300 +1,299 @@
 # PetVerse AI 模块功能说明
 
-> 本文档描述 `ai-service`（Python / FastAPI）的功能范围、编排结构、接口契约、数据存储与容错策略。
-> 面向读者：项目使用者、二次开发者、面试评审。启动与部署见 [../ai-service/README.md](../ai-service/README.md)。
+> 本文是 `ai-service`（Python / FastAPI / LangGraph）的功能说明书，覆盖**编排结构、接口契约、存储、配置、降级策略**五个方面。启动步骤与环境变量清单见 [ai-service/README.md](../ai-service/README.md)，本文侧重「模块内部是怎么组织的、为什么这么设计」。
 
-## 一、模块定位
+## 1. 模块定位
 
-AI 模块是整个平台的智能能力层，**独立部署为 Python 微服务**，与 Java 服务同构接入现有基础设施：
+`ai-service` 是 PetVerse 的 AI 能力微服务，与 8 个 Java 模块并列，通过网关统一入口 `/api/ai/**`（`StripPrefix=1`，服务内实际路径为 `/ai/**`）对外提供服务。
 
-- **统一入口**：注册进 Nacos（服务名 `ai-service`），由 Spring Cloud Gateway 以 `lb://ai-service` + `Path=/api/ai/**` 路由，`StripPrefix=1` 后到达本服务；
-- **统一鉴权**：网关完成 JWT 校验后剥离外部伪造头、注入 `X-User-Id`，本服务直接读取该头识别用户，**无需自行实现一套鉴权**；
-- **统一报文**：所有业务响应为 HTTP 200 + `{code, msg, data}`，与 Java 侧 `GlobalExceptionHandler` 行为对齐，前端一套错误处理逻辑通吃；
-- **反向调用**：本服务按需直连各 Java 服务（`/pet/my-list`、`/shop/order/page` 等），复用同一套内部信任头机制拉取用户真实数据。
+| 维度 | 说明 |
+|---|---|
+| 语言 / 框架 | Python 3.12 · FastAPI · LangGraph · LangChain |
+| 端口 / 注册 | `127.0.0.1:8086`，启动后注册进 Nacos（网关 `lb://ai-service` 发现） |
+| 模型接入 | 对话模型、Embedding、视觉模型、语音转写全部 **OpenAI 兼容格式**，改 `base_url + model + key` 即可切换 DeepSeek / 阿里云百炼等任意服务商 |
+| 鉴权 | 不自行校验 JWT，信任网关统一鉴权后注入的 `X-User-Id` 请求头；缺失 / 非法一律 `{"code":401,"msg":"未登录"}` |
+| 报文契约 | 与 Java 端 `Result<T>` 完全对齐：所有响应均为 **HTTP 200 + `{code,msg,data}`**，前端不会收到裸 5xx 或英文技术报错 |
+| 存储 | 业务数据统一落 PostgreSQL（库 `petverse_ai`）；结果缓存热层用 Redis（db=3） |
 
-```
-前端 ──▶ 网关(/api/ai/** + JWT) ──▶ ai-service :8086
-                                      │
-                                      ├──▶ Java 业务服务（注入 X-User-Id 拉取宠物/订单/购物车/评论/动态）
-                                      ├──▶ LLM 服务商（OpenAI 兼容：DeepSeek / 阿里云百炼 / ...）
-                                      ├──▶ Embedding 服务商（RAG 向量化）
-                                      ├──▶ PostgreSQL + pgvector（会话消息 / 对话记忆 / 长期记忆 / 知识库 / 报告 / 缓存）
-                                      ├──▶ Redis（结果缓存热层 / 跨实例并发计数）
-                                      └──▶ 阿里云 OSS（多模态附件）
-```
+**设计基调**：AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → Redis / PostgreSQL），任一环节都可能抖动。模块的核心工程目标是「**短暂故障不显化为用户可见的错误**」——除知识检索外，几乎所有外部依赖都做了静默降级（详见第 7 节）。
 
-## 二、技术选型
+## 2. 能力总览
 
-| 分类 | 选型 | 说明 |
-|---|---|---|
-| Web 框架 | FastAPI + Uvicorn | 原生 async，SSE 流式输出友好 |
-| 编排框架 | **LangGraph**（StateGraph / checkpoint / runtime store） | 显式状态图编排，替代手写流程 |
-| 模型接入 | langchain-openai（ChatOpenAI / OpenAIEmbeddings） | **OpenAI 兼容格式**，改 `base_url` + `model` 即可切换服务商 |
-| 向量库 | PostgreSQL + **pgvector**（langchain-postgres `PGVector`） | 与业务数据同库，少维护一个中间件 |
-| 业务持久化 | psycopg3 同步连接池 + `asyncio.to_thread` | 规避 Windows `ProactorEventLoop` 对 psycopg 异步连接的限制 |
-| 缓存与并发计数 | redis-py（asyncio，db=3） | 结果缓存热层；单用户并发额度计数跨实例共享 |
-| 对象存储 | oss2（阿里云 OSS） | 多模态附件直传 |
-| 注册中心 | nacos-sdk-python + OpenAPI 兜底 | 双保险注册与心跳保活 |
-| 配置 | pydantic-settings（`.env`） | 集中式、可校验、支持兼容回落 |
+四项能力各自用一张 LangGraph 状态图编排，节点职责单一、可观测、可扩展：
 
-## 三、能力总览
-
-| # | 能力 | 编排图 | 入口接口 |
+| 能力 | 入口接口 | 编排图 | 图结构 |
 |---|---|---|---|
-| 1 | AI 养宠顾问对话（SSE 流式） | `app/graph/chat_graph.py` | `POST /api/ai/chat/stream` |
-| 2 | 宠物健康智能评估 | `app/graph/health_graph.py` | `POST /api/ai/health/assess` |
-| 3 | 商品评论智能摘要 | `app/graph/review_graph.py` | `POST /api/ai/shop/review/summary` |
-| 4 | 个性化推荐流 | `app/graph/recommend_graph.py` | `GET /api/ai/recommend/feed` |
-| 5 | 多模态附件上传 | —（`app/media.py` + `app/oss.py`） | `POST /api/ai/chat/upload` |
-| 6 | 会话管理 / 历史回放 | —（`app/persistence.py`） | `GET|DELETE /api/ai/chat/sessions*`、`GET /api/ai/chat/history` |
-| 7 | 长期记忆管理 | —（`app/longterm.py` + `app/memstore.py`） | `GET /api/ai/chat/memories`、`DELETE /api/ai/chat/memories/{key}` |
+| AI 养宠顾问对话 | `POST /ai/chat/stream` | `app/graph/chat_graph.py` | 意图识别 →（RAG 检索 / 工具调用）→ 长期记忆读取 → Prompt 组装 → 生成 |
+| AI 健康智能评估 | `POST /ai/health/assess` | `app/graph/health_graph.py` | 档案整理 → 分析 → 落库 |
+| 商品评论摘要 | `POST /ai/shop/review/summary` | `app/graph/review_graph.py` | 拉取评论 → 摘要 → 写缓存 |
+| 个性化推荐 | `GET /ai/recommend/feed` | `app/graph/recommend_graph.py` | 画像聚合 → 召回候选 → 重排 → 写缓存 |
 
-## 四、核心能力详解
+四张图都在首次调用时 `compile()` 一次、进程内缓存复用（`get_*_graph()` 单例）。对话图编译时额外注入两个官方持久化组件：**checkpoint saver**（会话级短期记忆）与 **runtime store**（跨会话长期记忆），见第 5 节。
 
-### 4.1 AI 养宠顾问对话
+## 3. 对话编排结构（chat_graph）
 
-#### 4.1.1 编排结构（chat_graph）
+对话是模块最复杂的部分。整体是一张带条件分支的状态图：
 
 ```
-START → classify_intent ──┬─(knowledge / health / medical_urgent)─→ retrieve_knowledge ──┬─→ recall_memory → compose → generate → END
-                          ├─(tool_query)──────────────────────────────────────────────────┤
-                          └─(chitchat)────────────────────────────────────────────────────→
+START → classify_intent ──┬─(knowledge/health/medical_urgent)─→ retrieve_knowledge ─┬─(tool_query)─→ tool_action ─┐
+                          ├─(tool_query)───────────────────────────────────────────┴────────────────────────────┤
+                          └─(chitchat)───────────────────────────────────────────────────────────────────────→ recall_memory → compose → generate → END
 ```
 
-| 节点 | 职责 | 关键实现 |
+图状态 `ChatState`（`TypedDict`）中，`messages` 通道走 `add_messages` reducer 跨轮累积，其余字段后写覆盖前值。
+
+### 3.1 classify_intent（意图识别）
+
+- **真实模式**：用 LLM 结构化输出（`IntentResult`）把用户问题分为 5 类意图；
+- **mock 模式 / LLM 失败**：降级为关键词规则（`_rule_intent`），保证分类永远有结果。
+- **纯附件消息**（只有图片 / 音频 / 视频、无文字）：没有可分类文本，直接归 `knowledge`（养宠场景发图绝大多数是「看看这是什么情况」）。
+
+| 意图 | 含义 | 后续分支 |
 |---|---|---|
-| `classify_intent` | 意图识别 | 真实模式用 LLM 结构化输出 5 类意图（`chitchat` / `knowledge` / `health` / `medical_urgent` / `tool_query`）；失败降级关键词规则；**纯附件消息（无文字）直接归 `knowledge`**，不浪费一次分类调用 |
-| `retrieve_knowledge` | RAG 语义检索 | 仅对 `knowledge` / `health` / `medical_urgent` 三类生效；命中相似度阈值的结果带来源注入 Prompt；链路不可用时抛 `RagUnavailable` 直接报错 |
-| `tool_action` | Agent 工具调用 | 仅 `tool_query` 生效；`create_agent` 驱动 ReAct 工具调用，查询用户真实数据（6 个工具，见下） |
-| `recall_memory` | 长期记忆召回 | 从 LangGraph runtime store 读取「用户级 + 当前宠物级」记忆渲染为 bullet 文本；store 不可用 / 开关关闭时降级为空 |
-| `compose` | Prompt 组装 | 拼接最终 System Prompt（见 4.1.3），裁剪最近 `HISTORY_MAX_MESSAGES` 条历史；当前轮带图时组装多模态分片 |
-| `generate` | 生成 | 调 LLM 流式生成并把回复写回图状态 `messages`（随 checkpoint 自动持久化）；含图时切换视觉模型客户端 |
+| `chitchat` | 打招呼、闲聊 | 直接 → recall_memory |
+| `knowledge` | 养宠知识（喂养 / 疫苗 / 驱虫 / 行为 / 护理） | → retrieve_knowledge（RAG） |
+| `health` | 健康评估、体检、养护 | → retrieve_knowledge（RAG） |
+| `medical_urgent` | 疑似疾病 / 用药 / 急症（中毒、抽搐、尿闭等） | → retrieve_knowledge（RAG）+ 强制就医护栏 |
+| `tool_query` | 需查询用户本人数据（宠物 / 订单 / 购物车 / 评论 / 动态） | → tool_action（Agent 工具） |
 
-> 顺序说明：`retrieve_knowledge` 与 `tool_action` 按意图二选一（知识类走 RAG、工具类走 Agent），两者均会串接 `recall_memory`——即**长期记忆块始终参与组装**，与知识上下文 / 工具数据可叠加注入；各块内容为空时对应模板块整体省略，Prompt 始终可完整渲染。
+### 3.2 retrieve_knowledge（RAG 检索）
 
-#### 4.1.2 Agent 工具集（`app/tools.py`）
+- 命中 `knowledge / health / medical_urgent` 且 `RAG_ENABLED=true` 时，用 **pgvector + OpenAI 兼容 Embedding** 做语义检索；
+- 余弦相似度（`1 - distance`）+ 阈值过滤（`RAG_SCORE_THRESHOLD`，默认 0.35）+ Top-K（默认 4），结果带**来源标注**拼进 Prompt，供回答引用、降低幻觉；
+- **不做关键词降级**：Embedding 未配置或向量库不可用时直接抛 `RagUnavailable`，由路由层转成 `error` 事件。取舍理由——知识问答里「无依据却答得像真的」比明确失败更糟。
+- 知识库语料为 `app/knowledge/*.md`（疫苗 / 驱虫 / 喂养 / 常见病 / 行为护理），由 `scripts/ingest_knowledge.py` 切分后全量幂等写入 pgvector。
 
-工具按请求动态构建，**闭包捕获 `user_id`**，因此天然具备用户隔离；全部只读，失败返回空提示不影响主流程；单次返回内容截断 2000 字符控制上下文规模。
+### 3.3 tool_action（Agent 工具调用）
 
-| 工具名 | 用途 | 数据来源 |
-|---|---|---|
-| `get_my_pets` | 我的宠物档案与健康信息 | pet-service `/pet/my-list` |
-| `get_my_orders` | 我的近期订单（含自提码） | shop-service `/shop/order/page` |
-| `get_my_cart` | 我的购物车 | shop-service `/shop/cart` |
-| `get_product_reviews` | 指定商品的用户评论 | shop-service `/shop/review/page` |
-| `get_hot_posts` | 社区当前热门动态 | space-service `/space/page?sort=hot` |
-| `search_products` | 关键词搜索在售商品 | shop-service `/shop/product/page` |
+- 意图为 `tool_query` 且非 mock 时，用 `langchain.agents.create_agent` 起一个 **ReAct Agent**，让模型自主决定调用哪些工具查询用户真实数据；
+- 工具集（`app/tools.py`，全部只读）：`get_my_pets` / `get_my_orders` / `get_my_cart` / `get_product_reviews` / `get_hot_posts` / `search_products`；
+- **用户隔离**：工具按请求动态构建（闭包捕获 `user_id`），`user_id<=0` 直接返回空工具列表，天然杜绝越权查询；
+- 工具返回内容截断到 2000 字符再入上下文；任何工具失败都降级为空，不影响对话主流程。
 
-#### 4.1.3 Prompt 组装与安全护栏（`app/persona.py`）
+### 3.4 recall_memory（长期记忆读取）
 
-System Prompt 由「基础人设 + 五个可选上下文块 + 要求」构成，各块为空则整体省略：
+- 从 LangGraph 官方 **runtime store**（`config["store"]`）读取**用户级 + 当前宠物级**长期记忆，渲染为 bullet 行注入 Prompt；
+- 命名空间两级隔离：用户级 `(petverse, user_mem, uid)`、宠物级 `(petverse, pet_mem, uid, petId)`；
+- 记忆条数按 `MEMORY_MAX_ITEMS`（默认 20）截断，控制 token 成本；
+- `MEMORY_ENABLED=false` / store 未注入 / 读取失败 → 降级为空字符串，对话不受影响。
 
-| 块 | 内容来源 | 作用 |
-|---|---|---|
-| 宠物档案块 | 前端传入的 `pet`（名字/物种/品种/年龄 + 7 项健康字段） | 让建议与宠物个体匹配 |
-| 长期记忆块 | runtime store（用户偏好 / 宠物习性 / 病史） | 跨会话个性化，回答中不暴露「记忆」实现细节 |
-| 知识块 | RAG 检索结果（含来源标注） | 降低幻觉，支持引用 |
-| 用户数据块 | Agent 工具查询到的真实业务数据 | 杜绝凭空猜测订单 / 购物车 / 口碑 |
-| 医疗护栏块 | 命中 `medical_urgent` 时强制注入 | 明确声明「不能替代兽医诊断」，必须引导就医、禁止自行用药 |
+### 3.5 compose（Prompt 组装）
 
-人设定位为**中立的养宠顾问**（不扮演宠物、不使用拟人化语气），并要求「档案未提供的信息先向用户确认再作答」。
-
-#### 4.1.4 对话记忆（双层）
-
-| 层 | 载体 | 生命周期 | 说明 |
-|---|---|---|---|
-| 短期记忆（上下文） | LangGraph 官方 `PostgresSaver` checkpoint | 跟随会话 | 图状态 `messages` 按 `thread_id = petverse-chat:{userId}:{sessionId}` 在每个超级步自动落库；`compose` 时只取最近 `HISTORY_MAX_MESSAGES`（默认 40）条控制 token 成本 |
-| 长期记忆（跨会话） | LangGraph 官方 `PostgresStore` runtime store | 跨会话、与删除会话解耦 | 命名空间两级隔离：`petverse/user_mem/{userId}` 与 `petverse/pet_mem/{userId}/{petId}`；每轮正常结束后后台抽取（见 4.1.5） |
-
-**中断补写机制**（解决「用户点停止后 AI 失忆」）：用户中止生成时，取消路径在 `asyncio.shield` 保护下把「用户问题 + 已产出的部分回复（标记 `interrupted`）」经 `graph.aupdate_state(as_node="generate")` 补写回图状态——图状态就此收尾（`next` 为空），下一轮从 START 重新展开，不会重放未完成节点；同时兜底写入 PostgreSQL 供前端历史回放（`save_turn_if_exists` 在会话已被删除时原子跳过，不复活历史）。用户消息无条件落库，即使中止时零产出，首轮提问也不会丢。
-
-**存量会话回填**：升级前仅有历史消息、checkpoint 中无记录的会话，首次对话时用 PG 最近 N 条历史回填一次；回填消息 id 为确定性值（`bf-{序号}-{时间戳}`），`add_messages` 按 id 覆盖，重复触发不产生重复消息。
-
-#### 4.1.5 长期记忆抽取（`app/longterm.py`）
-
-每轮正常结束后（真实模式 + 回复非空）由后台任务异步执行，不阻塞 `done` 事件：
-
-1. 读取现有记忆清单（用户级 + 宠物级各限 20 条）作为比对依据；
-2. LLM 结构化输出 `MemoryUpdateResult`（操作列表）；
-3. 逐条应用：`add` 用新 uuid key、`update` 复用原 key 并保留 `createdAt`、`delete` 按 key 删除。
-
-抽取原则（写进 System Prompt）：只记录**长期有效**的养宠信息（用户偏好、宠物习性、病史过敏等），忽略一次性细节与寒暄；重复或演进的信息必须输出 `update` 而非 `add`（**防抖机制**）；无有效信息时输出 `none`。安全阀：单轮操作数上限 8 条、单条内容 50 字截断。中断轮（partial 回复）不触发抽取——不完整信息易产出误导性记忆。
-
-前端可查看与删除长期记忆（`GET /ai/chat/memories`、`DELETE /ai/chat/memories/{key}`），删除接口按「用户 ID + scope + petId」定位命名空间，**天然隔离越权**（他人无法猜 key 删除别人的记忆）。
-
-#### 4.1.6 SSE 流式协议与并发控制（`app/chat.py`）
-
-**事件协议**：
-
-| 事件 | 载荷 | 时机 |
-|---|---|---|
-| `meta` | `{sessionId}` | 首帧，前端据此绑定自动新建的会话并刷新列表 |
-| `delta` | `{content}` | 生成过程中的文本增量 |
-| `done` | — | 正常结束（此时两侧存储均已写入） |
-| `error` | `{msg}` | 异常 / 过载 / 并发超限，发出后结束流 |
-
-SSE 响应头固定 `Cache-Control: no-cache`、`X-Accel-Buffering: no`（禁 Nginx 反代缓冲）、`Connection: keep-alive`；超过 15s 无 token 产出即发送注释行 `: ping` 心跳防断连。
-
-**并发与限流**：
-
-| 机制 | 参数 | 说明 |
-|---|---|---|
-| 全局并发闸 | 20 路，3s 获取超时 | 超时返回过载提示，保护 LLM 调用与信号量池 |
-| 单用户并发闸 | 2 路 | 额度计数存于 Redis（`ai:conc:user:{userId}`，Lua 原子占用/归还，TTL 5 分钟自愈），多实例部署时跨实例生效；建会话前做只读预检查（避免超限请求白建空会话），正式占用在流生成器内完成、`finally` 归还 |
-| 消息长度 | 2000 字符 | 超长直接拒绝，保护上下文窗口与 token 成本 |
-| 附件数量 | 4 个 / 轮 | 可经 `.env` 调整 |
-| 首帧前重试 | 最多 2 次尝试 | 仅在**未产出任何内容**时静默重建流重试；已产出后失败不重试，避免重复输出 |
-
-**会话模型**：按「用户 + 宠物 + 会话」三级隔离——一只宠物可有多个会话；切换宠物 / 新建对话进入待创建态，**会话在用户发出首条消息时才落库**（避免频繁切换堆积空会话）；首轮消息自动作为会话标题（仍为「新会话」时刷新）；侧栏跨宠物统一展示全部历史会话。
-
-### 4.2 宠物健康智能评估（health_graph）
+纯函数（`app/persona.py`），把多路上下文拼成最终 System Prompt + 消息列表：
 
 ```
-START → load_profile → analyze → persist → END
+System Prompt = 养宠顾问人设
+              + 宠物档案块（物种/品种/年龄/体重/疫苗/病史…，仅拼非空字段）
+              + 长期记忆块（recall_memory 渲染的偏好/习性）
+              + 参考知识块（RAG 检索结果，带来源）
+              + 用户数据块（工具查到的真实订单/购物车/评论…）
+              + 医疗护栏（命中 medical_urgent 时强制附加「尽快就医、勿自行用药」）
 ```
 
-- **load_profile**：整理宠物档案与 7 项健康字段为文本，标记缺失项（物种、年龄、疫苗、驱虫等）；
-- **analyze**：LLM 结构化输出 `PetHealthReport`——综合评分（0-100）、评级（excellent / good / fair / warning）、一句话总结、风险点、改进建议、近期养护计划、疫苗/驱虫/体检提醒（含紧急程度）、免责声明。评分标准显式写进 Prompt（信息完整且正常 85-100，有风险项依次下探），并明确「不得做医疗诊断，仅基于用户填写信息评估」；
-- **persist**：报告落 `pet_health_report` 表（同库历史留存）。
+- **历史窗口**：从图状态 `messages` 取最近 `HISTORY_MAX_MESSAGES`（默认 40）条，checkpoint 保留全量记忆、此处按窗口裁剪控制 token；
+- **多模态**：仅**当前轮**用户消息携带 `image_url` 分片发给视觉模型；历史轮附件早已以文字描述并入消息内容，不再重复发图（既省 token，也避免图片分片进 checkpoint 撑爆记忆存储）。
 
-**降级**：LLM 失败或 mock 模式走规则评估（`_rule_report`）——按档案缺失项、病史关键词、特殊时期、疫苗/驱虫记录缺项扣分，产出同样结构完整的可演示报告。`GET /ai/health/history?petId=` 可查询某宠物历史评估（时间倒序）。
+### 3.6 generate（生成）
 
-### 4.3 商品评论智能摘要（review_graph）
+- 真实模式调用 LLM 流式生成，并把助手回复写回图状态 `messages`（随 checkpoint 自动持久化，成为下一轮的跨轮记忆）；空输出不落记忆；
+- 最终消息含图片分片时自动切换**视觉模型客户端**（`get_vision_client`）；
+- mock 模式不在图内生成，由路由层走打字机 mock 流，再手动补写回图状态保持两模式记忆一致。
 
-```
-START → fetch_reviews → summarize → persist_cache → END
-```
+### 3.7 流式输出与归一化
 
-- 拉取商品评论（最多 50 条，参与摘要 40 条、单条截断 300 字控制上下文）；
-- LLM 结构化输出 `ReviewSummary`：情感倾向、一句话总结、优点、缺点、3-6 个高频关键词；Prompt 强制「优缺点必须来自评论内容，不要编造」；
-- 结果写两级缓存（TTL 6 小时，有新增评论自然过期重建），无评论时返回明确占位摘要且**不写缓存**；
-- **降级**：LLM 失败时用规则摘要——按评分均值定情感、情感词表挑代表性短句作优缺点、中文 n-gram（2-4 字）词频提关键词。
+路由层用 `graph.astream(stream_mode="messages")` 消费图内所有 LLM 调用的消息流，但**只透传 `generate` 节点**（按 `metadata.langgraph_node` 过滤）的助手文本增量——意图识别、工具 Agent 的中间产物不会漏给前端。
 
-### 4.4 个性化推荐流（recommend_graph）
+## 4. 其余三张编排图
 
-```
-START → gather_profile → recall_candidates → rerank → persist_cache → END
-```
+### 4.1 health_graph（健康评估）
 
-- **gather_profile**：`asyncio.gather` 并发拉取五路画像（宠物 / 订单 / 购物车 / 评价 / 我的动态），任一失败降级为空不影响其余；
-- **recall_candidates**：从画像提取关键词（宠物物种品种 + 交互过的商品名），关键词搜商品 + 泛化在售商品 + 热门动态，去重规范化后作为候选（商品 ≤16 + 动态 ≤8）；
-- **rerank**：LLM 结合画像压缩文本重排，产出至多 8 条「内容 + 推荐理由（≤30 字）」；**防幻觉约束**：只能用候选列表中出现过的 id，模型编造的 id 在合并阶段被过滤；重排结果为空或失败时降级启发式排序（商品优先、动态按点赞数）；
-- **persist_cache**：按 `用户 + 场景` 写两级缓存（TTL 10 分钟）；`refresh=true` 跳过缓存强制刷新。
-- **单飞防击穿**：缓存未命中时同一 key 只放行一次真实计算（五路画像 + 召回 + LLM 重排），其余并发请求等锁后直接取结果；写入 TTL 附加 0~10% 随机抖动，避免同批缓存同时过期。
+`load_profile → analyze → persist`
 
-### 4.5 多模态附件（`app/media.py` / `app/oss.py`）
+- `load_profile`：整理宠物档案 + 健康字段（体重 / BCS / 驱虫 / 特殊时期 / 疫苗 / 养育方式 / 病史），标记缺失项；
+- `analyze`：真实模式用 LLM 结构化输出 `PetHealthReport`（评分 0-100、评级、风险、建议、养护计划、提醒、免责声明）；mock / LLM 失败降级为**规则评估**（按档案完整度与风险词给分）；
+- `persist`：报告落 PostgreSQL `pet_health_report`（按用户 + 宠物保留历史），失败仅记日志。
+- **安全边界**：Prompt 明确「不得做医疗诊断，仅基于用户填写信息评估，有就医必要时在 risks 中提示」。
 
-| 类型 | 处理方式 | 大小上限 |
+### 4.2 review_graph（评论摘要）
+
+`fetch_reviews → summarize → persist_cache`
+
+- 经 `clients.biz` 直连 shop-service 拉取商品真实评论（最多 40 条参与、单条截断 300 字）；
+- 真实模式 LLM 结构化输出 `ReviewSummary`（情感 / 一句话总结 / 优缺点 / 关键词 / 条数），优缺点强制来自评论内容不得编造；mock / 少评论降级为规则摘要（评分均值定情感 + n-gram 词频抽关键词）；
+- 结果写两级缓存（key `ai:review:summary:{productId}`，TTL 默认 6 小时）；
+- **单飞（single_flight）**：同一商品并发未命中只放行一次真实计算，其余等锁后直接取缓存，避免热点商品在缓存过期瞬间被并发打穿（多次 LLM 调用）。
+
+### 4.3 recommend_graph（个性化推荐）
+
+`gather_profile → recall_candidates → rerank → persist_cache`
+
+- `gather_profile`：**五路并发**拉取用户画像（宠物 / 订单 / 购物车 / 评价 / 我的动态），`return_exceptions=True` 任一失败为空、不影响其余；
+- `recall_candidates`：画像关键词（宠物物种 / 品种 + 交互过的商品名）搜索商品 + 泛化在售商品 + 热门动态，去重规范化为候选；
+- `rerank`：真实模式 LLM 结合画像重排并生成推荐理由（只能用候选列表中出现过的 id，不得编造），mock / 失败降级为启发式排序（商品热销优先、动态按点赞）；
+- `persist_cache`：按用户 + 场景写两级缓存（key `ai:recommend:{scene}:{userId}`，TTL 默认 10 分钟），`refresh=true` 跳过缓存强制刷新；同样用单飞防打穿。
+
+## 5. 记忆与存储设计
+
+### 5.1 两类记忆（都用 LangGraph 官方组件 + PostgreSQL）
+
+| 记忆 | 组件 | 粒度 | 生命周期 | 写入时机 |
+|---|---|---|---|---|
+| **会话记忆**（短期） | 官方 checkpoint `PostgresSaver` | `thread_id = petverse-chat:{userId}:{sessionId}` | 与会话绑定，删会话即删记忆 | 每个超级步自动持久化图状态 `messages` |
+| **长期记忆**（跨会话） | 官方 runtime store `PostgresStore` | 用户级 / 宠物级命名空间 | 跨会话保留，与删会话解耦 | 每轮正常结束后**后台任务**抽取写入 |
+
+**会话记忆的关键设计——「暂停不再失忆」**：用户点「停止生成」或客户端中途断开时，中断发生在 `generate` 落盘之前。路由层在 `asyncio.shield` 保护下，把「用户问题 + 已产出的部分回复（标记 `interrupted`）」经 `aupdate_state(as_node="generate")` 补写回图状态，被中止的轮次同样进入后续对话的记忆；同时 PostgreSQL 侧 `save_turn_if_exists` 兜底保存（会话已删则原子跳过，不复活历史），**用户消息无条件落库**（即使中止时零产出，首轮提问也不丢）。
+
+**长期记忆的抽取引擎**（`app/longterm.py`）：每轮 `done` 之后后台跑一次——读取该用户现有记忆清单 → LLM 结构化输出 `add/update/delete` 操作列表 → 逐条应用到 store。防抖靠 `update`（LLM 看到既有清单，重复或演进的信息复用原 key 覆盖，不重复堆积）；只记长期有效的养宠信息（偏好 / 习性 / 病史），一次性提问细节（「今天体温 39 度正常吗」）不进记忆；单条 ≤50 字、单轮 ≤8 条操作；全程异常静默、mock 模式跳过。
+
+### 5.2 PostgreSQL 表（库 `petverse_ai`）
+
+| 表 | 用途 | 创建方式 |
 |---|---|---|
-| 图片 | 当前轮以 `image_url` 分片直发视觉模型（如百炼 qwen-vl） | 10 MB |
-| 音频 | 经 OpenAI 兼容 ASR（如 paraformer-v2）转写为文本，并优先作为意图识别 / RAG 检索的信号 | 20 MB |
-| 视频 | 无法直接理解，生成明确的文字引导（建议截取关键画面以图片发送） | 50 MB |
+| `chat_session` | 会话（按用户 + 宠物隔离，一只宠物可建多会话） | 服务启动幂等自动建表 |
+| `chat_message` | 消息（`interrupted` 标记中止、`attachments` JSONB 存多模态附件） | 服务启动幂等自动建表 |
+| `pet_health_report` | 健康评估报告（按用户 + 宠物保留历史） | `db/schema_pgvector.sql` |
+| `ai_cache` | AI 结果缓存温层（Redis 缺失时兜底） | `db/schema_pgvector.sql` |
+| `checkpoints` 等 | LangGraph checkpoint（会话记忆） | 官方 `setup()` 自动建表 |
+| store 表 | LangGraph runtime store（长期记忆） | 官方 `setup()` 自动建表 |
+| `langchain_pg_collection` / `langchain_pg_embedding` | pgvector 向量库（RAG 语料） | LangChain PGVector 自动管理 |
 
-- **上传**：`POST /ai/chat/upload` 直传 OSS，对象 key 为 `ai-chat/{userId}/{yyyyMMdd}/{uuid}.ext`，URL 由浏览器回放与视觉模型回源拉取共用，**不占本服务带宽**；类型按 MIME 主类型判定、扩展名兜底，大小边读边累计、超限立即中断不产生上传流量；
-- **降级**：视觉模型未配置时图片降级为文字占位提示（引导用户文字描述）；ASR 未配置或转写失败时同样降级为提示，绝不阻断对话主流程；
-- **安全**：服务端读取附件字节（转写用）只接受**本人命名空间**的对象 key，且只按 key 取值、不按用户提交的 URL 抓取（防 SSRF）；转写结果回填 `transcript` 字段，消息通道中只保存文本描述（避免图片分片进 checkpoint 撑爆记忆存储）。
+会话与消息是**前端历史展示 / 会话管理**的持久层；checkpoint 承载**LLM 上下文记忆**——两者定位不同、互不替代，同库不同表。
 
-## 五、接口清单
+### 5.3 Redis（db=3）
 
-> 以下均为经网关的对外路径（网关 `StripPrefix=1`）；除上传接口外，所有接口需携带 JWT，网关注入 `X-User-Id`，缺失 / 非法统一返回 `{"code":401,"msg":"未登录"}`。
+- **结果缓存热层**：评论摘要 / 推荐（经 `app/cache.py` 两级门面读写）；
+- **用户级并发计数**：多实例共享的单用户并发额度（Lua 脚本 `INCR/DECR` 原子操作 + TTL 兜底回收）。
 
-| 方法 | 路径 | 说明 |
+### 5.4 两级结果缓存（app/cache.py）
+
+```
+读：Redis（热，快）未命中 → 回落 ai_cache（温，PG 持久）→ 都未命中返回 None 重算
+写：Redis 与 ai_cache 并行双写（TTL 一致，各 0~10% 随机抖动防雪崩）
+```
+
+- **为什么要第二级**：Redis 是易失热缓存，实例故障 / 重启会让全部结果缓存失效、请求透传重算（LLM 调用 + 外部服务查询）；ai_cache 落 PostgreSQL 与业务数据同库持久，Redis 缺失期间缓存能力不受单点影响；
+- **ai_cache 命中不回填 Redis**：避免「回填续期」让 TTL 语义失真（推荐缓存「10 分钟自然过期重建」的意图会被持续访问无限延长）——温层定位是「Redis 缺失时仍可用」，不是保温；
+- 任何缓存异常都内部静默降级，主流程不受影响（恢复后 redis-py 自动重连）。
+
+## 6. 接口契约
+
+所有接口经网关 `/api/ai/**`（StripPrefix=1）访问，需登录（网关注入 `X-User-Id`）。
+
+| 方法 | 网关路径 | 说明 |
 |---|---|---|
-| POST | `/api/ai/chat/stream` | SSE 流式对话，体 `{"message","pet":{...},"sessionId","attachments":[...]}`；首帧 `meta` 回传 sessionId |
-| POST | `/api/ai/chat/upload` | 上传多模态附件（multipart），返回 attachment 信息供前端原样放入 `attachments` |
-| GET | `/api/ai/chat/history?sessionId=` | 会话历史（时间正序，含 `interrupted` 标记与附件） |
+| POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{message, pet, sessionId?, attachments?}`；首帧 `meta` 回传 sessionId |
+| POST | `/api/ai/chat/upload` | 上传多模态附件（图片 / 音频 / 视频）直传 OSS，返回附件信息 |
+| GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（PostgreSQL，时间正序） |
 | GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物，最近活跃在前，每条带 petId） |
 | DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint 记忆） |
-| GET | `/api/ai/chat/memories` | 用户全部长期记忆（用户级 + 所有宠物级，最近更新在前） |
-| DELETE | `/api/ai/chat/memories/{key}?scope=&petId=` | 删除单条长期记忆 |
-| POST | `/api/ai/health/assess` | 宠物健康评估，体为宠物档案（含 `health`），返回结构化报告 |
-| GET | `/api/ai/health/history?petId=` | 宠物历史健康评估（时间倒序） |
-| POST | `/api/ai/shop/review/summary` | 商品评论摘要，体 `{"productId"}` |
-| GET | `/api/ai/recommend/feed?scene=home\|shop&refresh=` | 个性化推荐流（`refresh=true` 跳过缓存） |
+| GET | `/api/ai/chat/memories` | 查询当前用户全部长期记忆（用户级 + 所有宠物级） |
+| DELETE | `/api/ai/chat/memories/{key}?scope=&petId=` | 删除单条长期记忆（命名空间天然隔离越权） |
+| POST | `/api/ai/health/assess` | 宠物健康评估；体为宠物档案（含 `health`），返回结构化报告 |
+| GET | `/api/ai/health/history?petId=&limit=` | 宠物历史健康评估（时间倒序） |
+| POST | `/api/ai/shop/review/summary` | 商品评论摘要；体 `{productId}` |
+| GET | `/api/ai/recommend/feed?scene=home\|shop&refresh=` | 个性化推荐流 |
 
-**SSE 事件序列**：`meta` → `delta * n` → `done`；异常时 `error` 后结束流。业务错误（参数 / 会话不存在 / 过载）以 `{code, msg, data}` JSON 报文返回，HTTP 状态码恒为 200。
+**SSE 事件序列**：`meta`（回传 sessionId）→ `delta` × n（文本增量）→ `done`；异常时发 `error` 后结束流。服务端每 15s 发一行注释心跳 `: ping`（防代理 idle 超时断连）。
 
-## 六、数据存储
+**统一报文**：成功 `{"code":200,"msg":"success","data":...}`；失败 `{"code":xxx,"msg":"...","data":null}`（401 未登录 / 400 参数错误 / 404 会话不存在 / 429 并发超限 / 500 服务开小差）。参数校验失败由全局 `RequestValidationError` 处理器统一转 `{"code":400,"msg":"参数错误"}`，与 Java 端 `GlobalExceptionHandler` 行为对齐。
 
-全部业务数据落在 PostgreSQL 库 `petverse_ai`（与 Java 服务的 MySQL 体系独立）：
+**雪花 ID 精度**：`petId` 等 19 位雪花 ID 一律以**字符串**下发，避免超过 JS Number 安全整数（2^53）被前端截断。
 
-| 存储 | 表 / 结构 | 用途 | 建表方式 |
-|---|---|---|---|
-| 会话管理 | `chat_session` | 会话（user_id + pet_id 隔离，标题、活跃时间） | 启动时幂等自动创建 |
-| 消息历史 | `chat_message` | 前端历史回放（`interrupted` 标记、`attachments` JSONB） | 启动时幂等自动创建 |
-| 短期记忆 | LangGraph checkpoint 表 | LLM 上下文记忆（图状态持久化） | `PostgresSaver.setup()` 幂等创建 |
-| 长期记忆 | LangGraph store 表 | 跨会话用户 / 宠物偏好与事实 | `PostgresStore.setup()` 幂等创建 |
-| 知识库 | pgvector 集合 `petverse_kb` | RAG 向量检索 | 导入脚本重建 |
-| 健康报告 | `pet_health_report` | 历史评估报告（含 payload JSONB） | `db/schema_pgvector.sql` |
-| 结果缓存温层 | `ai_cache` | Redis 故障时的缓存兜底（UPSERT + 过期时间） | `db/schema_pgvector.sql` |
-| 结果缓存热层 | Redis db=3 | 评论摘要 / 推荐结果 | 运行时写入 |
-| 并发额度计数 | Redis db=3 `ai:conc:user:{userId}` | 单用户并发额度（多实例共享，TTL 5 分钟兜底回收） | 运行时写入 |
+## 7. 配置说明（.env）
 
-> 服务启动时 `lifespan` 依次初始化 Redis、PG 连接池、checkpoint、store、Nacos 注册；停机时反注册并释放各连接池。存量数据迁移（MySQL → PostgreSQL）用 `scripts/migrate_mysql_to_pg.py`（一次性、幂等、保留原会话 ID）。
-
-## 七、配置项（`.env`）
+配置由 `pydantic-settings` 从 `ai-service/.env` 读取，`app/config.py` 的 `Settings` 单例集中暴露。首次使用复制 `.env.example` 为 `.env`。
 
 | 配置组 | 关键项 | 说明 |
 |---|---|---|
-| 服务与注册 | `AI_SERVICE_NAME/IP/PORT`、`NACOS_SERVER_ADDR` | 默认 127.0.0.1:8086，注册名 `ai-service` |
-| 对话模型 | `LLM_API_KEY/BASE_URL/MODEL` | OpenAI 兼容；留空或 `MOCK_CHAT=true` 进入 mock 模式 |
-| 视觉模型 | `LLM_VISION_MODEL/API_KEY/BASE_URL` | Key / BaseURL 缺省时自动回落 `LLM_*`；模型未配置时图片走文字占位 |
-| 语音转写 | `ASR_API_KEY/BASE_URL/MODEL` | 三项齐全才启用，否则音频降级为文字提示 |
-| Embedding | `EMBEDDING_API_KEY/BASE_URL/MODEL/DIM` | 不配置则知识检索不可用（知识类提问明确报错）；`DIM` 必须与 pgvector 维度一致 |
-| RAG | `RAG_ENABLED / RAG_TOP_K / RAG_SCORE_THRESHOLD / RAG_COLLECTION` | 默认开关开、召回 4 条、阈值 0.35、集合 `petverse_kb` |
-| 记忆 | `MEMORY_ENABLED`、`MEMORY_MAX_ITEMS`、`HISTORY_MAX_MESSAGES` | 长期记忆总开关、注入条数上限 20、上下文窗口 40 条 |
-| PostgreSQL | `PG_HOST/PORT/USER/PASSWORD/DB`、`PG_POOL_MIN/MAX` | 库 `petverse_ai` |
-| Redis | `REDIS_HOST/PORT/PASSWORD/DB` | db=3 为 AI 结果缓存专用 |
-| OSS | `OSS_ENDPOINT/ACCESS_KEY_ID/ACCESS_KEY_SECRET/BUCKET_NAME/DOMAIN` | 与 Java 侧共用同一个桶；缺任一项上传接口明确报错 |
-| 附件 | `CHAT_MAX_ATTACHMENTS`、`MEDIA_MAX_IMAGE_MB/AUDIO_MB/VIDEO_MB` | 4 个 / 10MB / 20MB / 50MB |
-| 业务服务 | `PET/SHOP/SPACE/USER/SOCIAL/REMARK_SERVICE_URL`、`HTTP_TIMEOUT` | 直连拉取上下文，失败降级为空 |
-| 缓存 TTL | `REVIEW_SUMMARY_TTL`、`RECOMMEND_CACHE_TTL` | 6 小时 / 10 分钟 |
-| 生成参数 | `LLM_MAX_TOKENS`、`LLM_TEMPERATURE` | 默认 512 / 0.8 |
+| 对话模型 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | OpenAI 兼容；Key 留空或 `MOCK_CHAT=true` 走 mock。`DEEPSEEK_*` 为向后兼容别名（`LLM_*` 未配时自动回落） |
+| Embedding | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化，**知识检索必需**；不配置则知识类提问直接报错。维度须与 pgvector 一致 |
+| 视觉 / 语音 | `LLM_VISION_*` / `ASR_*` | 多模态：图片理解、音频转写；Key/Base 缺省回落到 `LLM_*`；未配置则降级为文字占位提示 |
+| OSS | `OSS_ENDPOINT` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_BUCKET_NAME` / `OSS_DOMAIN` | 附件直传，与 Java 侧共用同一桶 |
+| PostgreSQL | `PG_HOST` / `PG_PORT` / `PG_USER` / `PG_PASSWORD` / `PG_DB` / `PG_POOL_*` | 会话 / 消息 / checkpoint / store / RAG / 健康报告 / 缓存温层 |
+| Redis | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` / `REDIS_DB` | 结果缓存热层 + 并发计数（db=3） |
+| RAG | `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` / `RAG_COLLECTION` | 检索开关与参数 |
+| 记忆 | `HISTORY_MAX_MESSAGES` / `MEMORY_ENABLED` / `MEMORY_MAX_ITEMS` | 上下文窗口条数、长期记忆开关与注入上限 |
+| 缓存 TTL | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 评论摘要 6 小时、推荐 10 分钟 |
+| 生成参数 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 默认 512 / 0.8 |
+| 业务服务地址 | `PET_SERVICE_URL` / `SPACE_SERVICE_URL` / `SHOP_SERVICE_URL` … | ai-service 直连各微服务拉上下文，注入内部 `X-User-Id`；`HTTP_TIMEOUT` 默认 8s |
+| 多模态上限 | `CHAT_MAX_ATTACHMENTS` / `MEDIA_MAX_IMAGE_MB` / `MEDIA_MAX_AUDIO_MB` / `MEDIA_MAX_VIDEO_MB` | 附件数与单文件大小上限 |
 
-## 八、容错与降级策略汇总
+派生开关（`Settings` property）：`is_mock`（无 Key 或强制 mock）、`embedding_enabled`、`vision_enabled`、`asr_enabled`、`oss_configured`——各能力据此自动选择真实链路或降级链路。
 
-设计原则：**按业务语义分级**——记忆与上下文类能力「宁可降级不可中断」，会话管理与知识检索类能力「宁可失败不可静默」。
+## 8. 降级与韧性策略
 
-| 环节 | 故障场景 | 策略 |
-|---|---|---|
-| 对话记忆（checkpoint） | PG 不可用 | 读降级为「无历史」、写静默失败；建表失败 30s 冷却重试，PG 恢复后无需重启自动启用 |
-| 长期记忆（store） | PG 不可用 | 读降级为空、写静默；同上冷却重试自愈 |
-| 会话管理 | PG 不可用 / 会话不存在 | **明确抛错**转业务报文（对话前提不允许静默降级） |
-| 消息持久化 | PG 写入失败 | 仅记日志，不影响本次对话 |
-| RAG 检索 | Embedding 未配置 / 向量库异常 | **抛 `RagUnavailable` 明确报错**，不降级关键词检索 |
-| 意图识别 | LLM 失败 / mock | 降级关键词规则（含医疗急症词表） |
-| 工具调用 | 业务服务异常 | 跳过真实数据上下文，对话继续 |
-| 健康评估 | LLM 失败 / mock | 降级规则评分报告 |
-| 评论摘要 | LLM 失败 / mock / 无评论 | 降级规则摘要；无评论返回占位且不写缓存 |
-| 推荐 | 画像拉取失败 / LLM 失败 | 画像缺失退化通用结果；重排失败降级启发式排序 |
-| 结果缓存 | Redis 故障 | 读自动回落 `ai_cache` 温层，写仅落温层；两级都不可用才重新计算 |
-| 并发额度计数 | Redis 故障 | 降级为进程内计数（单实例上限仍生效）；按占用时的计数方式归还，两套计数不错位 |
-| 缓存击穿 / 雪崩 | 热点 key 过期瞬间并发未命中 | 同 key 单飞只放行一次计算；写入 TTL 加随机抖动错开过期时间 |
-| 音频转写 | ASR 未配置 / 失败 | 降级为文字占位提示，不阻断对话 |
-| 图片理解 | 视觉模型未配置 | 降级为文字占位提示，引导用户文字描述 |
-| 附件上传 | OSS 未配置 / 上传失败 | **明确报错**（不静默降级，避免附件悄悄丢失）；上传内部含 1 次抖动重试 |
-| LLM 流式输出 | 首帧前失败 / 中途异常 | 首帧前静默重建重试一轮；已产出内容后失败发 `error` 事件收尾 |
-| 前端连接 | 网络闪断 / 链路静默 | 心跳注释行保活；前端侧配连接看门狗（10s）与流看门狗（25s）、失败气泡可一键重发 |
-| Nacos 注册 | SDK 失败 / 实例丢失 | OpenAPI 兜底注册；自建 5s 心跳线程，检测到实例丢失自动重注册（30s 节流） |
-| 无 Key 联调 | 未配置 LLM Key | mock 模式：编排逻辑照常执行，回复由内置语料按打字机节奏输出，跨轮记忆一致 |
+这是 AI 模块工程量最集中的部分，分四层。
 
-## 九、知识库语料与导入
+### 8.1 服务过载保护（ai-service）
 
-- 语料位于 `app/knowledge/*.md`：`vaccine.md`（疫苗）、`deworming.md`（驱虫）、`feeding.md`（喂养）、`disease.md`（常见病）、`behavior.md`（行为护理）；
-- 导入：`.venv\Scripts\python -m scripts.ingest_knowledge` —— 按中文标点递归切分（chunk 280 / overlap 40），**先清空集合再全量写入**（幂等，可反复执行，以文件为唯一事实来源）；
-- Embedding 未配置或向量库不可用时脚本报错退出（RAG 只有 pgvector 一条链路，不做关键词降级）。
+- **全局并发闸**：同一时刻最多 20 路流式对话（`asyncio.Semaphore`），3s 内拿不到信号量即返回过载提示；
+- **单用户并发闸**：同一用户最多 2 路并发（防脚本刷满全局闸挤占他人）；额度计数走 **Redis 共享**（多实例生效，Lua 原子 `INCR/DECR`），首次建立设 300s TTL 兜底回收进程异常退出未归还的额度；**Redis 不可用退化为进程内计数**，单实例上限仍生效；
+- **消息长度上限**：单条 ≤2000 字、附件 ≤4 个，保护上下文窗口与 token 成本；
+- **LLM 首帧重试**：流在产出任何内容前失败（服务商瞬时抖动、429）时自动重建流静默重试一轮，用户无感知；已产出内容后不重试，避免重复输出。
 
-## 十、本地运行与联调
+### 8.2 存储层降级与自愈
 
-```powershell
-cd ai-service
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-copy .env.example .env          # 留空 LLM_API_KEY 即进入 mock 模式，可无 Key 全流程联调
-psql -U postgres -d petverse_ai -f db/schema_pgvector.sql   # 库需先 CREATE DATABASE petverse_ai
-.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
+- **结果缓存两级降级**：见 5.4，Redis 故障时读走 ai_cache、写仅落 ai_cache，仅两级都不可用才退化为重算；
+- **checkpoint / runtime store（记忆）**：官方 `PostgresSaver` / `PostgresStore`（同步引擎）+ **线程适配层**——本服务跑在 Windows 上，psycopg 异步连接在默认 `ProactorEventLoop` 下不可用，故异步方法统一经 `asyncio.to_thread` 代理执行；PG 故障时读降级为「无历史 / 无长期记忆」、写静默失败，对话不受影响；建表失败带 30s 冷却重试，PG 恢复后**无需重启服务**即可重新启用记忆；
+- **会话与消息持久化**：读降级为空历史、写仅记日志；连接池用 `psycopg_pool`（惰性连接 + 自有断线重连与坏连接淘汰），PG 重启 / 网络闪断后自愈；业务表缺失时带 30s 冷却自动补建；
+- **会话操作（建 / 删 / 查）**：失败**向上抛**，由路由层转成统一业务错误报文（不静默降级）——会话是对话的前提。
+
+### 8.3 外部依赖降级
+
+- **LLM 不可用 / 无 Key**：`MOCK_CHAT` 走内置打字机 mock 回复，编排逻辑（意图 / 检索 / 工具 / 组装）照常执行，便于联调；
+- **结构化输出跨服务商降级**：OpenAI 兼容服务对结构化输出支持差异大（DeepSeek 思考模型既不支持 `json_schema` 也不支持 `tool_choice`），按 `json_schema → function_calling → json_mode`（附显式 Schema 提示）顺序尝试并缓存首次成功方式；
+- **RAG 不可用**：唯一**不降级**的链路——直接报错（见 3.2）；
+- **视觉 / 语音未配置**：图片 / 音频降级为文字占位提示，引导用户文字补充，不阻断对话；
+- **业务服务调用失败**（`clients.py`）：服务未启动 / 超时 / 报文异常一律返回空并仅记日志，推荐与健康评估在数据缺失时退化为通用结果；
+- **Nacos 注册**：SDK 优先、OpenAPI 降级，外加自建 daemon 心跳线程每 5s 保活；检测到实例丢失（beat 返回 `20404` / 连续失败）自动重注册（30s 节流）；注册失败只打日志、绝不阻断启动。
+
+### 8.4 断连与异常收尾
+
+- **SSE 心跳**：15s 无 token 产出即发注释行 ping；
+- **客户端断开 / 用户停止生成**：问题与部分回复补写进 checkpoint + PostgreSQL（见 5.1），`asyncio.shield` 保证取消路径的写入落地，正常路径已收尾则不重复补写；
+- **生产者-消费者解耦**：LLM / mock 流先搬进 `asyncio.Queue`，消费端对「等待下一个片段」做超时心跳，而不必直接对 async generator 用 `wait_for`（超时取消会破坏生成器状态）；
+- **统一报文契约**：所有错误均为 HTTP 200 + `{code,msg,data}`。
+
+### 8.5 各依赖缺失时的行为速查
+
+| 未启动 / 未配置 | 影响 |
+|---|---|
+| LLM Key | 走 mock 打字机回复（编排照常） |
+| Embedding | 知识类提问**直接报错**（不降级） |
+| PostgreSQL | 会话持久化与对话记忆降级、知识检索报错、健康报告不落库 |
+| Redis | 结果缓存退化为重算（ai_cache 温层仍可用）、并发额度降级为进程内计数 |
+| 业务微服务 | 推荐 / 健康评估 / 工具查询退化为通用结果或空 |
+| OSS | 多模态附件上传不可用 |
+| Nacos | 服务照常启动，网关切走 `lb://ai-service` 发现（需直连或降级路由） |
+
+## 9. 代码地图
+
 ```
-
-- **最小依赖**：无 Nacos / Redis / PG 也可启动，各能力按上表自动降级（会话管理与 RAG 除外，会明确报错）；
-- **mock 模式**：`MOCK_CHAT=true` 或未配置 `LLM_API_KEY`，无需任何外部模型服务即可演示对话、记忆、会话管理全链路；
-- **切换服务商**：改 `.env` 中 `LLM_BASE_URL` + `LLM_MODEL` 即可（如 DeepSeek `https://api.deepseek.com/v1` + `deepseek-chat`，百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus`），代码零改动。
+ai-service/app/
+├── main.py              FastAPI 实例 + lifespan（启动初始化各连接池 / Nacos 注册，停机释放）
+├── config.py            pydantic-settings 配置单例（.env）
+├── chat.py              对话路由（SSE 流式、并发闸、心跳、首帧重试、中断补写、附件上传、会话/记忆管理）
+├── health.py / review.py / recommend.py   健康评估 / 评论摘要 / 推荐路由
+├── graph/
+│   ├── chat_graph.py        对话编排（意图/RAG/工具/记忆/组装/生成）
+│   ├── health_graph.py      健康评估编排
+│   ├── review_graph.py      评论摘要编排
+│   └── recommend_graph.py   个性化推荐编排
+├── llm.py               LLM / Embedding / 视觉客户端封装 + 跨服务商结构化输出 + mock 流
+├── persona.py           System Prompt 组装（人设 + 档案 + 记忆 + 知识 + 数据 + 医疗护栏）
+├── vectorstore.py       pgvector RAG 检索（余弦 + 阈值 + 来源；不可用抛 RagUnavailable）
+├── tools.py             Agent 工具集（闭包捕获 user_id，只读，用户隔离）
+├── checkpoint.py        LangGraph 官方 PostgresSaver + 线程适配 + 降级（会话记忆）
+├── memstore.py          LangGraph 官方 PostgresStore + 线程适配 + 降级（长期记忆）
+├── longterm.py          长期记忆抽取引擎（每轮后台 LLM 抽取 add/update/delete）
+├── persistence.py       PostgreSQL 会话与消息持久层（幂等建表、事务删会话、中止兜底保存）
+├── pg_store.py          PostgreSQL 健康报告 + ai_cache 温层缓存
+├── cache.py             两级缓存门面（Redis 热 + ai_cache 温；单飞 + TTL 抖动）
+├── memory.py            Redis 通用缓存与原子计数（Lua 脚本）
+├── limits.py            用户级并发闸（Redis 共享计数 + 进程内兜底）
+├── clients.py           业务微服务只读客户端（httpx，注入 X-User-Id，失败降级为空）
+├── media.py             多模态附件（类型/大小校验、OSS 直传、音频转写、SSRF 防护）
+├── oss.py               阿里云 OSS 封装
+├── schemas.py           Pydantic 模型（请求/响应 + LLM 结构化输出 schema）
+└── nacos_client.py      Nacos 注册（SDK + OpenAPI 双保险 + 自建心跳保活）
+```
