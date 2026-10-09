@@ -1,4 +1,4 @@
-# PetVerse AI 服务（ai-service）
+  # PetVerse AI 服务（ai-service）
 
 基于 FastAPI 的 AI 能力微服务，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供服务。内部统一使用 **LangGraph** 编排，对话模型与 Embedding 均为 **OpenAI 兼容格式**（改 `base_url` + `model` 即可切换 DeepSeek / 阿里云百炼等任意服务商）。
 

@@ -74,6 +74,19 @@ spring:
 auth:
   # 免鉴权路径白名单，逗号分隔，支持前缀匹配
   whitelist-paths: /api/user/login,/api/user/register
+  # 游客免登录可浏览的只读接口，逗号分隔，Ant 风格匹配，且仅对 GET 生效（写操作仍要求登录）。
+  # 必须逐条精确到资源，不能用 /api/shop、/api/space 这类上层前缀，否则会连带放开购物车/订单/发布等接口
+  public-get-paths: >-
+    /api/space/*,
+    /api/remark/comment/page,
+    /api/remark/comment/counts,
+    /api/remark/like/batch,
+    /api/shop/product/page,
+    /api/shop/product/*,
+    /api/shop/store/*,
+    /api/shop/review/page,
+    /api/shop/review/reply/page,
+    /api/shop/review/summary/*
 
 petverse:
   gateway:

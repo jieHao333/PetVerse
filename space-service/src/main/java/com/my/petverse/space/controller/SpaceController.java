@@ -29,22 +29,22 @@ public class SpaceController {
 
     private final SpaceService spaceService;
 
-    /** 根据ID查询动态，按当前用户可见性过滤，无权查看时视为不存在 */
+    /** 根据ID查询动态，按当前用户可见性过滤，无权查看时视为不存在；游客可读，未登录返回 null 身份 */
     @GetMapping("/{id}")
     public Result<SpaceVO> getById(@PathVariable("id") Long id) {
-        return Result.success(spaceService.getVisibleSpace(id, UserContext.getUserId()));
+        return Result.success(spaceService.getVisibleSpace(id, UserContext.peekUserId()));
     }
 
-    /** 查询当前用户可见的动态列表 */
+    /** 查询当前用户可见的动态列表（游客只见公开动态） */
     @GetMapping("/list")
     public Result<List<SpaceVO>> list() {
-        return Result.success(spaceService.listSpaces(UserContext.getUserId()));
+        return Result.success(spaceService.listSpaces(UserContext.peekUserId()));
     }
 
-    /** 分页查询当前用户可见的动态 */
+    /** 分页查询当前用户可见的动态（游客只见公开动态） */
     @GetMapping("/page")
     public Result<PageResult<SpaceVO>> page(SpacePageQueryDTO query) {
-        return Result.success(spaceService.pageSpaces(query, UserContext.getUserId()));
+        return Result.success(spaceService.pageSpaces(query, UserContext.peekUserId()));
     }
 
     /** 发布动态，同时为宠物发放经验奖励（作者ID取自登录令牌，不接受客户端传入） */

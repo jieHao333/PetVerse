@@ -10,11 +10,13 @@ import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
 import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
@@ -28,7 +30,8 @@ import java.util.stream.Collectors;
 
 /**
  * 网关 JWT 鉴权过滤器
- * 除白名单路径外，所有请求必须携带有效令牌；
+ * 除白名单路径外，所有请求必须携带有效令牌；游客例外——auth.public-get-paths 里的 GET 接口
+ * （圈子与商城的浏览类接口）可无令牌访问，携带有效令牌时仍会解析并注入身份，保证点赞状态等个性化字段正常；
  * 先剥离客户端携带的 X-User-Id/X-User-Role 请求头防止伪造，
  * 校验令牌后再把解析出的用户ID与角色注入请求头透传给下游服务；
  * 同时拦截外部对内部接口（/internal/）的访问，并对管理端/商家端路径做角色校验
@@ -60,6 +63,16 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
     @Value("${auth.whitelist-paths:/api/user/login,/api/user/register}")
     private String whitelistPaths;
 
+    /**
+     * 游客可匿名读取的接口，逗号分隔，支持 Ant 风格通配（? 单层、* 单层、** 多层）。
+     * 只对 GET 生效，写操作仍要求登录；用 Ant 精确匹配而非前缀匹配，
+     * 避免放开 /api/space 时把 POST/PUT/DELETE 等写接口一起放进来的越权风险
+     */
+    @Value("${auth.public-get-paths:}")
+    private String publicGetPaths;
+
+    private final AntPathMatcher antPathMatcher = new AntPathMatcher();
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         String path = exchange.getRequest().getURI().getPath();
@@ -82,7 +95,12 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
         }
         // 校验 Authorization: Bearer <token>
         String token = resolveToken(sanitized.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION));
+        boolean guestReadable = HttpMethod.GET.equals(exchange.getRequest().getMethod()) && isPublicGet(path);
         if (!StringUtils.hasText(token)) {
+            // 游客读公开数据：不放行身份头，下游按未登录取默认值（如点赞状态、是否可评价）
+            if (guestReadable) {
+                return chain.filter(sanitized);
+            }
             return unauthorized(exchange, "未登录");
         }
         Long userId;
@@ -94,6 +112,10 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             String claimRole = claims.get("role", String.class);
             role = StringUtils.hasText(claimRole) ? claimRole : "USER";
         } catch (Exception e) {
+            // 令牌失效时公开只读接口降级为游客，页面不至于整块报错
+            if (guestReadable) {
+                return chain.filter(sanitized);
+            }
             return unauthorized(exchange, "登录已失效，请重新登录");
         }
         // 管理端接口仅限管理员访问（角色取自令牌签发时刻，变更角色后需重新登录）
@@ -132,6 +154,17 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             }
         }
         return false;
+    }
+
+    /** 判断路径是否命中游客可读列表（Ant 风格模式逐个比对） */
+    private boolean isPublicGet(String path) {
+        if (!StringUtils.hasText(publicGetPaths)) {
+            return false;
+        }
+        return Arrays.stream(publicGetPaths.split(","))
+                .map(String::trim)
+                .filter(StringUtils::hasText)
+                .anyMatch(pattern -> antPathMatcher.match(pattern, path));
     }
 
     /** 返回 401 统一 JSON 结果 */

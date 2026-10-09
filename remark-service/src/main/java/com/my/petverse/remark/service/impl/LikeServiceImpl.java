@@ -93,31 +93,37 @@ public class LikeServiceImpl implements LikeService {
     public LikeBatchVO batchQuery(Integer targetType, List<Long> targetIds, Long userId) {
         checkTargetType(targetType);
         List<Long> ids = limitTargets(targetIds);
-        Map<Long, Long> counts = new HashMap<>();
-        Set<Long> likedIds = new HashSet<>();
-        if (!ids.isEmpty()) {
-            ensureLoadedBatch(targetType, ids);
-            byte[] rawUserId = raw(String.valueOf(userId));
-            // 整页对象的点赞数与当前用户点赞状态一次 pipeline 发出，避免逐条往返 Redis
-            List<Object> results = pipeline(connection -> {
-                RedisSetCommands sets = connection.setCommands();
-                for (Long targetId : ids) {
-                    byte[] rawKey = raw(setKey(targetType, targetId));
-                    sets.sCard(rawKey);
-                    sets.sIsMember(rawKey, rawUserId);
-                }
-            });
-            for (int i = 0; i < ids.size(); i++) {
-                Long targetId = ids.get(i);
-                counts.put(targetId, toLong(resultAt(results, i * 2)));
-                if (Boolean.TRUE.equals(resultAt(results, i * 2 + 1))) {
-                    likedIds.add(targetId);
-                }
+        LikeBatchVO vo = new LikeBatchVO();
+        vo.setCounts(new HashMap<>());
+        vo.setLikedIds(new HashSet<>());
+        if (ids.isEmpty()) {
+            return vo;
+        }
+        ensureLoadedBatch(targetType, ids);
+        if (userId == null) {
+            // 游客只关心点赞数，不必为每个对象多问一次「是否点过赞」
+            vo.setCounts(loadCounts(targetType, ids));
+            return vo;
+        }
+        byte[] rawUserId = raw(String.valueOf(userId));
+        // 整页对象的点赞数与当前用户点赞状态一次 pipeline 发出，避免逐条往返 Redis
+        List<Object> results = pipeline(connection -> {
+            RedisSetCommands sets = connection.setCommands();
+            for (Long targetId : ids) {
+                byte[] rawKey = raw(setKey(targetType, targetId));
+                sets.sCard(rawKey);
+                sets.sIsMember(rawKey, rawUserId);
+            }
+        });
+        Map<Long, Long> counts = vo.getCounts();
+        Set<Long> likedIds = vo.getLikedIds();
+        for (int i = 0; i < ids.size(); i++) {
+            Long targetId = ids.get(i);
+            counts.put(targetId, toLong(resultAt(results, i * 2)));
+            if (Boolean.TRUE.equals(resultAt(results, i * 2 + 1))) {
+                likedIds.add(targetId);
             }
         }
-        LikeBatchVO vo = new LikeBatchVO();
-        vo.setCounts(counts);
-        vo.setLikedIds(likedIds);
         return vo;
     }
 
@@ -125,18 +131,22 @@ public class LikeServiceImpl implements LikeService {
     public Map<Long, Long> batchCounts(Integer targetType, List<Long> targetIds) {
         checkTargetType(targetType);
         List<Long> ids = limitTargets(targetIds);
-        Map<Long, Long> counts = new HashMap<>();
         if (ids.isEmpty()) {
-            return counts;
+            return new HashMap<>();
         }
         ensureLoadedBatch(targetType, ids);
-        // 只取计数时每个对象一条 SCARD，同样一次 pipeline 完成
+        return loadCounts(targetType, ids);
+    }
+
+    /** 一次 pipeline 取出整页对象的点赞数 */
+    private Map<Long, Long> loadCounts(Integer targetType, List<Long> ids) {
         List<Object> results = pipeline(connection -> {
             RedisSetCommands sets = connection.setCommands();
             for (Long targetId : ids) {
                 sets.sCard(raw(setKey(targetType, targetId)));
             }
         });
+        Map<Long, Long> counts = new HashMap<>();
         for (int i = 0; i < ids.size(); i++) {
             counts.put(ids.get(i), toLong(resultAt(results, i)));
         }

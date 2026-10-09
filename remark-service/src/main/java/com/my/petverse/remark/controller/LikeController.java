@@ -44,11 +44,11 @@ public class LikeController {
         return Result.success(true);
     }
 
-    /** 批量查询点赞数与当前用户是否点赞，targetIds 逗号分隔 */
+    /** 批量查询点赞数与当前用户是否点赞，targetIds 逗号分隔；游客可读，未登录时 likedIds 恒为空 */
     @GetMapping("/batch")
     public Result<LikeBatchVO> batch(@RequestParam("targetType") Integer targetType,
                                      @RequestParam("targetIds") String targetIds) {
-        return Result.success(likeService.batchQuery(targetType, parseIds(targetIds), UserContext.getUserId()));
+        return Result.success(likeService.batchQuery(targetType, parseIds(targetIds), UserContext.peekUserId()));
     }
 
     /** 批量查询点赞数（仅计数），供其他服务内部 Feign 调用 */

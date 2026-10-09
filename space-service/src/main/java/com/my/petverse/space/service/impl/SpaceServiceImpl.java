@@ -202,9 +202,14 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
 
     /**
      * 追加可见性过滤条件：公开动态、本人动态始终可见；
-     * 仅好友动态在作者是当前用户的好友时可见（好友关系双向对称）
+     * 仅好友动态在作者是当前用户的好友时可见（好友关系双向对称）；
+     * 游客（callerId 为 null）只看公开动态，也不去查好友列表
      */
     private void applyVisibility(LambdaQueryWrapper<Space> wrapper, Long callerId) {
+        if (callerId == null) {
+            wrapper.eq(Space::getVisibility, SpaceVisibility.PUBLIC.getCode());
+            return;
+        }
         List<Long> friendIds = listFriendIdsQuietly(callerId);
         wrapper.and(w -> {
             w.eq(Space::getVisibility, SpaceVisibility.PUBLIC.getCode())
@@ -216,7 +221,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         });
     }
 
-    /** 判断动态对指定用户是否可见 */
+    /** 判断动态对指定用户是否可见，callerId 为 null 表示游客 */
     private boolean isVisibleTo(Space space, Long callerId) {
         // 作者本人始终可见（含仅自己）
         if (space.getUserId() != null && space.getUserId().equals(callerId)) {
@@ -227,13 +232,16 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
             return true;
         }
         if (visibility == SpaceVisibility.FRIENDS_ONLY) {
-            return listFriendIdsQuietly(space.getUserId()).contains(callerId);
+            return callerId != null && listFriendIdsQuietly(space.getUserId()).contains(callerId);
         }
         return false;
     }
 
     /** 调用社交服务获取好友ID，失败时降级为空列表（仅能看到公开动态） */
     private List<Long> listFriendIdsQuietly(Long userId) {
+        if (userId == null) {
+            return List.of();
+        }
         try {
             Result<List<Long>> result = socialFeignClient.listFriendIds(userId);
             if (result != null && result.getCode() == ResultCode.SUCCESS.getCode() && result.getData() != null) {
