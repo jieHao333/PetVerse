@@ -24,8 +24,8 @@ public class SpaceSaveDTO implements Serializable {
     @NotBlank(message = "内容不能为空")
     private String content;
 
-    /** 动态分类 */
-    @Size(max = 50, message = "分类不能超过50个字符")
+    /** 话题（多个以英文逗号分隔，最多 6 个） */
+    @Size(max = 255, message = "话题总长度不能超过255个字符")
     private String category;
 
     /** 关联的宠物ID，可为空 */

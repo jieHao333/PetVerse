@@ -12,13 +12,16 @@
 -- 三、已有环境升级（点赞功能）：为 space 表补充点赞数冗余列，由点赞服务定时同步，用于热度排序：
 -- ALTER TABLE petverse_space.space ADD COLUMN like_count INT NOT NULL DEFAULT 0 COMMENT '点赞数(由remark-service定时同步，用于热度排序)';
 -- ALTER TABLE petverse_space.space ADD KEY idx_like_count (like_count);
+--
+-- 四、已有环境升级（多话题）：放宽 category 列以容纳最多 6 个逗号分隔话题：
+-- ALTER TABLE petverse_space.space MODIFY COLUMN category VARCHAR(255) DEFAULT NULL COMMENT '话题(多个以英文逗号分隔,最多6个)';
 
 CREATE TABLE IF NOT EXISTS `space`
 (
     id          BIGINT   NOT NULL COMMENT '主键(雪花ID)',
     title       VARCHAR(100) DEFAULT NULL COMMENT '动态标题(可选)',
     content     TEXT     NOT NULL COMMENT '动态内容',
-    category    VARCHAR(50)  DEFAULT NULL COMMENT '动态分类',
+    category    VARCHAR(255) DEFAULT NULL COMMENT '话题(多个以英文逗号分隔,最多6个)',
     pet_id      BIGINT       DEFAULT NULL COMMENT '关联的宠物ID，可为空',
     user_id     BIGINT   NOT NULL COMMENT '所属用户ID',
     visibility  TINYINT  NOT NULL DEFAULT 0 COMMENT '可见性 0-公开 1-仅好友 2-仅自己',

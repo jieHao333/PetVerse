@@ -44,6 +44,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -85,6 +86,12 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     /** 单条动态媒体数量上限 */
     private static final int MAX_MEDIA_COUNT = 9;
 
+    /** 单条动态话题数量上限 */
+    private static final int MAX_TOPIC_COUNT = 6;
+
+    /** 话题分隔符（数据库以逗号拼接存储） */
+    private static final String TOPIC_SEPARATOR = ",";
+
     /** 图片大小上限：5MB */
     private static final long MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 
@@ -99,6 +106,16 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
 
     /** OSS存储路径中的日期目录格式 */
     private static final DateTimeFormatter MEDIA_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+
+    /**
+     * 圈子默认的综合热度排序 SQL：由点赞数与发布时间共同决定，越新、点赞越多越靠前。
+     * 采用 Hacker News 式重力衰减：热度分 =（点赞数 + 基准权重）/（发布至今小时数 + 2）^重力系数，
+     * 相同热度再按发布时间倒序兜底。纯常量表达式不含用户输入，可安全用 last() 追加在分页 LIMIT 之前。
+     */
+    private static final String HOT_SCORE_ORDER_BY =
+            "ORDER BY ((IFNULL(like_count, 0) + 2) / "
+                    + "POW(TIMESTAMPDIFF(MINUTE, IFNULL(create_time, NOW()), NOW()) / 60.0 + 2, 1.3)) DESC, "
+                    + "create_time DESC";
 
     /** 根据ID查询动态（不校验可见性，仅供归属校验等内部使用） */
     @Override
@@ -145,7 +162,8 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
             }
         }
         LambdaQueryWrapper<Space> wrapper = new LambdaQueryWrapper<Space>()
-                .eq(StringUtils.hasText(query.getCategory()), Space::getCategory, query.getCategory())
+                // 话题以逗号拼接存储，用 FIND_IN_SET 精确匹配包含该话题的动态（{0} 为参数占位，防注入）
+                .apply(StringUtils.hasText(query.getCategory()), "FIND_IN_SET({0}, category)", query.getCategory())
                 .eq(query.getPetId() != null, Space::getPetId, query.getPetId())
                 .eq(query.getUserId() != null, Space::getUserId, query.getUserId())
                 .ge(query.getStartTime() != null, Space::getCreateTime, query.getStartTime())
@@ -154,11 +172,12 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         if (StringUtils.hasText(keyword)) {
             wrapper.and(w -> w.like(Space::getTitle, keyword).or().like(Space::getContent, keyword));
         }
-        // 热度排序按点赞数倒序，相同则按发布时间兜底；默认按最新排序
-        if ("hot".equalsIgnoreCase(query.getSort())) {
-            wrapper.orderByDesc(Space::getLikeCount).orderByDesc(Space::getCreateTime);
-        } else {
+        // 排序：latest-按发布时间倒序（我的动态/用户主页时间线沿用）；
+        // 默认（圈子）按点赞数与发布时间的综合热度排序，不再提供单纯的按时间排序开关
+        if ("latest".equalsIgnoreCase(query.getSort())) {
             wrapper.orderByDesc(Space::getCreateTime);
+        } else {
+            wrapper.last(HOT_SCORE_ORDER_BY);
         }
         applyVisibility(wrapper, callerId);
         Page<Space> page = page(new Page<>(query.getPageNum(), query.getPageSize()), wrapper);
@@ -351,6 +370,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
     public SpaceCreateVO saveSpace(SpaceSaveDTO dto) {
         Space space = new Space();
         BeanUtils.copyProperties(dto, space, "mediaList");
+        space.setCategory(normalizeTopics(dto.getCategory()));
         // 可见性缺省为公开，非法值拒绝
         Integer visibility = checkVisibility(dto.getVisibility());
         space.setVisibility(visibility == null ? SpaceVisibility.PUBLIC.getCode() : visibility);
@@ -380,6 +400,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         checkVisibility(dto.getVisibility());
         Integer originalVisibility = space.getVisibility();
         BeanUtils.copyProperties(dto, space, "mediaList");
+        space.setCategory(normalizeTopics(dto.getCategory()));
         // 可见性未传时保持原值（BeanUtils 会用 null 覆盖）
         if (dto.getVisibility() == null) {
             space.setVisibility(originalVisibility);
@@ -483,6 +504,25 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
             throw new BusinessException(ResultCode.BAD_REQUEST, "无效的动态可见性");
         }
         return visibility;
+    }
+
+    /** 规范化话题：去空白、去重后以逗号拼接；超过上限拒绝；无有效话题返回 null */
+    private String normalizeTopics(String category) {
+        if (!StringUtils.hasText(category)) {
+            return null;
+        }
+        List<String> topics = Arrays.stream(category.split(TOPIC_SEPARATOR))
+                .map(String::trim)
+                .filter(StringUtils::hasText)
+                .distinct()
+                .collect(Collectors.toList());
+        if (topics.isEmpty()) {
+            return null;
+        }
+        if (topics.size() > MAX_TOPIC_COUNT) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "最多添加 " + MAX_TOPIC_COUNT + " 个话题");
+        }
+        return String.join(TOPIC_SEPARATOR, topics);
     }
 
     /** DO 转 VO */

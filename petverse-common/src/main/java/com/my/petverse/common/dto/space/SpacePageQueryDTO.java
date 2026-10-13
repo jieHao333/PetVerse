@@ -39,6 +39,6 @@ public class SpacePageQueryDTO extends BasePageQuery {
     @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime endTime;
 
-    /** 排序方式：latest-最新(默认) / hot-按点赞数热度 */
+    /** 排序方式：latest-按发布时间倒序（我的动态/用户主页时间线）；留空或其他值-综合热度(点赞数+发布时间)排序，为圈子默认 */
     private String sort;
 }

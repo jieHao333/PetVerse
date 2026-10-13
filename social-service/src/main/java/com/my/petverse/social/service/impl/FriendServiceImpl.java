@@ -6,26 +6,23 @@ import com.my.petverse.common.dto.social.FriendRequestSendDTO;
 import com.my.petverse.common.entity.social.FriendRequest;
 import com.my.petverse.common.entity.social.Friendship;
 import com.my.petverse.common.exception.BusinessException;
-import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
+import com.my.petverse.common.vo.social.FriendRelationVO;
 import com.my.petverse.common.vo.social.FriendRequestVO;
 import com.my.petverse.common.vo.social.FriendVO;
 import com.my.petverse.common.vo.user.UserVO;
-import com.my.petverse.social.feign.UserFeignClient;
 import com.my.petverse.social.mapper.FriendRequestMapper;
 import com.my.petverse.social.mapper.FriendshipMapper;
 import com.my.petverse.social.service.FriendService;
+import com.my.petverse.social.support.UserProfileLoader;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -47,7 +44,7 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
 
     private final FriendshipMapper friendshipMapper;
 
-    private final UserFeignClient userFeignClient;
+    private final UserProfileLoader userProfileLoader;
 
     /** 发起好友申请 */
     @Override
@@ -91,7 +88,7 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
                 .last("limit 50"));
         List<FriendRequestVO> result = new ArrayList<>();
         // 申请人资料一次批量查询，申请记录逐条聚合
-        Map<Long, UserVO> users = loadUsersQuietly(requests.stream()
+        Map<Long, UserVO> users = userProfileLoader.loadQuietly(requests.stream()
                 .map(FriendRequest::getFromUserId)
                 .collect(Collectors.toSet()));
         for (FriendRequest request : requests) {
@@ -145,7 +142,7 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
                 .orderByDesc(Friendship::getCreateTime));
         List<FriendVO> result = new ArrayList<>();
         // 好友资料一次批量查询，关系记录逐条聚合
-        Map<Long, UserVO> users = loadUsersQuietly(friendships.stream()
+        Map<Long, UserVO> users = userProfileLoader.loadQuietly(friendships.stream()
                 .map(Friendship::getFriendUserId)
                 .collect(Collectors.toSet()));
         for (Friendship friendship : friendships) {
@@ -179,6 +176,26 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
             ids.add(friendship.getFriendUserId());
         }
         return ids;
+    }
+
+    /** 查询我与指定用户之间的好友关系状态：是否好友、我是否已发起待处理申请、对方是否有待我处理的申请 */
+    @Override
+    public FriendRelationVO getRelation(Long userId, Long targetUserId) {
+        FriendRelationVO vo = new FriendRelationVO();
+        vo.setUserId(targetUserId);
+        vo.setFriend(isFriend(userId, targetUserId));
+        vo.setRequestSent(count(new LambdaQueryWrapper<FriendRequest>()
+                .eq(FriendRequest::getFromUserId, userId)
+                .eq(FriendRequest::getToUserId, targetUserId)
+                .eq(FriendRequest::getStatus, STATUS_PENDING)) > 0);
+        FriendRequest received = getOne(new LambdaQueryWrapper<FriendRequest>()
+                .eq(FriendRequest::getFromUserId, targetUserId)
+                .eq(FriendRequest::getToUserId, userId)
+                .eq(FriendRequest::getStatus, STATUS_PENDING)
+                .orderByDesc(FriendRequest::getCreateTime)
+                .last("limit 1"));
+        vo.setReceivedRequestId(received == null ? null : received.getId());
+        return vo;
     }
 
     /** 删除好友，双向解除关系 */
@@ -229,36 +246,5 @@ public class FriendServiceImpl extends ServiceImpl<FriendRequestMapper, FriendRe
         friendship.setUserId(userId);
         friendship.setFriendUserId(friendUserId);
         friendshipMapper.insert(friendship);
-    }
-
-    /** 批量查询用户资料：一次请求聚合整页用户，失败或用户已注销时返回空表，由调用方降级展示 */
-    private Map<Long, UserVO> loadUsersQuietly(Collection<Long> userIds) {
-        List<Long> ids = userIds.stream()
-                .filter(Objects::nonNull)
-                .distinct()
-                .collect(Collectors.toList());
-        if (ids.isEmpty()) {
-            return Map.of();
-        }
-        try {
-            Result<List<UserVO>> result = userFeignClient.listByIds(ids);
-            if (result == null) {
-                log.warn("用户服务返回空结果，用户数={}", ids.size());
-                return Map.of();
-            }
-            if (result.getCode() != ResultCode.SUCCESS.getCode()) {
-                log.warn("用户服务返回异常状态码，用户数={}, code={}, msg={}", ids.size(), result.getCode(), result.getMsg());
-                return Map.of();
-            }
-            if (result.getData() == null) {
-                return Map.of();
-            }
-            return result.getData().stream()
-                    .filter(user -> user.getId() != null)
-                    .collect(Collectors.toMap(UserVO::getId, Function.identity(), (a, b) -> a));
-        } catch (Exception e) {
-            log.warn("批量查询用户资料失败，用户数={}", ids.size(), e);
-            return Map.of();
-        }
     }
 }

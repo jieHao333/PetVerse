@@ -1,6 +1,7 @@
 package com.my.petverse.social.service;
 
 import com.my.petverse.common.dto.social.FriendRequestSendDTO;
+import com.my.petverse.common.vo.social.FriendRelationVO;
 import com.my.petverse.common.vo.social.FriendRequestVO;
 import com.my.petverse.common.vo.social.FriendVO;
 
@@ -28,6 +29,9 @@ public interface FriendService {
 
     /** 查询我的好友用户ID列表（供其他服务做可见性判断，不聚合用户资料） */
     List<Long> listFriendIds(Long userId);
+
+    /** 查询我与指定用户之间的好友关系状态（是否好友、申请是否在处理中） */
+    FriendRelationVO getRelation(Long userId, Long targetUserId);
 
     /** 删除好友（双向解除） */
     boolean removeFriend(Long userId, Long friendUserId);

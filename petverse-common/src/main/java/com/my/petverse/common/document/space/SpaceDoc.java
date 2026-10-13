@@ -8,6 +8,7 @@ import org.springframework.data.elasticsearch.annotations.FieldType;
 import org.springframework.data.elasticsearch.annotations.Setting;
 
 import java.io.Serializable;
+import java.util.List;
 
 /**
  * 宠域空间动态的 Elasticsearch 文档，用于替代数据库 LIKE 的全文检索。
@@ -30,9 +31,9 @@ public class SpaceDoc implements Serializable {
     @Field(type = FieldType.Text, analyzer = "ik_max_word", searchAnalyzer = "ik_smart")
     private String content;
 
-    /** 动态分类，精确过滤 */
+    /** 话题列表（Keyword 数组，term 精确匹配数组中任一话题） */
     @Field(type = FieldType.Keyword)
-    private String category;
+    private List<String> category;
 
     /** 关联的宠物ID，精确过滤 */
     @Field(type = FieldType.Long)

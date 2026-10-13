@@ -3,6 +3,7 @@ package com.my.petverse.social.controller;
 import com.my.petverse.common.context.UserContext;
 import com.my.petverse.common.dto.social.FriendRequestSendDTO;
 import com.my.petverse.common.result.Result;
+import com.my.petverse.common.vo.social.FriendRelationVO;
 import com.my.petverse.common.vo.social.FriendRequestVO;
 import com.my.petverse.common.vo.social.FriendVO;
 import com.my.petverse.social.service.FriendService;
@@ -57,6 +58,12 @@ public class FriendController {
     @GetMapping("/ids")
     public Result<List<Long>> listFriendIds() {
         return Result.success(friendService.listFriendIds(UserContext.getUserId()));
+    }
+
+    /** 查询我与指定用户的好友关系状态（用户主页、聊天页据此展示按钮） */
+    @GetMapping("/relation/{targetUserId}")
+    public Result<FriendRelationVO> relation(@PathVariable("targetUserId") Long targetUserId) {
+        return Result.success(friendService.getRelation(UserContext.getUserId(), targetUserId));
     }
 
     /** 内部接口：按用户ID查其好友ID列表（服务间 Feign 直调，不经网关无身份头） */

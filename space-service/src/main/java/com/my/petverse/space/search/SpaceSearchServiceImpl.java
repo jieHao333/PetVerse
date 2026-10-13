@@ -30,6 +30,7 @@ import org.springframework.util.StringUtils;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -229,16 +230,16 @@ public class SpaceSearchServiceImpl implements SpaceSearchService {
         return bool.build();
     }
 
-    /** 热度排序以点赞数为主、相关度兜底；其余情况相关度优先，再按发布时间倒序 */
+    /** latest：按发布时间倒序（我的动态/用户主页时间线）；
+     *  默认综合排序：检索场景以相关度为主，点赞数与发布时间作为热度次级排序 */
     private List<SortOptions> buildSort(SpacePageQueryDTO query) {
-        SortOptions byScore = SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc)));
-        if ("hot".equalsIgnoreCase(query.getSort())) {
+        if ("latest".equalsIgnoreCase(query.getSort())) {
             return List.of(
-                    SortOptions.of(s -> s.field(f -> f.field("likeCount").order(SortOrder.Desc))),
-                    byScore);
+                    SortOptions.of(s -> s.field(f -> f.field("createTime").order(SortOrder.Desc))));
         }
         return List.of(
-                byScore,
+                SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc))),
+                SortOptions.of(s -> s.field(f -> f.field("likeCount").order(SortOrder.Desc))),
                 SortOptions.of(s -> s.field(f -> f.field("createTime").order(SortOrder.Desc))));
     }
 
@@ -248,7 +249,7 @@ public class SpaceSearchServiceImpl implements SpaceSearchService {
         doc.setId(String.valueOf(space.getId()));
         doc.setTitle(space.getTitle());
         doc.setContent(space.getContent());
-        doc.setCategory(space.getCategory());
+        doc.setCategory(splitTopics(space.getCategory()));
         doc.setPetId(space.getPetId());
         doc.setUserId(space.getUserId());
         doc.setVisibility(space.getVisibility());
@@ -256,6 +257,18 @@ public class SpaceSearchServiceImpl implements SpaceSearchService {
         doc.setCreateTime(space.getCreateTime() == null
                 ? System.currentTimeMillis() : toEpochMilli(space.getCreateTime()));
         return doc;
+    }
+
+    /** 将逗号拼接的话题拆分为列表，供 ES Keyword 数组做精确过滤 */
+    private List<String> splitTopics(String category) {
+        if (!StringUtils.hasText(category)) {
+            return List.of();
+        }
+        return Arrays.stream(category.split(","))
+                .map(String::trim)
+                .filter(StringUtils::hasText)
+                .distinct()
+                .toList();
     }
 
     private long toEpochMilli(LocalDateTime time) {
