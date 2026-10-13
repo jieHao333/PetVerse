@@ -47,4 +47,4 @@ secrets-local.yml
 ### 若需在本地保存填入真实密钥的副本，请命名为 *-local.yml，已被忽略、禁止提交 ###
 nacos-config/*-local.yml
 
-PetVerseSingle/
+/PetVerseSingle/
