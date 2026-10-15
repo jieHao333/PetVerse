@@ -83,6 +83,13 @@ class BizClient:
                               user_id=user_id)
         return _records(data)
 
+    async def search_posts(self, keyword: str, limit: int = 8, user_id: int = 0) -> List[dict]:
+        """按关键词检索动态（热度排序；标题+正文全文检索，ES 不可用时库内模糊匹配）"""
+        data = await self.get(settings.SPACE_SERVICE_URL, "/space/page",
+                              params={"keyword": keyword, "sort": "hot", "pageNum": 1, "pageSize": limit},
+                              user_id=user_id)
+        return _records(data)
+
     async def get_my_posts(self, user_id: int, limit: int = 10) -> List[dict]:
         """当前用户发布的动态"""
         data = await self.get(settings.SPACE_SERVICE_URL, "/space/page",
