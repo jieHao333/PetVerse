@@ -84,15 +84,15 @@ class ChatState(TypedDict, total=False):
 def _rule_intent(query: str) -> str:
     """关键词规则意图识别（mock / 降级）"""
     q = query.lower()
-    if any(w in query for w in _URGENT_WORDS):
+    if any(w in q for w in _URGENT_WORDS):
         return "medical_urgent"
-    if any(w in query for w in _MEDICAL_WORDS):
+    if any(w in q for w in _MEDICAL_WORDS):
         return "medical_urgent"
-    if any(w in query for w in _TOOL_WORDS):
+    if any(w in q for w in _TOOL_WORDS):
         return "tool_query"
-    if any(w in query for w in _HEALTH_WORDS):
+    if any(w in q for w in _HEALTH_WORDS):
         return "health"
-    if any(w in query for w in _CHITCHAT_WORDS) or len(query.strip()) <= 2:
+    if any(w in q for w in _CHITCHAT_WORDS) or len(query.strip()) <= 2:
         return "chitchat"
     return "knowledge"
 
