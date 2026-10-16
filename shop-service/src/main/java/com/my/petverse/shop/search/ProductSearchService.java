@@ -4,6 +4,8 @@ import com.my.petverse.common.dto.shop.ProductPageQueryDTO;
 import com.my.petverse.common.entity.shop.Product;
 import com.my.petverse.common.result.PageResult;
 
+import java.util.Set;
+
 /**
  * 商品全文检索服务：Elasticsearch 只作为检索索引，展示数据仍以 MySQL 为准。
  * 所有方法在 ES 不可用时均不抛异常，由调用方降级为数据库查询。
@@ -33,4 +35,12 @@ public interface ProductSearchService {
      * @return ES 不可用或检索失败时返回 null，调用方需降级为数据库查询
      */
     PageResult<Long> searchIds(ProductPageQueryDTO query, String keyword, Integer status, Long merchantId);
+
+    /**
+     * 拉取索引中全部商品ID，供索引对账任务比对 MySQL 与 ES 的差集使用。
+     * 分页扫描，受 ES from+size 上限约束，单次最多覆盖一万条，超出部分记日志提示。
+     *
+     * @return ES 不可用或扫描失败时返回 null
+     */
+    Set<Long> listIndexedIds();
 }

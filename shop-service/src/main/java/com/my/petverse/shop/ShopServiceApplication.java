@@ -4,6 +4,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
 import org.springframework.cloud.openfeign.EnableFeignClients;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 商城服务启动类（商家入驻/审批/商品）
@@ -12,6 +13,7 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
 @SpringBootApplication(scanBasePackages = "com.my.petverse")
 @EnableDiscoveryClient
 @EnableFeignClients
+@EnableScheduling
 public class ShopServiceApplication {
 
     public static void main(String[] args) {

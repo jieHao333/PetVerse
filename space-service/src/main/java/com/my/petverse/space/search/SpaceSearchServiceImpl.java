@@ -31,8 +31,10 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 动态全文检索服务实现：写入时双写索引，检索时只取文档ID再回表。
@@ -56,6 +58,12 @@ public class SpaceSearchServiceImpl implements SpaceSearchService {
 
     /** 全量重建索引时的每批条数 */
     private static final int REINDEX_BATCH_SIZE = 500;
+
+    /** 索引ID全量扫描单页条数 */
+    private static final int ID_SCAN_PAGE_SIZE = 1000;
+
+    /** 索引ID全量扫描最大页数（ES 默认 from+size 单次不超过一万） */
+    private static final int ID_SCAN_MAX_PAGES = 10;
 
     /** 降级截止时间戳，该时刻之前不再访问 ES */
     private volatile long degradedUntil = 0L;
@@ -167,6 +175,40 @@ public class SpaceSearchServiceImpl implements SpaceSearchService {
             return PageResult.of(hits.getTotalHits(), query.getPageNum(), query.getPageSize(), ids);
         } catch (Exception e) {
             markDegraded("动态全文检索失败，降级为数据库模糊查询，keyword=" + keyword, e);
+            return null;
+        }
+    }
+
+    @Override
+    public Set<Long> listIndexedIds() {
+        if (!isAvailable()) {
+            return null;
+        }
+        try {
+            Set<Long> ids = new HashSet<>();
+            // 仅按发布时间排序分页扫描文档ID，不取正文内容，降低单页开销
+            for (int page = 0; page < ID_SCAN_MAX_PAGES; page++) {
+                NativeQuery nativeQuery = NativeQuery.builder()
+                        .withQuery(q -> q.matchAll(m -> m))
+                        .withSort(SortOptions.of(s -> s.field(f -> f.field("createTime").order(SortOrder.Asc))))
+                        .withPageable(PageRequest.of(page, ID_SCAN_PAGE_SIZE))
+                        .build();
+                List<SearchHit<SpaceDoc>> hits = elasticsearchOperations
+                        .search(nativeQuery, SpaceDoc.class).getSearchHits();
+                if (hits.isEmpty()) {
+                    return ids;
+                }
+                for (SearchHit<SpaceDoc> hit : hits) {
+                    ids.add(Long.valueOf(hit.getContent().getId()));
+                }
+                if (hits.size() < ID_SCAN_PAGE_SIZE) {
+                    return ids;
+                }
+            }
+            log.warn("动态索引ID扫描达到上限 {} 条，更大数据量需改用滚动扫描", ID_SCAN_MAX_PAGES * ID_SCAN_PAGE_SIZE);
+            return ids;
+        } catch (Exception e) {
+            markDegraded("扫描动态索引ID失败，降级为数据库模糊查询", e);
             return null;
         }
     }
