@@ -184,9 +184,7 @@ AI 服务使用独立的 `.env` 配置（LLM / Embedding / PostgreSQL / 缓存 T
 |---|---|
 | [docs/后端开发规范.md](docs/后端开发规范.md) | 模块职责、包结构、命名、分层调用、表结构规范（新人必读） |
 | [docs/Nacos配置中心接入教程.md](docs/Nacos配置中心接入教程.md) | Nacos 配置中心接入：MySQL 持久化、脱敏密钥填写、导入脚本、命名空间、FAQ |
-| [docs/AI模块功能说明.md](docs/AI模块功能说明.md) | AI 模块功能说明书：编排结构、接口契约、存储、配置、降级策略 |
 | [ai-service/README.md](ai-service/README.md) | AI 服务启动、环境变量、接口列表、生产韧性设计 |
-| [docs/秋招项目介绍.md](docs/秋招项目介绍.md) | 项目亮点与设计取舍（了解关键设计意图的来龙去脉） |
 
 ## 协作提醒
 
