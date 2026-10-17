@@ -88,6 +88,10 @@ class HistoryMessage(BaseModel):
     interrupted: bool = False    # assistant 回复是否被用户中止生成（历史回放展示「（已停止）」）
     attachments: List[AttachmentInfo] = Field(default_factory=list,
                                               description="该条消息携带的多模态附件（仅用户消息）")
+    refs: List[Dict[str, Any]] = Field(default_factory=list,
+                                       description="该条回答引用的知识库来源（仅 assistant 消息）："
+                                                   "[{rank, docId, source, docTitle, kind, section, "
+                                                   "category, score, matchedBy, snippet}]")
 
 
 class HistoryData(BaseModel):
@@ -125,6 +129,15 @@ class IntentResult(BaseModel):
 
     intent: IntentType = Field(description="用户本轮问题的意图分类")
     reason: str = Field(default="", description="简要说明分类依据")
+
+
+class SearchQuery(BaseModel):
+    """RAG 检索查询改写（多轮追问 → 自包含检索问法）"""
+
+    query: str = Field(description="可直接用于知识库检索的完整问句：补全指代（它/那个/这种情况）"
+                                   "与前文省略的主体，保留用户原意，不超过 40 字")
+    species: List[str] = Field(default_factory=list,
+                               description="问题涉及的物种，只允许填「猫」或「狗」；同时涉及两者或不确定时留空")
 
 
 class HealthReminder(BaseModel):

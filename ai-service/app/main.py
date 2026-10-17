@@ -29,6 +29,8 @@ from app.chat import router as chat_router
 from app.clients import biz
 from app.config import settings
 from app.health import router as health_router
+from app.kb import store as kb_store
+from app.kb_api import router as kb_router
 from app.logging_setup import setup_logging
 from app.recommend import router as recommend_router
 from app.review import router as review_router
@@ -64,8 +66,12 @@ async def lifespan(app: FastAPI):
     # LangGraph runtime store：长期记忆（用户 / 宠物偏好，跨会话）持久化到
     # PostgreSQL（同库不同表），建表失败的降级与重试由 memstore 模块内部处理
     await memstore.init()
-    # PostgreSQL 连接池：健康评估报告持久化 + AI 结果缓存（pgvector 由 vectorstore 惰性初始化）
+    # PostgreSQL 连接池：健康评估报告持久化 + AI 结果缓存
     await pg_store.init()
+    # 知识库存储（kb_document / kb_chunk + HNSW 向量索引）：RAG 检索与文档管理接口依赖
+    await kb_store.init()
+    if settings.RAG_ENABLED and settings.embedding_enabled:
+        logger.info("知识库规模: %s", await kb_store.stats())
     # Nacos 注册：SDK 是同步库，用 to_thread 丢进后台线程，避免阻塞事件循环
     await asyncio.to_thread(nacos_client.register)
     logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s）",
@@ -78,6 +84,7 @@ async def lifespan(app: FastAPI):
     await biz.close()
     await checkpoint.close()
     await memstore.close()
+    await kb_store.close()
     await pg_store.close()
     await persistence.close()
     await memory.close()
@@ -90,6 +97,7 @@ app = FastAPI(title="PetVerse AI Service", lifespan=lifespan)
 # 挂载各能力路由：对话（/ai/chat/*）、健康评估（/ai/health/*）、
 # 评论摘要（/ai/shop/review/summary）、个性化推荐（/ai/recommend/feed）
 app.include_router(chat_router)
+app.include_router(kb_router)
 app.include_router(health_router)
 app.include_router(review_router)
 app.include_router(recommend_router)

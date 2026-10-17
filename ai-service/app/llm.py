@@ -73,7 +73,7 @@ def get_vision_client():
 def get_embeddings():
     """获取 OpenAIEmbeddings 单例（RAG 向量化用）
 
-    Embedding 未配置时抛出异常，由 vectorstore 转为 RagUnavailable——检索链路
+    Embedding 未配置时抛出异常，由 app/kb/search.py 转为 RagUnavailable——检索链路
     明确失败并向上抛出，由调用方转为错误事件。
     """
     global _embeddings

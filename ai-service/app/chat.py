@@ -30,7 +30,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, File, Header, Path, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from app import checkpoint, limits, llm, longterm, memstore, media, oss, persistence
 from app.config import settings
@@ -75,6 +75,29 @@ _bg_memory_tasks: set = set()
 def _sse(data: dict) -> str:
     """构造一条 SSE 事件（data: JSON + 空行结尾）"""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _ref_items(knowledge: list) -> list:
+    """把检索结果转成前端「参考来源」载荷
+
+    只去掉 content（完整片段用于注入 Prompt，可达数百字）换成 snippet 摘要，
+    其余字段（文档名、类型、小节、分类、相关度、命中方式）都是展示所需。
+    """
+    items = []
+    for item in knowledge or []:
+        items.append({
+            "rank": item.get("rank"),
+            "docId": item.get("doc_id"),
+            "source": item.get("source"),
+            "docTitle": item.get("doc_title") or item.get("source") or "知识库",
+            "kind": item.get("kind") or "md",
+            "section": (item.get("section") or "").split(" > ")[-1],
+            "category": item.get("category") or "",
+            "score": item.get("score") or 0,
+            "matchedBy": item.get("matched_by") or "",
+            "snippet": item.get("snippet") or "",
+        })
+    return items
 
 
 def _spawn_memory_extraction(user_id: int, pet_id: int, pet_name: str,
@@ -162,47 +185,63 @@ async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int
 
 
 async def _pump(stream, queue: asyncio.Queue) -> None:
-    """生产者协程：消费 LLM / mock 流，把片段与结束信号统一搬进队列
+    """生产者协程：把流里的内容搬进队列，统一补上结束与异常信号
+
+    流元素允许两种形态：纯字符串（mock 打字机流，视为助手片段）或
+    (kind, payload) 元组（图流，含 delta 与 refs）。这样让队列消费端只处理一种协议。
 
     这样做是为了让消费端（SSE 生成器）能对"等待下一个片段"做超时心跳，
     而不必直接对 async generator 使用 wait_for（超时取消会破坏生成器状态）。
     """
     try:
-        async for chunk in stream:
-            await queue.put(("delta", chunk))
+        async for event in stream:
+            await queue.put(("delta", event) if isinstance(event, str) else event)
         await queue.put(("end", None))
     except Exception as exc:  # 生产过程中的任何异常都转成队列信号，统一兜底
         await queue.put(("error", exc))
 
 
 async def _graph_stream(state: dict, config: dict):
-    """把 LangGraph 的消息流归一化为「助手文本片段」流
+    """把 LangGraph 的消息流归一化为「检索来源 + 助手文本片段」事件流
 
-    graph.astream(stream_mode="messages") 会同时产出各节点的 LLM 调用消息（意图识别、
-    工具 Agent、最终生成）；这里只取最终生成节点的助手文本增量，避免把中间产物
-    透传给前端。通过 metadata.langgraph_node 过滤 generate 节点。
+    以 stream_mode=["updates", "messages"] 同时拿到两类信息：
+      - updates：各节点的产出，这里只取 retrieve_knowledge 的 knowledge（RAG 引用来源），
+        在答案首字之前就能推给前端，用户不必等整段回答结束才知道依据是什么；
+      - messages：各节点的 LLM 调用消息流（意图识别、工具 Agent、最终生成），
+        这里只取 generate 节点的助手文本增量（按 metadata.langgraph_node 过滤），
+        避免把中间产物透传给前端。
     config 携带 thread_id：图状态在每个超级步后由 checkpoint 自动持久化。
     """
     graph = get_chat_graph()
-    async for chunk, meta in graph.astream(state, config=config, stream_mode="messages"):
-        # 仅透传最终生成节点（generate）的助手文本
-        if meta and meta.get("langgraph_node") != "generate":
+    async for mode, payload in graph.astream(
+            state, config=config, stream_mode=["updates", "messages"]):
+        if mode == "updates":
+            if not isinstance(payload, dict):        # 非节点产出（如 checkpoints 等保留键）跳过
+                continue
+            update = payload.get("retrieve_knowledge")
+            if isinstance(update, dict):
+                yield "refs", update.get("knowledge") or []
+            continue
+
+        # messages 模式：payload 是 (消息分片, 元数据)
+        chunk, chunk_meta = payload
+        if chunk_meta and chunk_meta.get("langgraph_node") != "generate":
+            continue
+        # 只取流式分片：messages 模式在 LLM 结束时还会补投一条聚合完整消息，
+        # 不过滤掉会让整段回答被重复输出一次（前端表现为回复内容成双倍长度）
+        if not isinstance(chunk, AIMessageChunk):
             continue
         content = getattr(chunk, "content", None)
         if not content:
             continue
-        # 仅保留 AI 消息（过滤 Human/System/Tool 消息）
-        chunk_type = getattr(chunk, "type", "")
-        if chunk_type and chunk_type not in ("AIMessageChunk", "ai"):
-            continue
         if isinstance(content, str):
-            yield content
+            yield "delta", content
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, str):
-                    yield part
+                    yield "delta", part
                 elif isinstance(part, dict) and part.get("type") == "text":
-                    yield part.get("text", "")
+                    yield "delta", part.get("text", "")
 
 
 def _history_messages(history: list) -> list:
@@ -227,7 +266,8 @@ def _history_messages(history: list) -> list:
 async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
                                session_id: int, user_msg: str,
                                human_msg: HumanMessage, partial: str,
-                               attachments: Optional[list] = None) -> None:
+                               attachments: Optional[list] = None,
+                               refs: Optional[list] = None) -> None:
     """用户中止生成后的记忆补写（在 asyncio.shield 保护下调用）
 
     1) checkpoint：把用户问题（与输入同 id，去重）与已产出的部分回复补写回图状态，
@@ -245,7 +285,7 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
             logger.warning("中断记忆补写 checkpoint 失败(忽略): user_id=%s session_id=%s",
                            user_id, session_id, exc_info=True)
     await persistence.save_turn_if_exists(user_id, pet_id, session_id, user_msg, partial,
-                                          interrupted=True, attachments=attachments)
+                                          interrupted=True, attachments=attachments, refs=refs)
 
 
 async def _append_mock_reply(graph, config: dict, reply: str) -> None:
@@ -278,6 +318,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         return
 
     collected = []          # 已累计的回复片段
+    last_refs = []          # 本轮 RAG 检索到的引用来源（落库供历史回放）
     appended = False        # 本轮是否已收尾写入（防止取消分支重复补写）
     producer: Optional[asyncio.Task] = None
     user_slot: Optional[bool] = None  # 已占用的并发额度是否走 Redis 计数；None 表示未占用
@@ -349,11 +390,17 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         )
 
         if settings.is_mock:
-            # mock 模式：先跑一遍编排（意图/检索/工具/组装逻辑一致），再用打字机流输出内置回复
+            # mock 模式：先跑一遍编排（意图/检索/工具/组装逻辑一致），再用打字机流输出内置回复；
+            # 检索结果从整图输出里取（mock 流本身不产生节点事件），照常推 refs 帧
             try:
-                await graph.ainvoke(state, config=config)
+                values = await graph.ainvoke(state, config=config)
+                mock_refs = (values or {}).get("knowledge") or []
             except Exception:
                 logger.warning("mock 模式编排执行异常（忽略，继续输出 mock 回复）", exc_info=True)
+                mock_refs = []
+            if mock_refs:
+                last_refs = _ref_items(mock_refs)
+                yield _sse({"type": "refs", "items": last_refs})
 
         # 6. 生产者-消费者消费流：消费端带 15 秒心跳超时
         # 首帧韧性：若在产出任何内容之前流就失败（LLM 服务商网络抖动、瞬时 429 等），
@@ -388,6 +435,11 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                     logger.warning("LLM 流生成失败: %r", payload)
                     yield _sse({"type": "error", "msg": _ERROR_MSG})
                     return
+                # 检索来源帧：在答案首字之前到达，前端据此渲染「参考来源」
+                if kind == "refs":
+                    last_refs = _ref_items(payload or [])
+                    yield _sse({"type": "refs", "items": last_refs})
+                    continue
                 # kind == "delta"
                 collected.append(payload)
                 yield _sse({"type": "delta", "content": payload})
@@ -401,7 +453,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         if settings.is_mock and reply.strip():
             await _append_mock_reply(graph, config, reply)
         await persistence.save_turn(user_id, pet_id, session_id, persist_msg, reply,
-                                    attachments=attachments)
+                                    attachments=attachments, refs=last_refs)
         appended = True   # 已收尾写入：后续若被取消，取消分支不再重复补写
         # 8. 后台抽取长期记忆：正常轮 + 完整回复才抽取（中断轮 partial 易误导），
         #    异步执行不阻塞 done 事件，失败在任务内部静默降级
@@ -427,7 +479,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                 partial = "".join(collected)
                 await asyncio.shield(_persist_interrupted(
                     graph, config, user_id, pet_id, session_id, persist_msg,
-                    human_msg, partial, attachments=attachments))
+                    human_msg, partial, attachments=attachments, refs=last_refs))
         except BaseException:
             pass
         raise

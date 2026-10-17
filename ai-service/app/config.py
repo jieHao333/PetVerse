@@ -88,9 +88,31 @@ class Settings(BaseSettings):
 
     # ---------- RAG 检索参数 ----------
     RAG_ENABLED: bool = True                    # 关闭后对话跳过知识检索，直接生成
-    RAG_TOP_K: int = 4                          # 每次检索召回的知识片段数
-    RAG_SCORE_THRESHOLD: float = 0.35           # 相似度阈值（低于该值的片段丢弃，避免答非所问）
-    RAG_COLLECTION: str = "petverse_kb"         # pgvector 集合名
+    RAG_TOP_K: int = 5                          # 最终注入 Prompt 的知识片段数
+    RAG_RECALL_K: int = 20                      # 每条通道（向量 / 关键词）的候选召回数
+    RAG_MIN_SIM: float = 0.30                   # 向量通道门槛：余弦相似度低于此值且关键词未命中则丢弃
+    RAG_LEX_MIN_TERMS: int = 2                  # 关键词通道门槛：至少命中这么多个查询词才可信
+    RAG_FUSION_ALPHA: float = 0.85              # 融合权重：向量通道占比（0=纯关键词，1=纯向量），黄金集扫描标定
+    RAG_SPECIES_STRICT: bool = False           # true 时按物种硬过滤；false 仅降权（默认更宽容）
+    RAG_SPECIES_PENALTY: float = 0.5            # 物种不符时的融合得分折扣系数
+    RAG_QUERY_REWRITE: bool = True              # 多轮追问改写为自包含检索查询（LLM，失败降级原文）
+    RAG_REWRITE_MIN_CHARS: int = 12             # 提问不短于此长度且不含指代词时认为已自包含，不改写
+
+    # ---------- 知识库语料与切分 ----------
+    KNOWLEDGE_DIR: str = ""                     # 语料目录，留空用 app/knowledge
+    KB_CHUNK_SIZE: int = 600                    # 片段目标长度（中文字符数）
+    KB_CHUNK_MIN: int = 80                      # 短于此长度的小节并入相邻片段，避免无语义碎片
+    KB_CHUNK_MAX: int = 900                     # 片段长度硬上限（表格按行分组也不超过它）
+    EMBED_BATCH_SIZE: int = 10                  # 单次 Embedding 请求的片段条数（服务商上限）
+    KB_MAX_UPLOAD_MB: int = 20                  # 知识库文档上传大小上限（MB）
+    # 上传文档的原文留存目录（在线预览 PDF 等非纯文本格式要用）：
+    # 仓库语料直接记源文件路径，上传接口收到的文件按 doc_id 落盘到这个目录。
+    # 删除文档时只清理本目录内的留存文件，仓库语料源文件不动（那是代码仓库的资产）
+    KB_STORAGE_DIR: str = ""
+    # 知识库写操作（上传/删除/重建）的管理令牌：为空时写接口一律拒绝（403）。
+    # 知识库是全用户共享的检索语料，任何登录用户都能改就等于能向所有人的回答里注入内容，
+    # 因此这里刻意默认关闭，需管理端在请求头带 X-Kb-Admin 显式授权。
+    KB_ADMIN_TOKEN: str = ""
 
     # ---------- 业务服务地址（ai-service 直连各微服务拉取上下文） ----------
     PET_SERVICE_URL: str = "http://127.0.0.1:8081"      # 宠物档案 / 健康信息
@@ -191,6 +213,18 @@ class Settings(BaseSettings):
         """SQLAlchemy / LangChain-Postgres 连接串（显式指定 psycopg 驱动）"""
         return (f"postgresql+psycopg://{self.PG_USER}:{self.PG_PASSWORD}"
                 f"@{self.PG_HOST}:{self.PG_PORT}/{self.PG_DB}")
+
+    @property
+    def knowledge_dir(self) -> Path:
+        """知识库语料目录（KNOWLEDGE_DIR 为空时用服务内 app/knowledge）"""
+        raw = (self.KNOWLEDGE_DIR or "").strip()
+        return Path(raw) if raw else BASE_DIR / "app" / "knowledge"
+
+    @property
+    def kb_storage_dir(self) -> Path:
+        """上传文档的原文留存目录（KB_STORAGE_DIR 为空时用服务内 data/kb）"""
+        raw = (self.KB_STORAGE_DIR or "").strip()
+        return Path(raw) if raw else BASE_DIR / "data" / "kb"
 
 
 # 模块级配置单例：全项目统一通过它读取配置

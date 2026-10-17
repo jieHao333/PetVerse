@@ -15,7 +15,19 @@
 
 **对话记忆（LangGraph 官方 checkpoint）**：对话图编译时注入 `PostgresSaver`（`langgraph-checkpoint-postgres`），图状态 `messages` 按 `thread_id = 用户:会话` 在每个超级步自动持久化到 PostgreSQL，下一轮对话自动恢复上下文。用户点击「停止生成」时，路由层把「问题 + 已产出的部分回复（`interrupted` 标记）」经 `aupdate_state` 补写回图状态——被中止的轮次同样进入后续对话的记忆，不再「暂停即失忆」。
 
-**RAG 检索**：pgvector + OpenAI 兼容 Embedding 的语义检索（余弦相似度 + 阈值过滤 + 来源引用）。Embedding 未配置或向量库不可用时**直接报错**（`RagUnavailable`），不做关键词降级——知识问答里"无依据却答得像真的"比明确失败更糟。
+**RAG 检索（混合检索）**：`app/kb/` 子模块实现「向量 + 关键词」双通道召回——pgvector 余弦召回（HNSW 索引）与 jieba 分词的进程内 BM25 各取 `RAG_RECALL_K` 条，按加权序值融合（`RAG_FUSION_ALPHA` 偏向向量通道），再按宠物物种做元数据降权/过滤，最后用「语义相似度 或 关键词命中词数」双门槛决定保留。多轮追问会先经 LLM 改写成自包含检索问句（失败自动退回原句）。检索链路不可用时**直接报错**（`RagUnavailable`），不做静默降级——知识问答里"无依据却答得像真的"比明确失败更糟。
+
+**引用来源可追溯**：检索命中的文档（名称 / 类型 md·pdf·docx·doc / 小节 / 相关度 / 摘要）在答案首字之前以 SSE `refs` 帧推给前端，并随助手消息落库（`chat_message.refs` JSONB），历史回放同样可见；System Prompt 要求模型按 `[1] [2]` 标注引用，与来源列表一一对应。
+
+**语料规模与召回率**：`app/knowledge/` 现有 21 篇 md + 1 篇 pdf + 1 篇 docx（约 6.4 万字 / 174 个片段）。`scripts/eval_rag.py` 用 83 条黄金查询做消融评测（判定标准是「答案证据是否进候选」）：
+
+| 模式 | hit@1 | hit@3 | hit@5 | MRR |
+|---|---|---|---|---|
+| 改造前（旧 11 片段库 · 纯向量 top4 · 阈值 0.35） | 9.6% | 12.0% | 12.0% | 0.106 |
+| 只换语料与切分（新库 · 纯向量 top4 · 阈值 0.35） | 91.6% | 96.4% | 97.6% | 0.941 |
+| 最终混合检索（向量 + BM25 · 物种过滤 · 双门槛） | **92.8%** | **97.6%** | **97.6%** | **0.948** |
+
+结论很直白：**召回率的首要瓶颈是语料覆盖（12% → 97.6%），检索算法是第二顺位（97.6% → 97.6%、hit@1 +1.2pt、MRR +0.007）**——但关键词通道在「黑下巴、猫癣、氯菊酯、MDR1」这类精确术语问法上是必要的兜底。
 
 **会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；评论摘要 / 推荐结果为两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底）。
 
@@ -62,24 +74,52 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | RAG 向量化（OpenAI 兼容）。阿里云百炼 `text-embedding-v3`（dim 支持 1024/768/512）。**不配置则知识检索不可用（知识类提问明确报错）** |
 | `MOCK_CHAT` | `true` 强制内置模拟回复，无需真实调用 |
 | `PG_*` | PostgreSQL + pgvector（RAG 向量库 / 健康报告 / LangGraph checkpoint 对话记忆 / 结果缓存温层 `ai_cache`） |
-| `RAG_ENABLED` / `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` | RAG 开关与检索参数 |
+| `RAG_ENABLED` / `RAG_TOP_K` / `RAG_RECALL_K` | RAG 开关：注入 Prompt 的片段数 / 每条通道的候选召回数 |
+| `RAG_MIN_SIM` / `RAG_LEX_MIN_TERMS` / `RAG_FUSION_ALPHA` | 向量门槛 / 关键词命中词数门槛 / 融合时向量通道权重（0~1，越大越偏向量） |
+| `RAG_SPECIES_STRICT` / `RAG_SPECIES_PENALTY` | 物种不符时硬过滤或按系数降权 |
+| `RAG_QUERY_REWRITE` / `RAG_REWRITE_MIN_CHARS` | 多轮追问改写开关 / 短于此长度必定改写 |
+| `KNOWLEDGE_DIR` / `KB_CHUNK_*` / `EMBED_BATCH_SIZE` | 语料目录 / 切分长度（目标·合并下限·硬上限）/ 单批 Embedding 条数 |
+| `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（秒；Redis 热层与 ai_cache 温层共用） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
-> pgvector 维度必须与 `EMBEDDING_DIM` 一致；切换 Embedding 模型需重建向量集合。
+> pgvector 维度必须与 `EMBEDDING_DIM` 一致（`kb_chunk.embedding vector(1024)`）；切换 Embedding 模型需重建知识库表。
 
-## 导入知识库（RAG 语料）
+## 知识库语料与导入
 
-知识文档位于 `app/knowledge/*.md`（疫苗 / 驱虫 / 喂养 / 常见病 / 行为护理）。
+语料目录 `app/knowledge/`（可用 `KNOWLEDGE_DIR` 改），支持 **md / pdf / docx / doc** 四种格式，递归扫描子目录：
+
+- **md**：可在文件开头用 `---` 元数据块声明 `title` / `category` / `species` / `tags`（`tags` 会进 BM25 词表——正文里没写的俗称，如「黑下巴、猫痤疮」，靠标签才能被关键词命中）；正文按 Markdown 标题层级切分成小节，片段自带「文档标题｜分类｜小节」上下文前缀。
+- **docx**：按段落样式（Heading 1/2/3、标题 1/2/3）还原层级，表格转成「表头：值」文本，不丢内容。
+- **pdf**：PyMuPDF 逐页抽取（按阅读顺序），页码作为小节路径。
+- **doc**（Word 97-2003 二进制）：调用系统 `antiword` / `catdoc` 抽文本，工具缺失时明确报错提示先转存 docx（不静默产出空文档）。
 
 ```powershell
-.venv\Scripts\python -m scripts.ingest_knowledge
+# 增量导入（内容 sha256 未变的文档直接跳过，省 Embedding 调用）
+python -m scripts.ingest_knowledge
+python -m scripts.ingest_knowledge --full     # 清空后全量重建
+python -m scripts.ingest_knowledge --force    # 不跳过，全部重新向量化
+python -m scripts.ingest_knowledge --file x.pdf
+python -m scripts.ingest_knowledge --stats    # 查看当前规模与文档清单
 ```
 
-- 切分后全量写入 pgvector（幂等，可反复执行，以文件为唯一事实来源）。
-- Embedding 未配置或向量库不可用：脚本报错退出（RAG 只有 pgvector 一条链路，不做关键词降级）。
+按 `doc_id`（文件名主干）覆盖写入 `kb_document` + `kb_chunk`，单事务「删旧片段 → 写文档行 → 写片段」，并自增 `kb_meta.version` 让 BM25 索引惰性重建。单个文件解析失败只进失败清单、不中断整轮导入，脚本以非零码退出。
+
+**原文留存与在线预览**：`kb_document.file_path` 记录原文位置——仓库文档直接记源文件路径，
+上传接口收到的文件按 `doc_id` 落盘到 `KB_STORAGE_DIR`（默认 `data/kb`），删除上传文档时一并清理。
+预览接口优先重解析原文（排版完整、无切分重叠），原文缺失时回退按 `chunk_index` 拼接片段；
+管理页的「AI 入库片段」页签则直接展示切分后真正进向量库的内容（含上下文标题行、字数与检索词数），
+排查召回问题时看这个比看原文更有用。Markdown 正文在前端经 DOMPurify 消毒后才 `v-html`——
+文档内容来自上传文件，不过消毒等于把「上传文档」变成向页面注入脚本的通道。
+
+评测与调参：
+
+```powershell
+python -m scripts.eval_rag --validate   # 校验黄金集期望子串确实存在于知识库
+python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
+```
 
 ## 启动服务
 
@@ -91,10 +131,16 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 
 | 方法 | 网关路径（前端调用） | 说明 |
 |---|---|---|
-| POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}`；首帧 `meta` 回传 sessionId |
-| GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（PostgreSQL，时间正序） |
+| POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}`；首帧 `meta` 回传 sessionId，随后 `refs` 帧推送引用来源 |
+| GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（PostgreSQL，时间正序；助手消息带 `refs`） |
 | GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物，最近活跃在前） |
 | DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint 记忆） |
+| GET | `/api/ai/kb/documents?page=&size=&keyword=` | 知识库文档列表（管理员限定；服务端分页 + 名称/文件名/分类模糊过滤，返回 items/total/pages 与全库统计） |
+| GET | `/api/ai/kb/documents/{docId}/preview` | 文档在线预览（管理员限定；正文优先重解析原文，原文缺失回退片段拼接，附入库片段清单） |
+| GET | `/api/ai/kb/documents/{docId}/file?inline=` | 回读文档原文（管理员限定；PDF 供浏览器内置查看器渲染，路径限定在语料/留存目录内） |
+| POST | `/api/ai/kb/documents` | 上传知识文档（multipart：`file` + 可选 `title`/`category`/`species`）→ 解析切分入库（管理员限定） |
+| DELETE | `/api/ai/kb/documents/{docId}` | 删除文档（管理员限定；`kb_chunk` 外键级联删除含向量的片段，BM25 版本戳 +1 触发索引重建；上传文档的留存原文一并清理，**仓库语料源文件不动**——重新全量重建会把它带回来） |
+| POST | `/api/ai/kb/reindex` | 用仓库语料目录全量重建知识库（管理员限定；同一时刻仅允许一个） |
 | POST | `/api/ai/health/assess` | 宠物健康评估；体为宠物档案（含 `health`），返回结构化报告 |
 | GET | `/api/ai/health/history?petId=` | 宠物历史健康评估 |
 | POST | `/api/ai/shop/review/summary` | 商品评论摘要；体 `{"productId"}` |
@@ -103,9 +149,10 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 说明：
 
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
-- SSE 事件：`meta` → `delta` * n → `done`；异常时 `error` 后结束流。
+- SSE 事件：`meta` → `refs`（有知识命中时）→ `delta` * n → `done`；异常时 `error` 后结束流。`refs` 载荷为 `{"type":"refs","items":[{rank,docId,source,docTitle,kind,section,category,score,matchedBy,snippet}]}`，在答案首字之前到达。
+- **知识库 `/api/ai/kb/*` 四个接口一律管理员限定**：凭网关注入的 `X-User-Role`（网关会先剥离客户端同名头，值取自 JWT 的角色声明）判定，非 `ADMIN` 返回 `{"code":403,"msg":"仅管理员可管理知识库"}`。`KB_ADMIN_TOKEN` / 请求头 `X-Kb-Admin` 是留给「不经网关直连本服务跑运维脚本」的**备选凭证**，与管理员角色二选一即可——没有这条通道时，任何能直接访问 8086 的进程伪造一个 `X-User-Role: ADMIN` 就能改写全用户共享的检索语料。前端路由 `meta.roles: ['ADMIN']` 与顶栏入口同样只对管理员可见。
 - 推荐 / 评论摘要结果按用户、商品缓存于两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底，见 `app/cache.py`），`refresh=true` 可跳过推荐缓存强制刷新。
-- 中文模型配置与 pgvector 初始化完成后即启用语义检索；Embedding 或向量库不可用时知识类提问直接报错（不降级）。
+- Embedding 或向量库不可用时知识类提问直接报错（不降级）；知识库为空时报错提示先跑导入脚本。
 
 ## 安全提示
 

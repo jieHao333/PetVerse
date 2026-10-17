@@ -7,7 +7,8 @@
                              └─(闲聊)──────────────────────────────────────────────────────→ recall_memory → compose → generate → END
 
   - classify_intent   意图识别（联网用 LLM 结构化输出，mock / 失败降级为关键词规则）
-  - retrieve_knowledge RAG 检索：pgvector 语义检索，不可用时直接报错（不降级）
+  - retrieve_knowledge RAG 检索：多轮追问先改写成自包含查询，再做向量+BM25 混合检索
+                       （见 app/kb/search.py），检索链路不可用时直接报错（不降级）
   - tool_action       Agent 工具调用：查询用户真实宠物 / 订单 / 购物车 / 评论 / 动态
   - recall_memory     长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
   - compose           组装最终 System Prompt（人设 + 宠物档案 + 长期记忆 + 参考知识 + 真实数据 + 医疗护栏）
@@ -33,11 +34,12 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from app import checkpoint, memstore, persona, vectorstore
+from app import checkpoint, memstore, persona
 from app.config import settings
+from app.kb import search as kb_search
 from app.llm import astructured_invoke, get_client, get_vision_client
 from app.media import KIND_IMAGE
-from app.schemas import IntentResult, PetInfo
+from app.schemas import IntentResult, PetInfo, SearchQuery
 from app.tools import build_tools
 
 logger = logging.getLogger(__name__)
@@ -70,7 +72,8 @@ class ChatState(TypedDict, total=False):
     messages: Annotated[List[AnyMessage], add_messages]
     intent: str                    # 意图
     intent_reason: str
-    knowledge: List[Dict[str, Any]]  # RAG 检索结果
+    search_query: str              # 实际用于检索的查询（多轮追问改写后的自包含问法，空表示未改写）
+    knowledge: List[Dict[str, Any]]  # RAG 检索结果（同时作为前端「参考来源」数据）
     knowledge_text: str            # 拼接后的知识上下文
     tool_context: str              # 工具查询结果
     memory_text: str               # 长期记忆上下文（recall_memory 从 runtime store 读取渲染）
@@ -130,18 +133,89 @@ async def classify_intent(state: ChatState) -> Dict[str, Any]:
         return {"intent": intent, "intent_reason": "fallback/rule"}
 
 
+# 追问指代词：命中任一，或问题很短，说明脱离上下文就检索不到东西，需要改写
+_FOLLOWUP_HINTS = ["它", "他", "她", "这个", "那个", "这样", "那样", "还有", "可是", "但是",
+                   "那", "呢", "怎么办", "为什么", "多久", "几次", "要不要", "能不能", "可以"]
+
+
+def _needs_rewrite(query: str) -> bool:
+    """是否需要改写：短问句或含指代/省略词时改写，自包含长问句直接检索（省一次 LLM 调用）"""
+    q = query.strip()
+    if len(q) <= settings.RAG_REWRITE_MIN_CHARS:
+        return True
+    return any(hint in q for hint in _FOLLOWUP_HINTS)
+
+
+def _recent_dialogue(state: ChatState, limit: int = 4) -> str:
+    """取最近若干条对话作为改写上下文（当前轮 HumanMessage 已在末尾，排除掉）"""
+    messages = [m for m in (state.get("messages") or []) if isinstance(m, (HumanMessage, AIMessage))]
+    if messages and isinstance(messages[-1], HumanMessage):
+        messages = messages[:-1]
+    lines = []
+    for msg in messages[-limit:]:
+        role = "用户" if isinstance(msg, HumanMessage) else "助手"
+        text = msg.content if isinstance(msg.content, str) else str(msg.content)
+        text = " ".join(text.split())[:120]
+        if text:
+            lines.append(f"{role}：{text}")
+    return "\n".join(lines)
+
+
+async def _build_search_query(state: ChatState) -> Dict[str, Any]:
+    """构造检索查询：多轮追问时结合上下文补全指代，返回 {query, species}
+
+    改写只影响检索用文本，不改用户可见消息，也不写回 messages（不污染对话记忆）；
+    无需改写、mock 模式或 LLM 调用失败时一律退回原句——改写是召回优化，
+    不是对话前提，失败必须静默降级而不是让本轮报错。
+    """
+    query = state.get("query", "")
+    if not settings.RAG_QUERY_REWRITE or settings.is_mock or not _needs_rewrite(query):
+        return {"query": query, "species": []}
+
+    context = _recent_dialogue(state)
+    if not context:
+        return {"query": query, "species": []}
+    prompt = (
+        "你是宠物知识库的检索查询改写器。用户在多轮对话中提出了最新一句话，"
+        "请结合对话历史把它改写成一个脱离上下文也能独立检索的完整问句。\n"
+        "要求：补全「它/这个/那」等指代与前文省略的主体；不要新增用户没问的内容；"
+        "不要给出答案；只输出 JSON。\n"
+        f"对话历史：\n{context}\n"
+    )
+    try:
+        result: SearchQuery = await astructured_invoke(SearchQuery, prompt, query)
+        rewritten = (result.query or "").strip()
+        if rewritten:
+            return {"query": rewritten, "species": result.species or []}
+    except Exception:
+        logger.warning("检索查询改写失败，使用原句检索", exc_info=True)
+    return {"query": query, "species": []}
+
+
 async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
-    """RAG 检索节点：命中知识类意图时检索知识库
+    """RAG 检索节点：命中知识类意图时做混合检索（向量 + BM25 关键词）
 
     检索链路不可用时抛 RagUnavailable（由路由层转成 error 事件），不降级为
     关键词检索、也不静默跳过——避免让模型在没有知识依据的情况下作答。
+
+    物种信号优先取本轮提问里显式提到的物种（用户可能在替别人的宠物问），
+    提问没提到时才回退到宠物档案物种。
     """
-    query = state.get("query", "")
     intent = state.get("intent", "")
     if intent not in _KB_INTENTS or not settings.RAG_ENABLED:
-        return {"knowledge": [], "knowledge_text": ""}
-    results = await vectorstore.retrieve(query)
-    return {"knowledge": results, "knowledge_text": vectorstore.format_context(results)}
+        return {"knowledge": [], "knowledge_text": "", "search_query": ""}
+
+    rewritten = await _build_search_query(state)
+    pet_species = (state.get("pet") or {}).get("species") or []
+    results = await kb_search.retrieve(
+        rewritten["query"],
+        pet_species=rewritten["species"] or pet_species,
+    )
+    return {
+        "knowledge": results,
+        "knowledge_text": kb_search.format_context(results),
+        "search_query": rewritten["query"],
+    }
 
 
 async def tool_action(state: ChatState) -> Dict[str, Any]:
@@ -379,6 +453,7 @@ def initial_state(query: str, pet: Dict[str, Any], user_id: int,
         "messages": messages or [],
         "intent": "",
         "intent_reason": "",
+        "search_query": "",
         "knowledge": [],
         "knowledge_text": "",
         "tool_context": "",
