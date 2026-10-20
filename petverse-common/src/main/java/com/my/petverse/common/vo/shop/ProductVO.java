@@ -23,6 +23,15 @@ public class ProductVO implements Serializable {
     /** 所属店铺名称（商城列表聚合展示） */
     private String shopName;
 
+    /** 所属店铺状态：1-营业 0-打烊 2-封禁 */
+    private Integer shopStatus;
+
+    /** 所属店铺撤销状态：0-正常 1-冷静期 */
+    private Integer shopWithdrawStatus;
+
+    /** 所属店铺当前是否可对外售卖 */
+    private Boolean shopSelling;
+
     /** 商品名称 */
     private String name;
 

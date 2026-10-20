@@ -50,7 +50,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
 
     @Override
     public ProductVO saveProduct(Long userId, ProductSaveDTO dto) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        Merchant merchant = merchantService.getEditableMerchant(userId);
         if (ProductCategory.of(dto.getCategory()) == null) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "商品类型不合法");
         }
@@ -64,12 +64,12 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_UPSERT,
                 new ProductIndexMessage(product.getId(), merchant.getId()),
                 "product-index:" + product.getId());
-        return toVO(product, merchant.getShopName());
+        return toVO(product, merchant);
     }
 
     @Override
     public ProductVO updateProduct(Long userId, ProductUpdateDTO dto) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        Merchant merchant = merchantService.getEditableMerchant(userId);
         Product product = getOwnProduct(merchant, dto.getId());
         // 仅更新传入的非空字段
         if (StringUtils.hasText(dto.getName())) {
@@ -101,12 +101,12 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_UPSERT,
                 new ProductIndexMessage(product.getId(), merchant.getId()),
                 "product-index:" + product.getId());
-        return toVO(product, merchant.getShopName());
+        return toVO(product, merchant);
     }
 
     @Override
     public boolean deleteProduct(Long userId, Long productId) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        Merchant merchant = merchantService.getEditableMerchant(userId);
         Product product = getOwnProduct(merchant, productId);
         boolean removed = removeById(product.getId());
         // 事务提交后发事件，由索引消费者异步删除检索索引（重复删除幂等）
@@ -118,14 +118,14 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
 
     @Override
     public PageResult<ProductVO> pageMine(Long userId, ProductPageQueryDTO dto) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        Merchant merchant = merchantService.getManageMerchant(userId);
         String keyword = resolveKeyword(dto);
         if (StringUtils.hasText(keyword)) {
             // 商家管理列表只搜自己店铺的商品，不限制上下架状态
             PageResult<Long> idPage = searchIdsQuietly(dto, keyword, null, merchant.getId());
             if (idPage != null) {
                 List<ProductVO> vos = loadInOrder(idPage.getRecords(),
-                        product -> toVO(product, merchant.getShopName()));
+                        product -> toVO(product, merchant));
                 return PageResult.of(idPage.getTotal(), dto.getPageNum(), dto.getPageSize(), vos);
             }
         }
@@ -137,7 +137,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
                                 .or().like(Product::getDescription, keyword))
                         .orderByDesc(Product::getCreateTime));
         List<ProductVO> vos = page.getRecords().stream()
-                .map(product -> toVO(product, merchant.getShopName()))
+                .map(product -> toVO(product, merchant))
                 .collect(Collectors.toList());
         return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), vos);
     }
@@ -150,24 +150,35 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             PageResult<Long> idPage = searchIdsQuietly(dto, keyword, 1, dto.getMerchantId());
             if (idPage != null) {
                 List<Product> products = loadInOrder(idPage.getRecords());
-                Map<Long, String> shopNames = loadShopNames(products);
-                List<ProductVO> vos = products.stream()
-                        .map(product -> toVO(product, shopNames.get(product.getMerchantId())))
-                        .collect(Collectors.toList());
-                return PageResult.of(idPage.getTotal(), dto.getPageNum(), dto.getPageSize(), vos);
+                Map<Long, Merchant> shops = loadShops(products);
+                // 兜底：若索引仍有余留的不可售店铺文档（如历史遗留索引），当前页降级走数据库查询
+                boolean allSellable = products.stream().allMatch(product -> {
+                    Merchant merchant = shops.get(product.getMerchantId());
+                    return merchant != null && merchant.isSelling();
+                });
+                if (allSellable) {
+                    List<ProductVO> vos = products.stream()
+                            .map(product -> toVO(product, shops.get(product.getMerchantId())))
+                            .collect(Collectors.toList());
+                    return PageResult.of(idPage.getTotal(), dto.getPageNum(), dto.getPageSize(), vos);
+                }
             }
         }
         Page<Product> page = page(new Page<>(dto.getPageNum(), dto.getPageSize()),
                 new LambdaQueryWrapper<Product>()
                         .eq(Product::getStatus, 1)
+                        // 只展示营业中且不在撤销冷静期店铺的商品
+                        .inSql(Product::getMerchantId,
+                                "SELECT id FROM merchant WHERE deleted = 0 AND status = 1 "
+                                        + "AND (withdraw_status = 0 OR withdraw_status IS NULL)")
                         .eq(dto.getCategory() != null, Product::getCategory, dto.getCategory())
                         .eq(dto.getMerchantId() != null, Product::getMerchantId, dto.getMerchantId())
                         .and(StringUtils.hasText(keyword), w -> w.like(Product::getName, keyword)
                                 .or().like(Product::getDescription, keyword))
                         .orderByDesc(Product::getCreateTime));
-        Map<Long, String> shopNames = loadShopNames(page.getRecords());
+        Map<Long, Merchant> shops = loadShops(page.getRecords());
         List<ProductVO> vos = page.getRecords().stream()
-                .map(product -> toVO(product, shopNames.get(product.getMerchantId())))
+                .map(product -> toVO(product, shops.get(product.getMerchantId())))
                 .collect(Collectors.toList());
         return PageResult.of(page.getTotal(), page.getCurrent(), page.getSize(), vos);
     }
@@ -211,7 +222,11 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             throw new BusinessException(ResultCode.NOT_FOUND, "商品不存在或已下架");
         }
         Merchant merchant = merchantMapper.selectById(product.getMerchantId());
-        return toVO(product, merchant == null ? null : merchant.getShopName());
+        if (merchant == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "商品所属店铺不存在");
+        }
+        // 店铺打烊/封禁/撤销中仍返回详情，由前端展示对应状态并禁用购买入口
+        return toVO(product, merchant);
     }
 
     /** 查询商品并校验归属，防止越权操作他人店铺的商品 */
@@ -223,8 +238,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         return product;
     }
 
-    /** 批量查询商品所属店铺名称 */
-    private Map<Long, String> loadShopNames(List<Product> products) {
+    /** 批量查询商品所属店铺 */
+    private Map<Long, Merchant> loadShops(List<Product> products) {
         Set<Long> merchantIds = products.stream()
                 .map(Product::getMerchantId)
                 .collect(Collectors.toSet());
@@ -232,14 +247,19 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             return Map.of();
         }
         return merchantMapper.selectBatchIds(merchantIds).stream()
-                .collect(Collectors.toMap(Merchant::getId, Merchant::getShopName));
+                .collect(Collectors.toMap(Merchant::getId, Function.identity()));
     }
 
-    /** DO 转 VO，附加店铺名称与类型名称 */
-    private ProductVO toVO(Product product, String shopName) {
+    /** DO 转 VO，附加店铺名称/状态与类型名称 */
+    private ProductVO toVO(Product product, Merchant merchant) {
         ProductVO vo = new ProductVO();
         BeanUtils.copyProperties(product, vo);
-        vo.setShopName(shopName);
+        if (merchant != null) {
+            vo.setShopName(merchant.getShopName());
+            vo.setShopStatus(merchant.getStatus());
+            vo.setShopWithdrawStatus(merchant.getWithdrawStatus());
+            vo.setShopSelling(merchant.isSelling());
+        }
         ProductCategory category = ProductCategory.of(product.getCategory());
         vo.setCategoryName(category == null ? null : category.getDesc());
         return vo;

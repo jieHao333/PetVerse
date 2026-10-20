@@ -40,6 +40,18 @@ public class CartItemVO implements Serializable {
     /** 购买数量 */
     private Integer quantity;
 
-    /** 商品是否有效（上架且未删除，失效商品不可结算） */
+    /** 所属店铺状态：1-营业 0-打烊 2-封禁 */
+    private Integer shopStatus;
+
+    /** 所属店铺撤销状态：0-正常 1-冷静期 */
+    private Integer shopWithdrawStatus;
+
+    /** 所属店铺当前是否可对外售卖 */
+    private Boolean shopSelling;
+
+    /** 商品是否有效（上架且店铺可售，失效商品不可结算） */
     private Boolean valid;
+
+    /** 失效原因（有效时为空） */
+    private String invalidReason;
 }

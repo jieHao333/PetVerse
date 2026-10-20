@@ -1,7 +1,7 @@
 package com.my.petverse.shop.controller;
 
 import com.my.petverse.common.result.Result;
-import com.my.petverse.common.vo.shop.MerchantVO;
+import com.my.petverse.common.vo.shop.StoreVO;
 import com.my.petverse.shop.service.MerchantService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,9 +20,9 @@ public class StoreController {
 
     private final MerchantService merchantService;
 
-    /** 查询店铺公开信息（店家页面头部展示，仅营业中店铺可见） */
+    /** 查询店铺公开信息（店家页面头部展示，封禁/打烊时仍返回状态供页面提示） */
     @GetMapping("/{id}")
-    public Result<MerchantVO> info(@PathVariable("id") Long id) {
+    public Result<StoreVO> info(@PathVariable("id") Long id) {
         return Result.success(merchantService.getShopById(id));
     }
 }

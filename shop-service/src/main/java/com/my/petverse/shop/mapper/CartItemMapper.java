@@ -35,4 +35,10 @@ public interface CartItemMapper extends BaseMapper<CartItem> {
     @Delete("<script>DELETE FROM cart_item WHERE user_id = #{userId} AND id IN "
             + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach></script>")
     int physicalDeleteBatch(@Param("userId") Long userId, @Param("ids") Collection<Long> ids);
+
+    /** 物理删除引用了指定商品的购物车条目（商家撤销冷静期结束后清理其商品关联数据） */
+    @Delete("<script>DELETE FROM cart_item WHERE product_id IN "
+            + "<foreach collection='productIds' item='productId' open='(' separator=',' close=')'>"
+            + "#{productId}</foreach></script>")
+    int physicalDeleteByProductIds(@Param("productIds") Collection<Long> productIds);
 }

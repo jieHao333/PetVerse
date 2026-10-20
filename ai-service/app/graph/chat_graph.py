@@ -2,15 +2,20 @@
 
 把原先手写的「拼消息 → 调模型」升级为显式状态图编排，节点职责单一、可观测、可扩展：
 
-    START → classify_intent ──┬─(知识类)──→ retrieve_knowledge ──┬─(工具类)──→ tool_action ──┐
-                             ├─(工具类)──────────────────────────┴───────────────────────────┤
-                             └─(闲聊)──────────────────────────────────────────────────────→ recall_memory → compose → generate → END
+    START → classify_intent ──┬─(知识类, Send)──→ retrieve_knowledge ──┐
+                              ├─(工具类, Send)──→ tool_action ────────┼→ recall_memory → compose → generate → END
+                              └─(闲聊)───────────────────────────────┘
 
-  - classify_intent   意图识别（联网用 LLM 结构化输出，mock / 失败降级为关键词规则）
+  知识类（knowledge / health / medical_urgent）与工具类（tool_query）可以同时命中：
+  路由层用 Send 并行扇出两个分支，两个分支各自写入互不重叠的状态字段，随后在
+  recall_memory 汇合（同一超级步完成后只执行一次）。
+
+  - classify_intent   意图识别（多标签：一句话可同时命中多个意图；联网用 LLM 结构化
+                       输出，mock / 失败降级为关键词规则）
   - retrieve_knowledge RAG 检索：多轮追问先改写成自包含查询，再做向量+BM25 混合检索
                        （见 app/kb/search.py），检索链路不可用时直接报错（不降级）
   - tool_action       Agent 工具调用：查询用户真实宠物 / 订单 / 购物车 / 评论 / 动态
-  - recall_memory     长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
+  - recall_memory     并行分支的汇合点 + 长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
   - compose           组装最终 System Prompt（人设 + 宠物档案 + 长期记忆 + 参考知识 + 真实数据 + 医疗护栏）
   - generate          调用 LLM 生成回答（真实模式；mock 模式由路由层走打字机 mock 流）
 
@@ -27,12 +32,13 @@ compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 t
   store 不可用或 MEMORY_ENABLED 关闭时降级为无长期记忆，不影响对话。
 """
 import logging
-from typing import Annotated, Any, Dict, List, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Send
 
 from app import checkpoint, memstore, persona
 from app.config import settings
@@ -70,7 +76,7 @@ class ChatState(TypedDict, total=False):
     # 消息内容恒为纯文本（附件描述 / 转写以文字并入），图片分片仅在 compose 组装
     # 最终请求时按当前轮附件现算——避免图片分片进 checkpoint 撑爆记忆存储
     messages: Annotated[List[AnyMessage], add_messages]
-    intent: str                    # 意图
+    intents: List[str]             # 本轮命中的全部意图（知识类与工具类可同时命中）
     intent_reason: str
     search_query: str              # 实际用于检索的查询（多轮追问改写后的自包含问法，空表示未改写）
     knowledge: List[Dict[str, Any]]  # RAG 检索结果（同时作为前端「参考来源」数据）
@@ -84,53 +90,61 @@ class ChatState(TypedDict, total=False):
 
 # ---------- 节点实现 ----------
 
-def _rule_intent(query: str) -> str:
-    """关键词规则意图识别（mock / 降级）"""
+def _rule_intents(query: str) -> List[str]:
+    """关键词规则意图识别（mock / 降级），知识类与工具类可以同时命中"""
     q = query.lower()
-    if any(w in q for w in _URGENT_WORDS):
-        return "medical_urgent"
-    if any(w in q for w in _MEDICAL_WORDS):
-        return "medical_urgent"
+    intents: List[str] = []
+    # 知识类只取一个：医疗优先，其次健康，否则交给默认的 knowledge
+    if any(w in q for w in _URGENT_WORDS) or any(w in q for w in _MEDICAL_WORDS):
+        intents.append("medical_urgent")
+    elif any(w in q for w in _HEALTH_WORDS):
+        intents.append("health")
+    # 工具查询与知识类正交，可并存（如「猫吐了，顺便查下订单」）
     if any(w in q for w in _TOOL_WORDS):
-        return "tool_query"
-    if any(w in q for w in _HEALTH_WORDS):
-        return "health"
-    if any(w in q for w in _CHITCHAT_WORDS) or len(query.strip()) <= 2:
-        return "chitchat"
-    return "knowledge"
+        intents.append("tool_query")
+    if not intents:
+        if any(w in q for w in _CHITCHAT_WORDS) or len(query.strip()) <= 2:
+            intents.append("chitchat")
+        else:
+            intents.append("knowledge")
+    return intents
 
 
 async def classify_intent(state: ChatState) -> Dict[str, Any]:
-    """意图识别节点：真实模式用 LLM 结构化输出，其余走规则
+    """意图识别节点：真实模式用 LLM 结构化输出（多标签），其余走规则
 
+    一句话可能同时命中多个意图（如「猫吐了，顺便看下我之前买的猫粮订单」
+    既要知识检索又要查用户数据），因此输出意图列表，由路由层并行扇出。
     纯附件消息（无文字）没有可分类的文本：养宠场景发图片 / 音频 / 视频
     绝大多数是「看看这是什么情况」的知识或健康咨询，直接归 knowledge，
     不再让分类器对「用户发送了 N 张图片」这类摘要文本猜意图。
     """
     query = state.get("query", "")
     if state.get("attachments") and not query.strip():
-        return {"intent": "knowledge", "intent_reason": "attachment/no-text"}
+        return {"intents": ["knowledge"], "intent_reason": "attachment/no-text"}
     if settings.is_mock:
-        intent = _rule_intent(query)
-        return {"intent": intent, "intent_reason": "mock/rule"}
+        return {"intents": _rule_intents(query), "intent_reason": "mock/rule"}
 
     prompt = (
-        "你是宠物社区 AI 助手的意图分类器。请判断用户问题的意图，"
-        "只输出意图分类结果。\n"
+        "你是宠物社区 AI 助手的意图分类器。请判断用户问题命中的全部意图，"
+        "可以多选：一句话可能同时包含多个意图，命中项必须全部输出。\n"
         "可选意图：\n"
         "- chitchat：打招呼、闲聊、寒暄\n"
         "- knowledge：养宠知识咨询（喂养、疫苗、驱虫、行为、护理等）\n"
         "- health：宠物健康评估、体检、养护计划\n"
         "- medical_urgent：疑似生病、症状描述、用药、急症（如中毒/抽搐/尿不出）\n"
         "- tool_query：需要查询用户本人数据（我的宠物、订单、购物车、商品评论、社区动态）\n"
+        "只输出意图分类结果。\n"
     )
     try:
         result: IntentResult = await astructured_invoke(IntentResult, prompt, query)
-        return {"intent": result.intent, "intent_reason": result.reason}
+        intents = list(dict.fromkeys(result.intents or []))
+        if intents:
+            return {"intents": intents, "intent_reason": result.reason}
+        logger.warning("意图识别返回空列表，降级为关键词规则")
     except Exception:
         logger.warning("意图识别失败，降级为关键词规则", exc_info=True)
-        intent = _rule_intent(query)
-        return {"intent": intent, "intent_reason": "fallback/rule"}
+    return {"intents": _rule_intents(query), "intent_reason": "fallback/rule"}
 
 
 # 追问指代词：命中任一，或问题很短，说明脱离上下文就检索不到东西，需要改写
@@ -201,8 +215,8 @@ async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
     物种信号优先取本轮提问里显式提到的物种（用户可能在替别人的宠物问），
     提问没提到时才回退到宠物档案物种。
     """
-    intent = state.get("intent", "")
-    if intent not in _KB_INTENTS or not settings.RAG_ENABLED:
+    intents = state.get("intents") or []
+    if not _KB_INTENTS.intersection(intents) or not settings.RAG_ENABLED:
         return {"knowledge": [], "knowledge_text": "", "search_query": ""}
 
     rewritten = await _build_search_query(state)
@@ -219,10 +233,10 @@ async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
 
 
 async def tool_action(state: ChatState) -> Dict[str, Any]:
-    """工具调用节点：意图为 tool_query 时运行 ReAct Agent 查询真实数据"""
+    """工具调用节点：命中 tool_query 意图时运行 ReAct Agent 查询真实数据"""
     user_id = state.get("user_id", 0)
     query = state.get("query", "")
-    if state.get("intent") != "tool_query" or settings.is_mock:
+    if "tool_query" not in (state.get("intents") or []) or settings.is_mock:
         return {"tool_context": ""}
     tools = build_tools(user_id)
     if not tools:
@@ -320,8 +334,7 @@ async def compose(state: ChatState) -> Dict[str, Any]:
         pet = PetInfo(**pet_dict)
     except Exception:
         pet = PetInfo()
-    intent = state.get("intent", "")
-    medical = intent == "medical_urgent"
+    medical = "medical_urgent" in (state.get("intents") or [])
 
     system_prompt = persona.build_system_prompt(
         pet,
@@ -386,17 +399,41 @@ async def generate(state: ChatState) -> Dict[str, Any]:
 
 # ---------- 路由 ----------
 
-def _route_after_classify(state: ChatState) -> str:
-    intent = state.get("intent", "")
-    if intent in _KB_INTENTS:
-        return "retrieve_knowledge"
-    if intent == "tool_query":
-        return "tool_action"
-    return "recall_memory"
+def _route_after_classify(state: ChatState) -> Sequence[Send]:
+    """多意图路由：知识类与工具类可同时命中，用 Send 并行扇出后在 recall_memory 汇合
 
+    每个 Send 的第二个参数是目标节点本次执行的输入，只携带该节点真正用到的
+    字段：检索分支需要 query / pet / messages（多轮追问改写）与 intents，
+    工具分支需要 query / user_id / intents，闲聊直达记忆分支只需 pet / user_id。
+    分支返回的增量会合并回主图状态，因此 compose 仍能拿到完整上下文。
+    两个分支写入互不重叠的字段（检索结果 / 工具结果），状态通道无需 reducer。
+    """
+    intents = state.get("intents") or []
+    pet = state.get("pet") or {}
+    res: List[Send] = []
 
-def _route_after_retrieve(state: ChatState) -> str:
-    return "tool_action" if state.get("intent") == "tool_query" else "recall_memory"
+    if _KB_INTENTS.intersection(intents):
+        res.append(Send("retrieve_knowledge", {
+            "query": state.get("query", ""),
+            "pet": pet,
+            "intents": intents,
+            "messages": state.get("messages") or [],
+        }))
+
+    if "tool_query" in intents:
+        res.append(Send("tool_action", {
+            "query": state.get("query", ""),
+            "user_id": state.get("user_id", 0),
+            "intents": intents,
+        }))
+
+    if not res:
+        res.append(Send("recall_memory", {
+            "pet": pet,
+            "user_id": state.get("user_id", 0),
+        }))
+
+    return res
 
 
 # ---------- 图构建 ----------
@@ -425,10 +462,8 @@ def get_chat_graph():
     builder.add_node("generate", generate)
 
     builder.add_edge(START, "classify_intent")
-    builder.add_conditional_edges("classify_intent", _route_after_classify,
-                                  ["retrieve_knowledge", "tool_action", "recall_memory"])
-    builder.add_conditional_edges("retrieve_knowledge", _route_after_retrieve,
-                                  ["tool_action", "recall_memory"])
+    builder.add_conditional_edges("classify_intent", _route_after_classify)
+    builder.add_edge("retrieve_knowledge", "recall_memory")
     builder.add_edge("tool_action", "recall_memory")
     builder.add_edge("recall_memory", "compose")
     builder.add_edge("compose", "generate")
@@ -451,7 +486,7 @@ def initial_state(query: str, pet: Dict[str, Any], user_id: int,
         "user_id": user_id,
         "attachments": attachments or [],
         "messages": messages or [],
-        "intent": "",
+        "intents": [],
         "intent_reason": "",
         "search_query": "",
         "knowledge": [],

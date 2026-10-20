@@ -14,6 +14,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * 统一消息发布器，屏蔽 RocketMQ 细节：
  * 1. 未配置 rocketmq.name-server 时 RocketMQTemplate 不存在，发送自动降级为仅记日志，不影响业务；
  * 2. 发送失败仅记日志不抛异常，保证主流程不被消息中间件拖垮；
+ *    需要保证事件不丢的业务可用带兜底回调的 publishAfterCommit 重载
  * 3. 提供事务提交后发送能力，避免"消息已发、事务回滚"导致的脏事件
  */
 @Slf4j
@@ -32,19 +33,19 @@ public class MqEventPublisher {
         return templateProvider.getIfAvailable() != null;
     }
 
-    /** 立即发送消息 */
-    public void publish(String topic, String tag, Object payload) {
-        doSend(destination(topic, tag), payload, null, null);
+    /** 立即发送消息；返回是否真正投递成功（未启用 MQ 或发送失败返回 false） */
+    public boolean publish(String topic, String tag, Object payload) {
+        return doSend(destination(topic, tag), payload, null, null);
     }
 
     /** 立即发送消息并携带业务去重键（消费端据此幂等） */
-    public void publish(String topic, String tag, Object payload, String key) {
-        doSend(destination(topic, tag), payload, key, null);
+    public boolean publish(String topic, String tag, Object payload, String key) {
+        return doSend(destination(topic, tag), payload, key, null);
     }
 
     /** 发送延迟消息，delayLevel 为开源版固定档位（如 14=10分钟） */
-    public void publishDelayed(String topic, String tag, Object payload, String key, int delayLevel) {
-        doSend(destination(topic, tag), payload, key, delayLevel);
+    public boolean publishDelayed(String topic, String tag, Object payload, String key, int delayLevel) {
+        return doSend(destination(topic, tag), payload, key, delayLevel);
     }
 
     /** 事务提交后发送；无活跃事务时立即发送 */
@@ -58,6 +59,25 @@ public class MqEventPublisher {
             });
         } else {
             publish(topic, tag, payload, key);
+        }
+    }
+
+    /**
+     * 事务提交后发送；未启用 MQ 或投递失败时执行 fallback。
+     * 单体版各模块同进程共存，可据此把跨服务事件降级为本地直接调用，避免事件丢失导致业务状态不一致
+     */
+    public void publishAfterCommit(String topic, String tag, Object payload, String key, Runnable fallback) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    if (!publish(topic, tag, payload, key)) {
+                        fallback.run();
+                    }
+                }
+            });
+        } else if (!publish(topic, tag, payload, key)) {
+            fallback.run();
         }
     }
 
@@ -75,11 +95,11 @@ public class MqEventPublisher {
         }
     }
 
-    private void doSend(String destination, Object payload, String key, Integer delayLevel) {
+    private boolean doSend(String destination, Object payload, String key, Integer delayLevel) {
         RocketMQTemplate template = templateProvider.getIfAvailable();
         if (template == null) {
             log.warn("RocketMQ 未启用（缺少 rocketmq.name-server 配置），跳过消息发送：{}", destination);
-            return;
+            return false;
         }
         try {
             MessageBuilder<Object> builder = MessageBuilder.withPayload(payload);
@@ -91,8 +111,10 @@ public class MqEventPublisher {
             } else {
                 template.syncSend(destination, builder.build(), SEND_TIMEOUT_MS, delayLevel);
             }
+            return true;
         } catch (Exception e) {
             log.error("消息发送失败，destination={}", destination, e);
+            return false;
         }
     }
 

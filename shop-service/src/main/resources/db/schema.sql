@@ -28,21 +28,37 @@ CREATE TABLE IF NOT EXISTS merchant_apply
 -- 商家店铺（入驻审批通过后生成）
 CREATE TABLE IF NOT EXISTS merchant
 (
-    id            BIGINT       NOT NULL COMMENT '主键(雪花ID)',
-    user_id       BIGINT       NOT NULL COMMENT '店主用户ID',
-    apply_id      BIGINT       NOT NULL COMMENT '来源申请单ID',
-    shop_name     VARCHAR(50)  NOT NULL COMMENT '店铺名称',
-    shop_logo     VARCHAR(255) DEFAULT NULL COMMENT '店铺LOGO',
-    description   VARCHAR(500) DEFAULT NULL COMMENT '店铺简介',
-    contact_phone VARCHAR(20)  DEFAULT NULL COMMENT '联系电话',
-    status        TINYINT      DEFAULT 1 COMMENT '店铺状态 1-营业 0-封禁',
-    create_time   DATETIME     DEFAULT NULL COMMENT '创建时间',
-    update_time   DATETIME     DEFAULT NULL COMMENT '更新时间',
-    deleted       TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
+    id                BIGINT       NOT NULL COMMENT '主键(雪花ID)',
+    user_id           BIGINT       NOT NULL COMMENT '店主用户ID',
+    apply_id          BIGINT       NOT NULL COMMENT '来源申请单ID',
+    shop_name         VARCHAR(50)  NOT NULL COMMENT '店铺名称',
+    shop_logo         VARCHAR(255) DEFAULT NULL COMMENT '店铺LOGO',
+    description       VARCHAR(500) DEFAULT NULL COMMENT '店铺简介',
+    contact_phone     VARCHAR(20)  DEFAULT NULL COMMENT '联系电话',
+    status            TINYINT      DEFAULT 1 COMMENT '店铺状态 1-营业 0-打烊 2-封禁',
+    ban_reason        VARCHAR(200) DEFAULT NULL COMMENT '封禁原因',
+    ban_time          DATETIME     DEFAULT NULL COMMENT '封禁时间',
+    withdraw_status   TINYINT      DEFAULT 0 COMMENT '商家身份撤销状态 0-正常 1-冷静期',
+    withdraw_deadline DATETIME     DEFAULT NULL COMMENT '撤销冷静期截止时间（到期清除店铺数据）',
+    create_time       DATETIME     DEFAULT NULL COMMENT '创建时间',
+    update_time       DATETIME     DEFAULT NULL COMMENT '更新时间',
+    deleted           TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_user_id (user_id)
+    UNIQUE KEY uk_user_id (user_id),
+    KEY idx_withdraw (withdraw_status, withdraw_deadline)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='商家店铺';
+
+-- 存量库升级（原有 status=0 表示封禁，新语义 0 表示打烊，升级时先迁移为 2）：
+-- ALTER TABLE merchant
+--     MODIFY COLUMN status TINYINT DEFAULT 1 COMMENT '店铺状态 1-营业 0-打烊 2-封禁',
+--     ADD COLUMN ban_reason VARCHAR(200) DEFAULT NULL COMMENT '封禁原因' AFTER status,
+--     ADD COLUMN ban_time DATETIME DEFAULT NULL COMMENT '封禁时间' AFTER ban_reason,
+--     ADD COLUMN withdraw_status TINYINT DEFAULT 0 COMMENT '商家身份撤销状态 0-正常 1-冷静期' AFTER ban_time,
+--     ADD COLUMN withdraw_deadline DATETIME DEFAULT NULL COMMENT '撤销冷静期截止时间' AFTER withdraw_status,
+--     ADD KEY idx_withdraw (withdraw_status, withdraw_deadline);
+-- UPDATE merchant SET status = 2 WHERE status = 0;
+-- UPDATE merchant SET withdraw_status = 0 WHERE withdraw_status IS NULL;
 
 -- 商品（宠物用品/食品与活体宠物）
 CREATE TABLE IF NOT EXISTS product

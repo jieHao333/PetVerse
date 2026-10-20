@@ -1,6 +1,7 @@
 package com.my.petverse.shop.controller;
 
 import com.my.petverse.common.context.UserContext;
+import com.my.petverse.common.dto.shop.MerchantStatusDTO;
 import com.my.petverse.common.dto.shop.MerchantUpdateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
 import com.my.petverse.common.dto.shop.ProductPageQueryDTO;
@@ -42,6 +43,24 @@ public class MerchantController {
     @PutMapping("/info")
     public Result<MerchantVO> updateInfo(@RequestBody @Valid MerchantUpdateDTO dto) {
         return Result.success(merchantService.updateInfo(UserContext.getUserId(), dto));
+    }
+
+    /** 切换店铺营业状态（营业/打烊），打烊期间商品在商城隐藏且不可下单 */
+    @PutMapping("/status")
+    public Result<MerchantVO> updateStatus(@RequestBody @Valid MerchantStatusDTO dto) {
+        return Result.success(merchantService.updateSellingStatus(UserContext.getUserId(), dto));
+    }
+
+    /** 申请撤销商家身份，进入 5 天冷静期，期间店铺立即停止对外售卖 */
+    @PostMapping("/withdraw")
+    public Result<MerchantVO> withdraw() {
+        return Result.success(merchantService.applyWithdraw(UserContext.getUserId()));
+    }
+
+    /** 冷静期内取消撤销，恢复商家身份继续经营 */
+    @PostMapping("/withdraw/cancel")
+    public Result<MerchantVO> cancelWithdraw() {
+        return Result.success(merchantService.cancelWithdraw(UserContext.getUserId()));
     }
 
     /** 新增商品（默认下架，编辑完成后手动上架） */

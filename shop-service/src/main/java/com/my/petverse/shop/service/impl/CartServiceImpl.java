@@ -47,6 +47,8 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         if (product == null || product.getStatus() == null || product.getStatus() != 1) {
             throw new BusinessException(ResultCode.NOT_FOUND, "商品不存在或已下架");
         }
+        // 店铺封禁/打烊/撤销冷静期内不允许加购，避免结算时才被拦截
+        Merchant merchant = requireSellableMerchant(product.getMerchantId());
         // 原子累加数量：并发加购同一商品由唯一索引与条件更新兜底，不会产生重复条目或数量覆盖
         if (baseMapper.accumulateQuantity(userId, dto.getProductId(), dto.getQuantity(), MAX_QUANTITY) == 0) {
             // 累加未生效：条目已存在说明到达数量上限，不存在则新增
@@ -71,8 +73,7 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         if (product.getStock() != null && item.getQuantity() > product.getStock()) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "加购数量超过库存，当前库存 " + product.getStock());
         }
-        Merchant merchant = merchantMapper.selectById(product.getMerchantId());
-        return toVO(item, product, merchant == null ? null : merchant.getShopName());
+        return toVO(item, product, merchant);
     }
 
     @Override
@@ -90,14 +91,14 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         Set<Long> merchantIds = products.values().stream()
                 .map(Product::getMerchantId)
                 .collect(Collectors.toSet());
-        Map<Long, String> shopNames = merchantIds.isEmpty() ? Map.of()
+        Map<Long, Merchant> merchants = merchantIds.isEmpty() ? Map.of()
                 : merchantMapper.selectBatchIds(merchantIds).stream()
-                        .collect(Collectors.toMap(Merchant::getId, Merchant::getShopName));
+                        .collect(Collectors.toMap(Merchant::getId, Function.identity()));
         return items.stream()
                 .map(item -> {
                     Product product = products.get(item.getProductId());
-                    String shopName = product == null ? null : shopNames.get(product.getMerchantId());
-                    return toVO(item, product, shopName);
+                    Merchant merchant = product == null ? null : merchants.get(product.getMerchantId());
+                    return toVO(item, product, merchant);
                 })
                 .collect(Collectors.toList());
     }
@@ -109,6 +110,8 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         if (product == null || product.getStatus() == null || product.getStatus() != 1) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "商品已失效，请删除后重新选购");
         }
+        // 店铺暂停营业后购物车条目不可继续修改数量，需等待店铺恢复或删除条目
+        requireSellableMerchant(product.getMerchantId());
         if (product.getStock() != null && dto.getQuantity() > product.getStock()) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "购买数量超过库存，当前库存 " + product.getStock());
         }
@@ -121,6 +124,24 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         getOwnItem(userId, itemId);
         // 物理删除：移除后的条目不再占用 (user_id, product_id) 唯一索引，可直接重新加购
         return baseMapper.physicalDelete(itemId, userId) > 0;
+    }
+
+    /** 校验店铺当前可售，返回店铺实体供返回结果复用 */
+    private Merchant requireSellableMerchant(Long merchantId) {
+        Merchant merchant = merchantMapper.selectById(merchantId);
+        if (merchant == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "店铺不存在");
+        }
+        if (merchant.isBanned()) {
+            throw new BusinessException(ResultCode.FORBIDDEN, "该商家已被封禁，无法购买");
+        }
+        if (merchant.isWithdrawing()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法购买");
+        }
+        if (merchant.getStatus() == null || merchant.getStatus() != 1) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已打烊，暂不营业");
+        }
+        return merchant;
     }
 
     /** 定位同一用户同一商品的购物车条目 */
@@ -139,23 +160,51 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         return item;
     }
 
-    /** DO 转 VO，附加商品与店铺信息（商品被删除/下架时标记失效） */
-    private CartItemVO toVO(CartItem item, Product product, String shopName) {
+    /** DO 转 VO，附加商品与店铺信息（商品失效或店铺不可售时标记失效及原因） */
+    private CartItemVO toVO(CartItem item, Product product, Merchant merchant) {
         CartItemVO vo = new CartItemVO();
         vo.setId(item.getId());
         vo.setProductId(item.getProductId());
         vo.setQuantity(item.getQuantity());
         if (product != null) {
             vo.setMerchantId(product.getMerchantId());
-            vo.setShopName(shopName);
             vo.setProductName(product.getName());
             vo.setProductImage(product.getImageUrl());
             vo.setPrice(product.getPrice());
             vo.setStock(product.getStock());
-            vo.setValid(product.getStatus() != null && product.getStatus() == 1);
-        } else {
-            vo.setValid(false);
         }
+        if (merchant != null) {
+            vo.setShopName(merchant.getShopName());
+            vo.setShopStatus(merchant.getStatus());
+            vo.setShopWithdrawStatus(merchant.getWithdrawStatus());
+            vo.setShopSelling(merchant.isSelling());
+        }
+        String invalidReason = resolveInvalidReason(product, merchant);
+        vo.setValid(invalidReason == null);
+        vo.setInvalidReason(invalidReason);
         return vo;
+    }
+
+    /** 计算购物车条目失效原因，null 表示可正常结算 */
+    private String resolveInvalidReason(Product product, Merchant merchant) {
+        if (product == null) {
+            return "商品已失效（下架或售罄）";
+        }
+        if (product.getStatus() == null || product.getStatus() != 1) {
+            return "商品已下架";
+        }
+        if (merchant == null) {
+            return "店铺不存在";
+        }
+        if (merchant.isBanned()) {
+            return "商家已被封禁";
+        }
+        if (merchant.isWithdrawing()) {
+            return "店铺已停止营业";
+        }
+        if (merchant.getStatus() == null || merchant.getStatus() != 1) {
+            return "店铺休息中";
+        }
+        return null;
     }
 }

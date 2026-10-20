@@ -150,17 +150,19 @@ public class ProductIndexReconcileTask {
         return removed;
     }
 
-    /** 批量回表店铺名后重推一批商品索引（与索引消费者同一套回表逻辑） */
+    /** 批量回表店铺信息后重推一批商品索引（与索引消费者同一套回表逻辑，按店铺营业状态写入可售状态） */
     private void reindexProducts(List<Product> products) {
         if (products.isEmpty()) {
             return;
         }
         Set<Long> merchantIds = products.stream().map(Product::getMerchantId).collect(Collectors.toSet());
-        Map<Long, String> shopNames = merchantMapper.selectBatchIds(merchantIds).stream()
-                .collect(Collectors.toMap(Merchant::getId,
-                        merchant -> merchant.getShopName() == null ? "" : merchant.getShopName()));
+        Map<Long, Merchant> shops = merchantMapper.selectBatchIds(merchantIds).stream()
+                .collect(Collectors.toMap(Merchant::getId, merchant -> merchant));
         for (Product product : products) {
-            productSearchService.indexProduct(product, shopNames.getOrDefault(product.getMerchantId(), ""));
+            Merchant merchant = shops.get(product.getMerchantId());
+            productSearchService.indexProduct(product,
+                    merchant == null ? "" : merchant.getShopName(),
+                    merchant != null && merchant.isSelling());
         }
     }
 

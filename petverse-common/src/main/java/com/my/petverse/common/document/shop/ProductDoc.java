@@ -42,7 +42,7 @@ public class ProductDoc implements Serializable {
     @Field(type = FieldType.Long)
     private Long merchantId;
 
-    /** 状态：0-下架 1-上架 */
+    /** 对外可售状态：0-不可售 1-可售（商品上架且店铺营业时为 1） */
     @Field(type = FieldType.Integer)
     private Integer status;
 

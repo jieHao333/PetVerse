@@ -27,7 +27,7 @@ import java.nio.charset.StandardCharsets;
 @RequiredArgsConstructor
 @RocketMQMessageListener(topic = MqTopics.PRODUCT_INDEX,
         selectorExpression = MqTopics.TAG_PRODUCT_UPSERT + " || " + MqTopics.TAG_PRODUCT_REMOVE
-                + " || " + MqTopics.TAG_PRODUCT_SHOP_RENAMED,
+                + " || " + MqTopics.TAG_PRODUCT_SHOP_RENAMED + " || " + MqTopics.TAG_PRODUCT_SHOP_CHANGED,
         consumerGroup = "product-index-consumer")
 public class ProductIndexConsumer implements RocketMQListener<MessageExt> {
 
@@ -54,8 +54,9 @@ public class ProductIndexConsumer implements RocketMQListener<MessageExt> {
             if (MqTopics.TAG_PRODUCT_REMOVE.equals(tag)) {
                 // 重复删除幂等，无需额外去重
                 productSearchService.removeProduct(msg.getProductId());
-            } else if (MqTopics.TAG_PRODUCT_SHOP_RENAMED.equals(tag)) {
-                refreshShopName(msg.getMerchantId());
+            } else if (MqTopics.TAG_PRODUCT_SHOP_RENAMED.equals(tag)
+                    || MqTopics.TAG_PRODUCT_SHOP_CHANGED.equals(tag)) {
+                refreshMerchantProducts(msg.getMerchantId());
             } else {
                 indexProduct(msg.getProductId());
             }
@@ -77,19 +78,19 @@ public class ProductIndexConsumer implements RocketMQListener<MessageExt> {
         }
         Merchant merchant = merchantMapper.selectById(product.getMerchantId());
         String shopName = merchant == null ? "" : merchant.getShopName();
-        productSearchService.indexProduct(product, shopName);
+        productSearchService.indexProduct(product, shopName, merchant != null && merchant.isSelling());
     }
 
-    /** 店铺改名：按最新店铺名重刷该店全部商品索引 */
-    private void refreshShopName(Long merchantId) {
+    /** 店铺改名/营业状态变更：按最新店铺信息重刷该店全部商品索引 */
+    private void refreshMerchantProducts(Long merchantId) {
         if (merchantId == null) {
             return;
         }
         Merchant merchant = merchantMapper.selectById(merchantId);
         if (merchant == null) {
-            log.warn("改名事件对应的店铺不存在，merchantId={}", merchantId);
+            log.warn("店铺索引事件对应的店铺不存在，merchantId={}", merchantId);
             return;
         }
-        productSearchService.refreshShopName(merchantId, merchant.getShopName());
+        productSearchService.refreshMerchantProducts(merchantId);
     }
 }

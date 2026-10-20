@@ -125,9 +125,10 @@ IntentType = Literal["chitchat", "knowledge", "health", "medical_urgent", "tool_
 
 
 class IntentResult(BaseModel):
-    """意图识别结构化输出"""
+    """意图识别结构化输出（多标签：一句话可同时命中多个意图）"""
 
-    intent: IntentType = Field(description="用户本轮问题的意图分类")
+    intents: List[IntentType] = Field(
+        description="用户本轮问题命中的全部意图，可多选；命中多个时全部返回，至少返回一个")
     reason: str = Field(default="", description="简要说明分类依据")
 
 

@@ -127,10 +127,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
             throw new BusinessException(ResultCode.BAD_REQUEST, "一次只能结算同一店铺的商品，请分开下单");
         }
         Long merchantId = merchantIds.iterator().next();
-        Merchant merchant = merchantMapper.selectById(merchantId);
-        if (merchant == null || merchant.getStatus() == null || merchant.getStatus() != 1) {
-            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法下单");
-        }
+        // 封禁/打烊/撤销冷静期的店铺不允许下单
+        Merchant merchant = requireSellableMerchant(merchantId);
         // 购物车条目转购买清单后走统一下单流程
         List<long[]> buyItems = new ArrayList<>();
         for (CartItem item : cartItems) {
@@ -150,13 +148,28 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         if (product == null || product.getStatus() == null || product.getStatus() != 1) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "商品已下架或不存在，无法购买");
         }
-        Merchant merchant = merchantMapper.selectById(product.getMerchantId());
-        if (merchant == null || merchant.getStatus() == null || merchant.getStatus() != 1) {
-            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法下单");
-        }
+        Merchant merchant = requireSellableMerchant(product.getMerchantId());
         // 直接购买不经过购物车，单商品成单
         return buildOrder(userId, merchant, Map.of(product.getId(), product),
                 List.of(new long[]{product.getId(), dto.getQuantity()}), dto.getRemark());
+    }
+
+    /** 校验店铺当前可售并返回店铺实体，封禁/打烊/撤销冷静期统一在此拦截 */
+    private Merchant requireSellableMerchant(Long merchantId) {
+        Merchant merchant = merchantMapper.selectById(merchantId);
+        if (merchant == null) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺不存在，无法下单");
+        }
+        if (merchant.isBanned()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "该商家已被封禁，无法下单");
+        }
+        if (merchant.isWithdrawing()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已停止营业，无法下单");
+        }
+        if (merchant.getStatus() == null || merchant.getStatus() != 1) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺已打烊，暂不营业");
+        }
+        return merchant;
     }
 
     /**
@@ -232,6 +245,14 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         }
         if (!Objects.equals(order.getStatus(), OrderStatus.PENDING_PAYMENT.getCode())) {
             throw new BusinessException(ResultCode.BAD_REQUEST, "订单不是待支付状态，无法支付");
+        }
+        // 商家被封禁后禁止继续完成支付，未支付订单会随支付超时自动取消并回补库存
+        Merchant merchant = merchantMapper.selectById(order.getMerchantId());
+        if (merchant == null) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "店铺不存在，订单无法支付");
+        }
+        if (merchant.isBanned()) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "该商家已被封禁，订单无法支付");
         }
         // 模拟支付成功，生成取货码作为到店核销凭证；
         // 状态条件更新限制仅待支付可支付，与超时取消互斥，不会出现支付后又被取消
@@ -325,7 +346,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     @Override
     public PageResult<OrderVO> pageMerchant(Long userId, OrderPageQueryDTO dto) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        // 打烊与撤销冷静期仍可查看/处理历史订单，仅封禁店铺禁止操作
+        Merchant merchant = merchantService.getManageMerchant(userId);
         Page<ShopOrder> page = page(new Page<>(dto.getPageNum(), dto.getPageSize()),
                 new LambdaQueryWrapper<ShopOrder>()
                         .eq(ShopOrder::getMerchantId, merchant.getId())
@@ -336,7 +358,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     @Override
     public OrderVO completeOrder(Long userId, Long orderId, String pickupCode) {
-        Merchant merchant = merchantService.getActiveMerchant(userId);
+        // 打烊/撤销冷静期允许继续核销已产生的待取货订单
+        Merchant merchant = merchantService.getManageMerchant(userId);
         ShopOrder order = getById(orderId);
         // 校验订单归属本店，防止越权核销他店订单
         if (order == null || !Objects.equals(order.getMerchantId(), merchant.getId())) {

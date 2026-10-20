@@ -22,7 +22,7 @@ public final class MqTopics {
     /** 动态索引删除：消费方为 space-service 自身 */
     public static final String TAG_SPACE_INDEX_REMOVE = "index-remove";
 
-    /** 商品检索索引事件（新增/更新、删除、店铺改名重刷） */
+    /** 商品检索索引事件（新增/更新、删除、店铺改名/营业状态变更重刷） */
     public static final String PRODUCT_INDEX = "product-index-topic";
 
     public static final String TAG_PRODUCT_UPSERT = "upsert";
@@ -31,15 +31,19 @@ public final class MqTopics {
 
     public static final String TAG_PRODUCT_SHOP_RENAMED = "shop-renamed";
 
+    public static final String TAG_PRODUCT_SHOP_CHANGED = "shop-changed";
+
     /** 订单超时自动取消（延迟消息） */
     public static final String ORDER_TIMEOUT = "order-timeout-topic";
 
     public static final String TAG_ORDER_TIMEOUT = "timeout";
 
-    /** 商户事件（入驻审批通过后升级用户角色） */
+    /** 商户事件（入驻审批通过后升级用户角色、撤销冷静期结束后降级用户角色） */
     public static final String MERCHANT_EVENT = "merchant-event-topic";
 
     public static final String TAG_MERCHANT_APPROVED = "approved";
+
+    public static final String TAG_MERCHANT_WITHDRAWN = "withdrawn";
 
     /** 点赞变更事件（驱动业务侧热度冗余列近实时同步） */
     public static final String LIKE_CHANGED = "like-changed-topic";

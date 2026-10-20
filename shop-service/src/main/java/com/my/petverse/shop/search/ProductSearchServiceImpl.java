@@ -74,12 +74,12 @@ public class ProductSearchServiceImpl implements ProductSearchService {
     }
 
     @Override
-    public void indexProduct(Product product, String shopName) {
+    public void indexProduct(Product product, String shopName, boolean shopSelling) {
         if (!searchEnabled || product == null) {
             return;
         }
         try {
-            elasticsearchOperations.save(toDoc(product, shopName));
+            elasticsearchOperations.save(toDoc(product, shopName, shopSelling));
         } catch (Exception e) {
             markDegraded("写入商品索引失败，productId=" + product.getId(), e);
         }
@@ -98,21 +98,26 @@ public class ProductSearchServiceImpl implements ProductSearchService {
     }
 
     @Override
-    public void refreshShopName(Long merchantId, String shopName) {
+    public void refreshMerchantProducts(Long merchantId) {
         if (!searchEnabled || merchantId == null) {
             return;
         }
         try {
+            Merchant merchant = merchantMapper.selectById(merchantId);
+            if (merchant == null) {
+                return;
+            }
             List<Product> products = productMapper.selectList(new LambdaQueryWrapper<Product>()
                     .eq(Product::getMerchantId, merchantId));
             if (products.isEmpty()) {
                 return;
             }
+            boolean shopSelling = merchant.isSelling();
             elasticsearchOperations.save(products.stream()
-                    .map(product -> toDoc(product, shopName))
+                    .map(product -> toDoc(product, merchant.getShopName(), shopSelling))
                     .toList());
         } catch (Exception e) {
-            markDegraded("刷新店铺名到商品索引失败，merchantId=" + merchantId, e);
+            markDegraded("刷新店铺商品索引失败，merchantId=" + merchantId, e);
         }
     }
 
@@ -149,9 +154,13 @@ public class ProductSearchServiceImpl implements ProductSearchService {
             if (batch.isEmpty()) {
                 break;
             }
-            Map<Long, String> shopNames = loadShopNames(batch);
+            Map<Long, Merchant> shops = loadShops(batch);
             elasticsearchOperations.save(batch.stream()
-                    .map(product -> toDoc(product, shopNames.get(product.getMerchantId())))
+                    .map(product -> {
+                        Merchant merchant = shops.get(product.getMerchantId());
+                        return toDoc(product, merchant == null ? null : merchant.getShopName(),
+                                merchant != null && merchant.isSelling());
+                    })
                     .toList());
             lastId = batch.get(batch.size() - 1).getId();
             total += batch.size();
@@ -159,19 +168,19 @@ public class ProductSearchServiceImpl implements ProductSearchService {
         return total;
     }
 
-    /** 批量查询商品所属店铺名称 */
-    private Map<Long, String> loadShopNames(List<Product> products) {
+    /** 批量查询商品所属店铺 */
+    private Map<Long, Merchant> loadShops(List<Product> products) {
         Set<Long> merchantIds = products.stream()
                 .map(Product::getMerchantId)
                 .collect(Collectors.toSet());
         if (merchantIds.isEmpty()) {
             return Map.of();
         }
-        Map<Long, String> shopNames = new HashMap<>();
+        Map<Long, Merchant> shops = new HashMap<>();
         for (Merchant merchant : merchantMapper.selectBatchIds(merchantIds)) {
-            shopNames.put(merchant.getId(), merchant.getShopName());
+            shops.put(merchant.getId(), merchant);
         }
-        return shopNames;
+        return shops;
     }
 
     @Override
@@ -266,8 +275,8 @@ public class ProductSearchServiceImpl implements ProductSearchService {
         return bool.build();
     }
 
-    /** DO 转 ES 文档 */
-    private ProductDoc toDoc(Product product, String shopName) {
+    /** DO 转 ES 文档：status 记录对外可售状态，店铺未营业时即使商品上架也按 0 处理 */
+    private ProductDoc toDoc(Product product, String shopName, boolean shopSelling) {
         ProductDoc doc = new ProductDoc();
         doc.setId(String.valueOf(product.getId()));
         doc.setName(product.getName());
@@ -275,7 +284,8 @@ public class ProductSearchServiceImpl implements ProductSearchService {
         doc.setShopName(shopName);
         doc.setCategory(product.getCategory());
         doc.setMerchantId(product.getMerchantId());
-        doc.setStatus(product.getStatus());
+        boolean onSale = product.getStatus() != null && product.getStatus() == 1 && shopSelling;
+        doc.setStatus(onSale ? 1 : 0);
         doc.setCreateTime(product.getCreateTime() == null
                 ? System.currentTimeMillis() : toEpochMilli(product.getCreateTime()));
         return doc;

@@ -152,6 +152,7 @@ public class MerchantApplyServiceImpl extends ServiceImpl<MerchantApplyMapper, M
             merchant.setDescription(apply.getDescription());
             merchant.setContactPhone(apply.getContactPhone());
             merchant.setStatus(1);
+            merchant.setWithdrawStatus(0);
             merchantMapper.insert(merchant);
             // 跨服务升级用户角色改为事件驱动：事务提交后发消息，user-service 消费升级角色，
             // 失败由 RocketMQ 重试直至成功，避免同步 Feign 失败导致审批整体回滚（最终一致）
