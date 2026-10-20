@@ -160,6 +160,14 @@ def _is_off_species(cand: Dict[str, Any], own_groups: Set[str]) -> bool:
     return not owned or order[0] in foreign
 
 
+def _as_number(value: Any) -> int:
+    """把 Java 可能序列化成字符串的数值字段安全转成 int，异常值按 0 处理"""
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _relevance(cand: Dict[str, Any], own_groups: Set[str]) -> float:
     """相关度打分：命中自家物种加分（标题命中更高于详情命中），标题写明别家物种减分，
     画像召回优于热门兜底，动态再按点赞微调。"""
@@ -278,7 +286,8 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
             cand = {
                 "id": rid, "type": "space",
                 "title": raw.get("title") or (raw.get("content") or "")[:30],
-                "image": "", "likeCount": raw.get("likeCount") or 0,
+                # Java 侧 Long 统一序列化为字符串，相关度计算要用数值，先归一化
+                "image": "", "likeCount": _as_number(raw.get("likeCount")),
                 "category": raw.get("category") or "",
             }
         cand["_targeted"] = targeted
