@@ -61,6 +61,12 @@ spring:
             - Path=/api/shop/**
           filters:
             - StripPrefix=1
+        - id: promotion-service
+          uri: lb://promotion-service
+          predicates:
+            - Path=/api/promotion/**
+          filters:
+            - StripPrefix=1
         - id: ai-service
           uri: lb://ai-service
           predicates:
@@ -86,7 +92,8 @@ auth:
     /api/shop/store/*,
     /api/shop/review/page,
     /api/shop/review/reply/page,
-    /api/shop/review/summary/*
+    /api/shop/review/summary/*,
+    /api/promotion/coupons/list
 
 petverse:
   gateway:

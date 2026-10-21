@@ -4,6 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.my.petverse.common.dto.promotion.CouponDiscountDTO;
+import com.my.petverse.common.dto.promotion.OrderCouponDTO;
+import com.my.petverse.common.dto.promotion.OrderProductDTO;
 import com.my.petverse.common.dto.shop.OrderBuyNowDTO;
 import com.my.petverse.common.dto.shop.OrderCreateDTO;
 import com.my.petverse.common.dto.shop.OrderPageQueryDTO;
@@ -19,9 +22,11 @@ import com.my.petverse.common.mq.MqEventPublisher;
 import com.my.petverse.common.mq.MqTopics;
 import com.my.petverse.common.mq.message.OrderTimeoutMessage;
 import com.my.petverse.common.result.PageResult;
+import com.my.petverse.common.result.Result;
 import com.my.petverse.common.result.ResultCode;
 import com.my.petverse.common.vo.shop.OrderItemVO;
 import com.my.petverse.common.vo.shop.OrderVO;
+import com.my.petverse.shop.feign.PromotionFeignClient;
 import com.my.petverse.shop.mapper.CartItemMapper;
 import com.my.petverse.shop.mapper.MerchantMapper;
 import com.my.petverse.shop.mapper.ProductMapper;
@@ -30,6 +35,7 @@ import com.my.petverse.shop.mapper.ShopOrderMapper;
 import com.my.petverse.shop.service.MerchantService;
 import com.my.petverse.shop.service.OrderService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -52,6 +58,7 @@ import java.util.stream.Collectors;
 /**
  * 订单服务实现类（目前仅支持到店自取，预留外卖配送扩展）
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> implements OrderService {
@@ -67,6 +74,11 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     private final MerchantService merchantService;
 
     private final MqEventPublisher mqEventPublisher;
+
+    private final PromotionFeignClient promotionFeignClient;
+
+    /** 元与分的换算倍数（promotion-service 优惠金额以分为单位） */
+    private static final BigDecimal CENT_RATE = BigDecimal.valueOf(100);
 
     /** 支付超时时长（分钟），默认 10 分钟；超出开源版延迟档位支持范围时向上取最近档位 */
     @Value("${petverse.order.pay-timeout-minutes:10}")
@@ -134,7 +146,7 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         for (CartItem item : cartItems) {
             buyItems.add(new long[]{item.getProductId(), item.getQuantity()});
         }
-        OrderVO vo = buildOrder(userId, merchant, products, buyItems, dto.getRemark());
+        OrderVO vo = buildOrder(userId, merchant, products, buyItems, dto.getRemark(), dto.getUserCouponId());
         // 已结算条目移出购物车（物理删除，释放 (user_id, product_id) 唯一索引）
         cartItemMapper.physicalDeleteBatch(userId, cartItemIds);
         return vo;
@@ -151,7 +163,7 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
         Merchant merchant = requireSellableMerchant(product.getMerchantId());
         // 直接购买不经过购物车，单商品成单
         return buildOrder(userId, merchant, Map.of(product.getId(), product),
-                List.of(new long[]{product.getId(), dto.getQuantity()}), dto.getRemark());
+                List.of(new long[]{product.getId(), dto.getQuantity()}), dto.getRemark(), dto.getUserCouponId());
     }
 
     /** 校验店铺当前可售并返回店铺实体，封禁/打烊/撤销冷静期统一在此拦截 */
@@ -174,12 +186,14 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     /**
      * 统一下单流程（购物车结算与直接购买共用）：
-     * 合并购买行并按商品ID升序扣减库存 → 生成待支付订单与商品快照明细 → 事务提交后发送支付超时延迟消息
+     * 合并购买行并按商品ID升序扣减库存 → 优惠券试算抵扣 → 生成待支付订单与商品快照明细 →
+     * 核销优惠券 → 事务提交后发送支付超时延迟消息
      *
-     * @param buyItems 购买清单，每项为 {商品ID, 数量}，同一商品的多行会先合并
+     * @param buyItems     购买清单，每项为 {商品ID, 数量}，同一商品的多行会先合并
+     * @param userCouponId 下单使用的用户优惠券ID，null 表示不使用优惠券
      */
     private OrderVO buildOrder(Long userId, Merchant merchant, Map<Long, Product> products,
-                               List<long[]> buyItems, String remark) {
+                               List<long[]> buyItems, String remark, Long userCouponId) {
         // 合并同一商品的购买行并用有序表按商品ID升序迭代：并发下单时各事务以相同顺序持有行锁，避免互相等待
         Map<Long, Integer> mergedItems = new TreeMap<>();
         for (long[] buyItem : buyItems) {
@@ -211,7 +225,13 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
             Product product = products.get(entry.getKey());
             totalAmount = totalAmount.add(product.getPrice().multiply(BigDecimal.valueOf(entry.getValue())));
         }
+        // 优惠券试算抵扣：先调 promotion-service 计算所选券在当前商品组合下的优惠金额（不可用则拒绝下单）
+        BigDecimal discountAmount = userCouponId == null ? BigDecimal.ZERO
+                : queryCouponDiscount(userId, userCouponId, products, mergedItems, totalAmount);
         order.setTotalAmount(totalAmount);
+        order.setDiscountAmount(discountAmount);
+        order.setPayAmount(totalAmount.subtract(discountAmount));
+        order.setUserCouponId(userCouponId);
         save(order);
         for (Map.Entry<Long, Integer> entry : mergedItems.entrySet()) {
             Product product = products.get(entry.getKey());
@@ -225,6 +245,14 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
             orderItem.setAmount(product.getPrice().multiply(BigDecimal.valueOf(entry.getValue())));
             orderItemMapper.insert(orderItem);
         }
+        // 核销优惠券：放在订单与明细落库之后，核销失败抛异常使本地事务回滚，
+        // 订单不会带着未核销的优惠金额创建成功
+        if (userCouponId != null) {
+            Result<Void> writeOff = promotionFeignClient.writeOffCoupon(List.of(userCouponId));
+            if (writeOff == null || writeOff.getCode() != ResultCode.SUCCESS.getCode()) {
+                throw new BusinessException(ResultCode.BAD_REQUEST, "优惠券核销失败，请稍后重试");
+            }
+        }
         // 事务提交后发送超时延迟消息，到期后若仍未支付由消费者自动取消并回补库存，防止库存被永久占用；
         // 消费端按订单状态幂等处理，消息重复投递或下单后已支付/取消均安全（发送失败仅记日志，不影响下单）
         int[] delay = resolvePayTimeoutDelay();
@@ -232,6 +260,54 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
                 new OrderTimeoutMessage(order.getId()), "order-timeout:" + order.getId(),
                 delay[0]);
         return toVO(order, merchant.getShopName(), listItems(order.getId()));
+    }
+
+    /**
+     * 调用 promotion-service 试算所选优惠券在当前商品组合下的抵扣金额：
+     * 组装商品 id/分类/价格（分）交给优惠方案计算服务校验门槛与计算明细，
+     * 券不可用（无方案或优惠金额非正数）时拒绝下单
+     */
+    private BigDecimal queryCouponDiscount(Long userId, Long userCouponId, Map<Long, Product> products,
+                                           Map<Long, Integer> mergedItems, BigDecimal totalAmount) {
+        List<OrderProductDTO> orderProducts = mergedItems.entrySet().stream()
+                .map(entry -> {
+                    Product product = products.get(entry.getKey());
+                    return new OrderProductDTO()
+                            .setId(product.getId())
+                            .setCategoryId(product.getCategory() == null ? null : product.getCategory().longValue())
+                            .setPrice(product.getPrice().multiply(BigDecimal.valueOf(mergedItems.get(product.getId())))
+                                    .multiply(CENT_RATE).intValue());
+                })
+                .collect(Collectors.toList());
+        OrderCouponDTO orderCoupon = new OrderCouponDTO();
+        orderCoupon.setUserCouponIds(List.of(userCouponId));
+        orderCoupon.setProductList(orderProducts);
+        CouponDiscountDTO discount;
+        try {
+            Result<CouponDiscountDTO> result = promotionFeignClient.queryDiscountDetail(orderCoupon);
+            discount = result == null ? null : result.getData();
+        } catch (Exception e) {
+            log.error("优惠券优惠金额试算失败，userCouponId={}", userCouponId, e);
+            throw new BusinessException(ResultCode.BAD_REQUEST, "优惠券服务不可用，请稍后重试");
+        }
+        if (discount == null || discount.getDiscountAmount() == null || discount.getDiscountAmount() <= 0) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "优惠券不满足当前订单使用条件，请重新选择");
+        }
+        int discountCents = Math.min(discount.getDiscountAmount(),
+                totalAmount.multiply(CENT_RATE).intValue());
+        return BigDecimal.valueOf(discountCents, 2);
+    }
+
+    /** 取消订单时退还已使用的优惠券（promotion-service 不可用时仅记日志，不阻断取消流程） */
+    private void refundCouponQuietly(ShopOrder order) {
+        if (order.getUserCouponId() == null) {
+            return;
+        }
+        try {
+            promotionFeignClient.refundCoupon(List.of(order.getUserCouponId()));
+        } catch (Exception e) {
+            log.error("退还优惠券失败，orderId={}, userCouponId={}", order.getId(), order.getUserCouponId(), e);
+        }
     }
 
     @Override
@@ -316,6 +392,8 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
                     .eq(Product::getId, item.getProductId())
                     .setSql("stock = stock + {0}", item.getQuantity()));
         }
+        // 退还下单时使用的优惠券（仅条件更新抢占成功的一方执行，不会重复退还）
+        refundCouponQuietly(order);
         return true;
     }
 

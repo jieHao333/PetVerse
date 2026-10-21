@@ -20,6 +20,7 @@
         <module>social-service</module>
         <module>remark-service</module>
         <module>shop-service</module>
+        <module>promotion-service</module>
         <module>gateway-service</module>
     </modules>
 
@@ -35,6 +36,7 @@
         <jjwt.version>0.12.7</jjwt.version>
         <aliyun-oss.version>3.18.1</aliyun-oss.version>
         <rocketmq-spring.version>2.3.3</rocketmq-spring.version>
+        <redisson.version>3.27.2</redisson.version>
     </properties>
 
     <dependencyManagement>
@@ -106,6 +108,12 @@
                 <groupId>org.apache.rocketmq</groupId>
                 <artifactId>rocketmq-spring-boot-starter</artifactId>
                 <version>${rocketmq-spring.version}</version>
+            </dependency>
+            <!-- Redisson：优惠券分布式锁（@MyLock 注解体系） -->
+            <dependency>
+                <groupId>org.redisson</groupId>
+                <artifactId>redisson</artifactId>
+                <version>${redisson.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

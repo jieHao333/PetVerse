@@ -29,6 +29,15 @@ public class ShopOrder extends BaseEntity {
     /** 订单总金额(元) */
     private BigDecimal totalAmount;
 
+    /** 优惠券抵扣金额(元)，未用券为 0 */
+    private BigDecimal discountAmount;
+
+    /** 应付金额(元)，等于 totalAmount - discountAmount */
+    private BigDecimal payAmount;
+
+    /** 下单使用的用户优惠券ID（未用券为 null，取消订单时据此退券） */
+    private Long userCouponId;
+
     /** 订单状态：0-待支付 1-待取货 2-已完成 3-已取消 */
     private Integer status;
 

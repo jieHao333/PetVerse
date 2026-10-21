@@ -168,6 +168,7 @@ public class CartServiceImpl extends ServiceImpl<CartItemMapper, CartItem> imple
         vo.setQuantity(item.getQuantity());
         if (product != null) {
             vo.setMerchantId(product.getMerchantId());
+            vo.setCategory(product.getCategory());
             vo.setProductName(product.getName());
             vo.setProductImage(product.getImageUrl());
             vo.setPrice(product.getPrice());

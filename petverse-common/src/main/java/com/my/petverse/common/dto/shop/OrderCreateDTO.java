@@ -22,4 +22,7 @@ public class OrderCreateDTO implements Serializable {
     /** 买家备注 */
     @Size(max = 200, message = "备注不能超过200字")
     private String remark;
+
+    /** 下单使用的用户优惠券ID（可选，不传或传空表示不使用优惠券） */
+    private Long userCouponId;
 }

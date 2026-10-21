@@ -54,4 +54,10 @@ public final class MqTopics {
     public static final String NOTIFY = "notify-topic";
 
     public static final String TAG_NOTIFY_CREATED = "created";
+
+    /** 促销事件（优惠券领取/兑换码兑换成功后异步落库） */
+    public static final String PROMOTION_EVENT = "promotion-event-topic";
+
+    /** 领券/兑换：消费方为 promotion-service 自身，完成发放数自增与 user_coupon 落库 */
+    public static final String TAG_COUPON_RECEIVE = "receive";
 }

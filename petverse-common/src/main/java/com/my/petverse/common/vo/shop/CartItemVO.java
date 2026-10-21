@@ -25,6 +25,9 @@ public class CartItemVO implements Serializable {
     /** 所属店铺名称 */
     private String shopName;
 
+    /** 商品分类：1-宠物用品 2-宠物食品 3-活体宠物（优惠券分类范围匹配用） */
+    private Integer category;
+
     /** 商品名称 */
     private String productName;
 

@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS shop_order
     user_id      BIGINT         NOT NULL COMMENT '买家用户ID',
     merchant_id  BIGINT         NOT NULL COMMENT '商家ID（一单一店）',
     total_amount DECIMAL(10, 2) NOT NULL COMMENT '订单总金额(元)',
+    discount_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00 COMMENT '优惠券抵扣金额(元)，未用券为0',
+    pay_amount   DECIMAL(10, 2) NOT NULL DEFAULT 0.00 COMMENT '应付金额(元)，等于 total_amount - discount_amount',
+    user_coupon_id BIGINT       DEFAULT NULL COMMENT '下单使用的用户优惠券ID（未用券为NULL，取消时据此退券）',
     status       TINYINT        DEFAULT 0 COMMENT '订单状态 0-待支付 1-待取货 2-已完成 3-已取消',
     pickup_type  TINYINT        DEFAULT 1 COMMENT '取货方式 1-到店自取（预留 2-外卖配送）',
     pickup_code  VARCHAR(10)    DEFAULT NULL COMMENT '取货码（支付后生成，到店核销凭证）',
@@ -126,6 +129,13 @@ CREATE TABLE IF NOT EXISTS shop_order
     KEY idx_merchant_id (merchant_id)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4 COMMENT ='订单';
+
+-- 存量库升级（优惠券抵扣接入前的订单未记录优惠信息）：
+-- ALTER TABLE shop_order
+--     ADD COLUMN discount_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00 COMMENT '优惠券抵扣金额(元)，未用券为0' AFTER total_amount,
+--     ADD COLUMN pay_amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00 COMMENT '应付金额(元)，等于 total_amount - discount_amount' AFTER discount_amount,
+--     ADD COLUMN user_coupon_id BIGINT DEFAULT NULL COMMENT '下单使用的用户优惠券ID（未用券为NULL，取消时据此退券）' AFTER pay_amount;
+-- UPDATE shop_order SET pay_amount = total_amount WHERE pay_amount IS NULL OR pay_amount = 0;
 
 -- 商品评价（仅已完成订单的买家可评价，同一用户对同一商品仅能评价一次；支持图片/视频晒单）
 CREATE TABLE IF NOT EXISTS product_review

@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: promotion-service
+  cloud:
+    nacos:
+      server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
+      # 服务发现
+      discovery:
+        enabled: true
+      # 配置中心：dataId=${spring.application.name}（导入声明见 application.yml 的 spring.config.import）
+      config:
+        enabled: true
+        file-extension: yml
+        group: DEFAULT_GROUP
+        refresh-enabled: true

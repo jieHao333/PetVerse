@@ -1,0 +1,53 @@
+# =============================================================
+# Nacos 配置：dataId=promotion-service  group=DEFAULT_GROUP  type=yaml
+# 促销服务（优惠券）全部配置，由 Nacos 配置中心统一下发
+# =============================================================
+server:
+  port: 8088
+
+spring:
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:3306/petverse_promotion?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      pool-name: promotion-pool
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      # 数据库隔离约定：db1-签到 db2-点赞 db3-AI缓存 db4-优惠券
+      database: 4
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+# RocketMQ：领券/兑换消息异步落库；未启动 Broker 时发送自动降级为记日志（仅失去异步落库，领券主流程不受影响）
+rocketmq:
+  name-server: localhost:9876
+  producer:
+    group: promotion-producer
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+jwt:
+  # 与 user-service 保持一致；生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值
+  secret: ${JWT_SECRET:***********************}
