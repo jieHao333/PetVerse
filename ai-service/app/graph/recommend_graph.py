@@ -401,6 +401,12 @@ def _profile_digest(profile: Dict[str, Any]) -> str:
     return "\n".join(lines) or "（暂无足够画像数据，请推荐热门内容）"
 
 
+def _identity(cand_type: str, raw_id: Any) -> Tuple[str, str]:
+    """推荐项去重键：Java 侧雪花 ID 序列化为字符串，LLM 回传的 id 是数字，
+    统一归一化成字符串再比较，否则同一项会被当成两条重复下发"""
+    return cand_type, str(raw_id)
+
+
 def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[str],
                  own_words: List[str]) -> List[Dict[str, Any]]:
     """把 LLM 输出与候选详情合并（过滤不存在的 id 与越出门槛的物种），保序
@@ -408,11 +414,11 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
     模型为「宁缺毋滥」少选时，用同样过了物种门槛、按相关度排好的剩余候选补齐，
     避免首页出现没必要的空位。
     """
-    index = {(c["type"], int(c["id"])): c for c in candidates if str(c.get("id", "")).isdigit() or isinstance(c.get("id"), int)}
+    index = {_identity(c["type"], c["id"]): c for c in candidates if c.get("id") is not None}
     merged = []
-    picked: Set[Tuple[str, Any]] = set()
+    picked: Set[Tuple[str, str]] = set()
     for mi in model_items:
-        key = (mi.type, int(mi.id))
+        key = _identity(mi.type, mi.id)
         cand = index.get(key)
         if cand is None or key in picked or _is_off_species(cand, own_groups):
             continue
@@ -421,7 +427,7 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
     for cand in candidates:
         if len(merged) >= _TOP_N:
             break
-        key = (cand["type"], cand["id"])
+        key = _identity(cand["type"], cand["id"])
         if key in picked or _is_off_species(cand, own_groups):
             continue
         picked.add(key)
