@@ -35,7 +35,7 @@
 
 - Python 3.12
 - 可访问的 Nacos（默认 `localhost:8848`）
-- 可访问的 Redis（默认 `localhost:6379`，密码 `123456`，db=3）
+- 可访问的 Redis（默认 `localhost:6379`，密码 `123456`，AI 模块统一使用 db=1）
 - 可访问的 PostgreSQL + **pgvector 插件**（默认 `localhost:5432`，库 `petverse_ai`；会话与消息、对话记忆 checkpoint、RAG 语义检索、健康报告都在这里；缺失时聊天记忆等自动降级，知识检索则直接报错）
 - LLM API Key（OpenAI 兼容，可选：留空或 `MOCK_CHAT=true` 时走内置 mock 回复）
 - Embedding API Key（OpenAI 兼容；**知识检索必需**，不配置时知识类提问直接报错）
@@ -81,7 +81,8 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `KNOWLEDGE_DIR` / `KB_CHUNK_*` / `EMBED_BATCH_SIZE` | 语料目录 / 切分长度（目标·合并下限·硬上限）/ 单批 Embedding 条数 |
 | `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
-| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（秒；Redis 热层与 ai_cache 温层共用） |
+| `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
+| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（秒；Redis 热层与 ai_cache 温层共用；推荐默认 300 = 5 分钟） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 

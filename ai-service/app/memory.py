@@ -1,4 +1,4 @@
-"""Redis 通用缓存（redis.asyncio，db=3）
+"""Redis 通用缓存（redis.asyncio，db 由 REDIS_DB 配置，默认 1）
 
 承载评论摘要 / 个性化推荐等 AI 结果缓存；对话上下文记忆已迁移至
 LangGraph 官方 checkpoint（PostgreSQL，见 app/checkpoint.py），本模块不再
@@ -11,6 +11,7 @@ import logging
 from typing import Optional
 
 import redis.asyncio as aredis
+from redis.exceptions import AuthenticationError
 
 from app.config import settings
 
@@ -34,8 +35,39 @@ def init() -> None:
         # 读写与建连超时：Redis 无响应时快速失败并进入降级分支，请求线程不被挂住
         socket_timeout=3,
         socket_connect_timeout=2,
+        # 强制 RESP2：Redis 5.x 不支持 RESP3 的 HELLO 握手，新版 redis-py 默认 RESP3
+        # 时只有 Python 侧连不上（Java Lettuce 不受影响）
+        protocol=2,
     )
     _client = aredis.Redis(connection_pool=_pool)
+
+
+async def check_connection() -> bool:
+    """启动时探测 Redis 连接并打印具体失败原因（认证 / DB 越界 / 协议等）
+
+    失败只记录错误并返回 False，由各调用方继续走降级逻辑，不阻塞服务启动。
+    """
+    if _client is None:
+        logger.error("Redis 未初始化，结果缓存与并发计数将降级")
+        return False
+    try:
+        await _client.ping()
+        logger.info("Redis 连接正常: %s:%s db=%s",
+                    settings.REDIS_HOST, settings.REDIS_PORT, settings.REDIS_DB)
+        return True
+    except AuthenticationError:
+        logger.error(
+            "Redis 认证失败：Python 侧配置了 REDIS_PASSWORD，但 Redis 未启用密码或密码不一致。"
+            "服务器 Redis 没有密码时请将 ai-service/.env 的 REDIS_PASSWORD 留空；"
+            "已启用密码时请与 requirepass / ACL 配置保持一致。地址: %s:%s db=%s",
+            settings.REDIS_HOST, settings.REDIS_PORT, settings.REDIS_DB,
+            exc_info=True)
+        return False
+    except Exception:
+        logger.error("Redis 连接失败（结果缓存 / 并发计数将降级）: %s:%s db=%s",
+                     settings.REDIS_HOST, settings.REDIS_PORT, settings.REDIS_DB,
+                     exc_info=True)
+        return False
 
 
 async def close() -> None:

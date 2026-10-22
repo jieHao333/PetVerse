@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_PASSWORD: str = ""
-    REDIS_DB: int = 3                           # AI 结果缓存专用 db（评论摘要 / 推荐；经 app/cache.py 两级门面读写）
+    REDIS_DB: int = 1                           # AI 模块统一使用的 Redis db（缓存 / 并发计数）
 
     # ---------- PostgreSQL（业务持久化：会话/消息 + checkpoint + RAG + 健康报告） ----------
     PG_HOST: str = "localhost"
@@ -125,7 +125,7 @@ class Settings(BaseSettings):
 
     # ---------- 功能缓存 TTL（秒；Redis 热层与 ai_cache 温层共用） ----------
     REVIEW_SUMMARY_TTL: int = 21600             # 评论摘要缓存 6 小时（有新增评论自然过期重建）
-    RECOMMEND_CACHE_TTL: int = 600              # 个性化推荐缓存 10 分钟
+    RECOMMEND_CACHE_TTL: int = 300              # 个性化推荐缓存 5 分钟（到期自动失效，控制 Redis 内存占用）
 
     # ---------- 对话记忆 ----------
     # LLM 上下文窗口条数：compose 组装时从 checkpoint 记忆裁剪最近 N 条，控制 token 成本；

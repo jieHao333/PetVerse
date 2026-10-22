@@ -58,6 +58,8 @@ async def lifespan(app: FastAPI):
         )
     # Redis 连接池：评论摘要 / 推荐等通用缓存（创建连接池本身不发网络请求）
     memory.init()
+    # 启动即探测一次，连接失败时打印真实原因（认证失败 / DB 不存在 / 协议不兼容等）
+    await memory.check_connection()
     # 会话与消息持久层（PostgreSQL）：连接池 + 业务表自动创建（幂等）
     await persistence.init()
     # LangGraph checkpoint：对话图状态（记忆）持久化到 PostgreSQL（同库不同表），
