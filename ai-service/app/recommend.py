@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai")
 
+# 推荐结果随用户画像与库存实时变化，禁止浏览器 / 代理缓存，避免复用上一次的列表
+_NO_STORE = {"Cache-Control": "no-store"}
+
 
 @router.get("/recommend/feed")
 async def recommend_feed(
@@ -38,7 +41,7 @@ async def recommend_feed(
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
     try:
         data = await recommend(user_id, scene=scene, use_cache=not refresh)
-        return JSONResponse(status_code=200, content=ok(data))
+        return JSONResponse(status_code=200, content=ok(data), headers=_NO_STORE)
     except Exception:
         logger.exception("个性化推荐失败: user_id=%s scene=%s", user_id, scene)
         return JSONResponse(status_code=200, content=fail(500, "AI 服务暂时开小差了，请稍后再试"))

@@ -26,6 +26,10 @@ from app.schemas import RecommendResult
 
 logger = logging.getLogger(__name__)
 
+# 缓存命名空间版本：推荐结果结构 / 去重逻辑变更时递增，
+# 保证旧版本写入的缓存（可能含重复项）不会再被复用
+_CACHE_VERSION = "v2"
+
 # 召回规模
 _MAX_KEYWORDS = 5               # 画像物种关键词上限（每个关键词一次商品检索）
 _MAX_POST_KEYWORDS = 2          # 动态按物种检索的关键词上限
@@ -356,13 +360,18 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
         return _heuristic_rank(state)
 
 
+def _cache_key(user_id: int, scene: str) -> str:
+    """推荐缓存键：带版本命名空间，逻辑升级后自动切换到新键空间"""
+    return f"ai:recommend:{_CACHE_VERSION}:{scene}:{user_id}"
+
+
 async def persist_cache(state: RecommendState) -> Dict[str, Any]:
     """写入推荐缓存（按用户 + 场景；Redis 热 + ai_cache 温两层）"""
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
     if state.get("items"):
         await cache.set_cached(
-            f"ai:recommend:{scene}:{user_id}",
+            _cache_key(user_id, scene),
             {"items": state.get("items") or [], "summary": state.get("summary") or ""},
             settings.RECOMMEND_CACHE_TTL)
     return {}
@@ -492,7 +501,7 @@ async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -
     未命中时进入单飞：同一用户同一场景的并发请求只放行一次真实计算
     （五路画像拉取 + 召回 + LLM 重排），其余请求等锁后直接取缓存结果。
     """
-    cache_key = f"ai:recommend:{scene}:{user_id}"
+    cache_key = _cache_key(user_id, scene)
     if use_cache:
         cached = await cache.get_cached(cache_key)
         if cached is not None:
