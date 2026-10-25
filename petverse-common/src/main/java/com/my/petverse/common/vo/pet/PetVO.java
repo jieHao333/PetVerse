@@ -5,6 +5,7 @@ import lombok.Data;
 import java.io.Serializable;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.Map;
 
 /**
  * 宠物返回实体
@@ -98,6 +99,22 @@ public class PetVO implements Serializable {
     /** 健康-病史（猫/狗） */
     private String medicalHistory;
 
+    /** 健康信息元数据，key 与健康字段一致；旧数据没有元数据时为空 */
+    private Map<String, HealthMeta> healthMeta;
+
     /** 创建时间 */
     private LocalDateTime createTime;
+
+    /** 单项健康记录的结构化元数据，recordTime 使用 ISO 本地时间字符串 */
+    @Data
+    public static class HealthMeta implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        /** 内容单位，如 kg、g、分 */
+        private String unit;
+
+        /** 业务记录时间 */
+        private String recordTime;
+    }
 }

@@ -24,6 +24,8 @@
 -- ALTER TABLE pet ADD COLUMN vaccine VARCHAR(255) DEFAULT NULL COMMENT '健康-疫苗' AFTER special_period;
 -- ALTER TABLE pet ADD COLUMN rearing_method VARCHAR(255) DEFAULT NULL COMMENT '健康-养育方式' AFTER vaccine;
 -- ALTER TABLE pet ADD COLUMN medical_history VARCHAR(500) DEFAULT NULL COMMENT '健康-病史' AFTER rearing_method;
+-- 5) 健康信息结构化元数据（按类别保存单位与记录时间，原健康字段保持兼容）：
+-- ALTER TABLE pet ADD COLUMN health_meta JSON DEFAULT NULL COMMENT '健康信息元数据(单位与记录时间)' AFTER medical_history;
 
 CREATE TABLE IF NOT EXISTS pet
 (
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS pet
     vaccine        VARCHAR(255) DEFAULT NULL COMMENT '健康-疫苗',
     rearing_method VARCHAR(255) DEFAULT NULL COMMENT '健康-养育方式',
     medical_history VARCHAR(500) DEFAULT NULL COMMENT '健康-病史',
+    health_meta    JSON         DEFAULT NULL COMMENT '健康信息元数据(单位与记录时间)',
     create_time    DATETIME     DEFAULT NULL COMMENT '创建时间',
     update_time    DATETIME     DEFAULT NULL COMMENT '更新时间',
     deleted        TINYINT      DEFAULT 0 COMMENT '逻辑删除 0-否 1-是',

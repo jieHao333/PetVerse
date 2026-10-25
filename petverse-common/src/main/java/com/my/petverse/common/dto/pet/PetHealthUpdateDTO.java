@@ -6,6 +6,7 @@ import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 import java.io.Serializable;
+import java.time.LocalDateTime;
 
 /**
  * 宠物健康信息单项更新请求参数（猫/狗身份卡健康模块）
@@ -30,4 +31,11 @@ public class PetHealthUpdateDTO implements Serializable {
     /** 健康信息内容，空串表示清空该项 */
     @Size(max = 500, message = "健康信息内容不能超过500个字符")
     private String value;
+
+    /** 内容单位，如体重 kg/g、BCS 分；无单位类别可为空 */
+    @Size(max = 20, message = "健康信息单位不能超过20个字符")
+    private String unit;
+
+    /** 记录时间，ISO 格式 yyyy-MM-ddTHH:mm:ss；旧客户端不传时由服务端补当前时间 */
+    private LocalDateTime recordTime;
 }

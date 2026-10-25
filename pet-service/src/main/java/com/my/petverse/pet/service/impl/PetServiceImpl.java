@@ -3,6 +3,9 @@ package com.my.petverse.pet.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.my.petverse.common.dto.pet.PetClaimDTO;
 import com.my.petverse.common.dto.pet.PetExpGrantDTO;
 import com.my.petverse.common.dto.pet.PetHealthUpdateDTO;
@@ -39,11 +42,14 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.Period;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -71,11 +77,16 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
     /** OSS 存储路径中的日期目录格式 */
     private static final DateTimeFormatter AVATAR_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
+    /** 健康记录时间统一精确到秒，避免回填日期控件时出现额外的小数秒 */
+    private static final DateTimeFormatter HEALTH_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
+
     private final PetCatalogService petCatalogService;
 
     private final OssService ossService;
 
     private final SignInBitMap signInBitMap;
+
+    private final ObjectMapper objectMapper;
 
     /** 根据ID查询宠物 */
     @Override
@@ -243,15 +254,20 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         return toVO(pet);
     }
 
-    /** 更新宠物健康信息单项：按类别键定位字段，仅允许修改本人宠物 */
+    /** 更新宠物健康信息单项：原字段保存内容，health_meta 按类别保存单位与业务记录时间 */
     @Override
     public PetVO updatePetHealth(PetHealthUpdateDTO dto) {
         Pet pet = getById(dto.getPetId());
         if (pet == null || !pet.getUserId().equals(dto.getUserId())) {
             throw new BusinessException(ResultCode.NOT_FOUND, "宠物不存在");
         }
+        String category = dto.getCategory();
         String value = dto.getValue() == null ? "" : dto.getValue().trim();
-        switch (dto.getCategory()) {
+        int maxLength = "medicalHistory".equals(category) ? 500 : 255;
+        if (value.length() > maxLength) {
+            throw new BusinessException(ResultCode.BAD_REQUEST, "健康信息内容不能超过" + maxLength + "个字符");
+        }
+        switch (category) {
             case "weight" -> pet.setWeight(value);
             case "bcs" -> pet.setBcs(value);
             case "deworming" -> pet.setDeworming(value);
@@ -259,8 +275,22 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
             case "vaccine" -> pet.setVaccine(value);
             case "rearingMethod" -> pet.setRearingMethod(value);
             case "medicalHistory" -> pet.setMedicalHistory(value);
-            default -> throw new BusinessException(ResultCode.BAD_REQUEST, "未知的健康信息类别：" + dto.getCategory());
+            default -> throw new BusinessException(ResultCode.BAD_REQUEST, "未知的健康信息类别：" + category);
         }
+
+        Map<String, PetVO.HealthMeta> healthMeta = readHealthMeta(pet.getHealthMetaJson());
+        if (value.isEmpty()) {
+            healthMeta.remove(category);
+        } else {
+            PetVO.HealthMeta meta = new PetVO.HealthMeta();
+            String unit = dto.getUnit() == null ? null : dto.getUnit().trim();
+            meta.setUnit(StringUtils.hasText(unit) ? unit : null);
+            LocalDateTime recordTime = dto.getRecordTime() == null ? LocalDateTime.now() : dto.getRecordTime();
+            meta.setRecordTime(recordTime.format(HEALTH_TIME_FORMAT));
+            healthMeta.put(category, meta);
+        }
+        // 即使清空最后一项也写入 {}，避免 MyBatis-Plus 默认忽略 null 导致旧元数据残留
+        pet.setHealthMetaJson(writeHealthMeta(healthMeta));
         updateById(pet);
         return toVO(pet);
     }
@@ -447,6 +477,31 @@ public class PetServiceImpl extends ServiceImpl<PetMapper, Pet> implements PetSe
         } else {
             vo.setNextLevelExp(PetLevelCalculator.expNeededForNextLevel(pet.getLevel()));
         }
+        if (StringUtils.hasText(pet.getHealthMetaJson())) {
+            vo.setHealthMeta(readHealthMeta(pet.getHealthMetaJson()));
+        }
         return vo;
+    }
+
+    /** 读取全部健康项元数据；LinkedHashMap 保证返回顺序稳定 */
+    private Map<String, PetVO.HealthMeta> readHealthMeta(String json) {
+        if (!StringUtils.hasText(json)) {
+            return new LinkedHashMap<>();
+        }
+        try {
+            return objectMapper.readValue(json,
+                    new TypeReference<LinkedHashMap<String, PetVO.HealthMeta>>() { });
+        } catch (JsonProcessingException e) {
+            throw new BusinessException(ResultCode.INTERNAL_ERROR, "健康信息元数据读取失败");
+        }
+    }
+
+    /** 元数据仅由服务端按类别组装，避免前端直接提交整段 JSON 覆盖其他健康项 */
+    private String writeHealthMeta(Map<String, PetVO.HealthMeta> healthMeta) {
+        try {
+            return objectMapper.writeValueAsString(healthMeta);
+        } catch (JsonProcessingException e) {
+            throw new BusinessException(ResultCode.INTERNAL_ERROR, "健康信息元数据保存失败");
+        }
     }
 }

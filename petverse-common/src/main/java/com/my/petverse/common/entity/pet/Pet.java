@@ -1,5 +1,6 @@
 package com.my.petverse.common.entity.pet;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
 import com.my.petverse.common.entity.BaseEntity;
 import lombok.Data;
@@ -87,4 +88,8 @@ public class Pet extends BaseEntity {
 
     /** 健康-病史（猫/狗） */
     private String medicalHistory;
+
+    /** 健康信息元数据 JSON，按类别保存单位与记录时间；实体中使用字符串避免影响原有 VO 转换 */
+    @TableField("health_meta")
+    private String healthMetaJson;
 }
