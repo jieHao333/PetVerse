@@ -123,9 +123,9 @@ class Settings(BaseSettings):
     SHOP_SERVICE_URL: str = "http://127.0.0.1:8087"     # 商品 / 订单 / 评论
     HTTP_TIMEOUT: float = 8.0                   # 业务服务调用超时（秒），失败降级为空
 
-    # ---------- 功能缓存 TTL（秒；Redis 热层与 ai_cache 温层共用） ----------
-    REVIEW_SUMMARY_TTL: int = 21600             # 评论摘要缓存 6 小时（有新增评论自然过期重建）
-    RECOMMEND_CACHE_TTL: int = 300              # 个性化推荐缓存 5 分钟（到期自动失效，控制 Redis 内存占用）
+    # ---------- 功能缓存 TTL（秒） ----------
+    REVIEW_SUMMARY_TTL: int = 21600             # 评论摘要缓存 6 小时（Redis + ai_cache 两级）
+    RECOMMEND_CACHE_TTL: int = 300              # 推荐 Redis 缓存 5 分钟；未命中直接重新查询业务
 
     # ---------- 对话记忆 ----------
     # LLM 上下文窗口条数：compose 组装时从 checkpoint 记忆裁剪最近 N 条，控制 token 成本；

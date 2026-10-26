@@ -5,7 +5,7 @@ LangGraph 编排：
   - gather_profile：并发拉取用户画像数据（宠物 / 订单 / 购物车 / 评价 / 我的动态）；
   - recall_candidates：按画像物种召回商品与同物种动态、热门内容兜底，再做物种相关度排序；
   - rerank：真实模式用 LLM 结合画像重排并生成推荐理由；mock / 失败时按相关度排序；
-  - persist_cache：按用户 + 场景写两级缓存（Redis 热 + ai_cache 温，TTL 可配）。
+  - persist_cache：按用户 + 场景写 Redis 热缓存（TTL 5 分钟，不写 PostgreSQL 温层）。
 
 为什么相关度要先在 Python 侧算一遍：商品只有「用品/食品/活体」三分类、动态只有自由话题，
 两侧都没有物种字段，物种信号只存在于标题与详情的自由文本里。只靠 LLM 重排兜不住——候选池
@@ -366,11 +366,11 @@ def _cache_key(user_id: int, scene: str) -> str:
 
 
 async def persist_cache(state: RecommendState) -> Dict[str, Any]:
-    """写入推荐缓存（按用户 + 场景；Redis 热 + ai_cache 温两层）"""
+    """写入推荐 Redis 缓存（按用户 + 场景；不写 PostgreSQL 温层）"""
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
     if state.get("items"):
-        await cache.set_cached(
+        await cache.set_hot(
             _cache_key(user_id, scene),
             {"items": state.get("items") or [], "summary": state.get("summary") or ""},
             settings.RECOMMEND_CACHE_TTL)
@@ -496,20 +496,21 @@ def get_recommend_graph():
 
 
 async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -> Dict[str, Any]:
-    """生成个性化推荐（优先读两级缓存），返回 {items, summary}
+    """生成个性化推荐（优先读 Redis，未命中直接重新查询业务数据）
 
-    未命中时进入单飞：同一用户同一场景的并发请求只放行一次真实计算
-    （五路画像拉取 + 召回 + LLM 重排），其余请求等锁后直接取缓存结果。
+    Redis 只保留五分钟热缓存，不回落 PostgreSQL 温层；缓存未命中时进入单飞：
+    同一用户同一场景的并发请求只放行一次真实计算（五路画像拉取 + 召回 + LLM 重排），
+    其余请求等锁后直接取结果。
     """
     cache_key = _cache_key(user_id, scene)
     if use_cache:
-        cached = await cache.get_cached(cache_key)
+        cached = await cache.get_hot(cache_key)
         if cached is not None:
             return cached
     async with cache.single_flight(cache_key):
         # 等锁期间可能已由其他请求计算并写入缓存
         if use_cache:
-            cached = await cache.get_cached(cache_key)
+            cached = await cache.get_hot(cache_key)
             if cached is not None:
                 return cached
         state: RecommendState = {"user_id": user_id, "scene": scene}

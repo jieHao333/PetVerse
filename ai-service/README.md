@@ -29,7 +29,7 @@
 
 结论很直白：**召回率的首要瓶颈是语料覆盖（12% → 97.6%），检索算法是第二顺位（97.6% → 97.6%、hit@1 +1.2pt、MRR +0.007）**——但关键词通道在「黑下巴、猫癣、氯菊酯、MDR1」这类精确术语问法上是必要的兜底。
 
-**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；评论摘要 / 推荐结果为两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底）。
+**会话与存储**：对话按「用户 + 宠物 + 会话」三级隔离；全部业务数据统一落在 PostgreSQL（`petverse_ai`）——`chat_session` / `chat_message` 为会话与消息持久层（前端展示 / 会话管理，被中止的轮次同样兜底落库并以 `interrupted` 列标记）、LangGraph checkpoint 承载 LLM 上下文记忆、健康评估报告入 `pet_health_report`；评论摘要为两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底），推荐结果只使用 Redis 五分钟热缓存。
 
 ## 环境要求
 
@@ -82,7 +82,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
-| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 结果缓存 TTL（秒；Redis 热层与 ai_cache 温层共用；推荐默认 300 = 5 分钟） |
+| `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
@@ -152,7 +152,7 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
 - SSE 事件：`meta` → `refs`（有知识命中时）→ `delta` * n → `done`；异常时 `error` 后结束流。`refs` 载荷为 `{"type":"refs","items":[{rank,docId,source,docTitle,kind,section,category,score,matchedBy,snippet}]}`，在答案首字之前到达。
 - **知识库 `/api/ai/kb/*` 四个接口一律管理员限定**：凭网关注入的 `X-User-Role`（网关会先剥离客户端同名头，值取自 JWT 的角色声明）判定，非 `ADMIN` 返回 `{"code":403,"msg":"仅管理员可管理知识库"}`。`KB_ADMIN_TOKEN` / 请求头 `X-Kb-Admin` 是留给「不经网关直连本服务跑运维脚本」的**备选凭证**，与管理员角色二选一即可——没有这条通道时，任何能直接访问 8086 的进程伪造一个 `X-User-Role: ADMIN` 就能改写全用户共享的检索语料。前端路由 `meta.roles: ['ADMIN']` 与顶栏入口同样只对管理员可见。
-- 推荐 / 评论摘要结果按用户、商品缓存于两级缓存（Redis 热 + PostgreSQL `ai_cache` 温兜底，见 `app/cache.py`），`refresh=true` 可跳过推荐缓存强制刷新。
+- 评论摘要结果缓存于 Redis + PostgreSQL `ai_cache` 两级；推荐结果只缓存于 Redis（5 分钟），Redis 未命中时直接重新查询业务数据，`refresh=true` 可跳过推荐缓存强制刷新。
 - Embedding 或向量库不可用时知识类提问直接报错（不降级）；知识库为空时报错提示先跑导入脚本。
 
 ## 安全提示
@@ -185,10 +185,13 @@ AI 对话链路长（浏览器 → 网关 → ai-service → LLM 服务商 → R
 
 ### 3. 存储层降级与自愈
 
-- **结果缓存两级降级（评论摘要 / 推荐）**：热层 Redis + 温层 PostgreSQL `ai_cache`，
+- **评论摘要结果缓存两级降级**：热层 Redis + 温层 PostgreSQL `ai_cache`，
   由 `app/cache.py` 门面统一读写——读：Redis 未命中自动回落 ai_cache；写：两级并行双写；
   Redis 故障时读自动走 ai_cache、写仅落 ai_cache，仅两级都不可用才退化为重新计算；
   任何缓存异常均内部静默降级，主流程不受影响（恢复后 redis-py 自动重连）。
+- **推荐缓存只走 Redis**：`ai:recommend:v2:{scene}:{userId}` TTL 300 秒，
+  Redis 未命中直接重新查询业务数据并回填，不读也不写 `ai_cache`；
+  同一 Key 仍通过进程内单飞锁避免并发重算。
 - **LangGraph checkpoint（对话记忆）**：官方 `PostgresSaver`（同步存储引擎）+ 线程适配层——
   本服务运行在 Windows 上，psycopg 异步连接在默认 ProactorEventLoop 下不可用（与 pg_store 同款约束），
   故异步方法统一经线程池代理执行；PG 故障时读降级为「无历史」、写静默失败，对话不受影响；

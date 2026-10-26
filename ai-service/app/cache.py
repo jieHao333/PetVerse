@@ -1,20 +1,24 @@
-"""结果缓存门面：Redis（热）→ PostgreSQL ai_cache（温）两级降级
+"""结果缓存门面：推荐走 Redis 单层，其他 AI 结果走两级降级
 
-评论摘要 / 个性化推荐等 AI 结果的两级缓存，由本模块统一读写：
-  - 读：优先 Redis（快）；未命中回落 ai_cache（温层，Redis 故障 / 重启后仍可用）；
-    都未命中返回 None，由调用方重新计算；
-  - 写：Redis 与 ai_cache 并行双写（TTL 一致），均为 best-effort
-    （两个模块内部各自异常降级，绝不让缓存故障影响主流程）；
+读取策略：
+  - 个性化推荐（get_hot / set_hot）：只读写 Redis，TTL 到期后 Redis 未命中
+    必须由调用方重新查询业务数据，不回落 PostgreSQL 温层；
+  - 评论摘要等（get_cached / set_cached）：Redis 热层未命中回落 ai_cache 温层，
+    Redis 故障 / 重启后仍可用；
+  - 两级写入为 best-effort，缓存异常绝不影响主流程；
   - 单飞：同一 key 的并发未命中只放行一次真实计算，其余请求等待后直接取结果
     （防止热点商品 / 热门场景在缓存过期瞬间被并发打穿）；
-  - 雪崩：写入 TTL 附加随机抖动，避免同一批缓存同时过期。
+  - 雪崩：两级缓存写入附加 TTL 随机抖动，避免同一批缓存同时过期。
 
-为什么需要第二级：Redis 是易失的热缓存——实例故障 / 重启会让全部结果缓存
+为什么评论摘要仍需要第二级：Redis 是易失的热缓存——实例故障 / 重启会让全部结果缓存
 失效、请求透传重算（LLM 调用 + 外部服务查询）。ai_cache 落 PostgreSQL，
 与业务数据同库持久，Redis 缺失期间缓存能力不受单点影响。
 
+推荐缓存不使用温层：推荐结果强调「五分钟内复用、过期即重新查业务」，
+若回落 ai_cache 会让 Redis 过期后仍返回旧推荐，弱化刷新语义。
+
 说明：ai_cache 命中时不回填 Redis——避免「回填续期」让 TTL 语义失真
-（如推荐缓存「10 分钟自然过期重建」的意图会被持续访问无限延长）；
+（如评论摘要自然过期重建的意图会被持续访问无限延长）；
 温层的定位是「Redis 缺失时仍可用」，不是保温。
 """
 import asyncio
@@ -53,6 +57,20 @@ async def single_flight(cache_key: str):
             flight["waiters"] -= 1
             if flight["waiters"] <= 0:
                 _flights.pop(cache_key, None)
+
+
+async def get_hot(cache_key: str) -> Optional[dict]:
+    """只读 Redis 热层；未命中返回 None，由调用方直接重新查询业务数据
+
+    推荐缓存使用此方法：Redis 过期/缺失时不能回落到 ai_cache，
+    否则“Redis 五分钟过期后重新计算”的语义会被温层破坏。
+    """
+    return await memory.cache_get(cache_key)
+
+
+async def set_hot(cache_key: str, payload: dict, ttl: int) -> None:
+    """只写 Redis 热层（不做 PostgreSQL 温层双写），异常由 Redis 层内部降级"""
+    await memory.cache_set(cache_key, payload, ttl)
 
 
 async def get_cached(cache_key: str) -> Optional[dict]:
