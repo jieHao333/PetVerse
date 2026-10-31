@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 # 缓存命名空间版本：推荐结果结构 / 去重逻辑变更时递增，
 # 保证旧版本写入的缓存（可能含重复项）不会再被复用
-_CACHE_VERSION = "v2"
+# v3：动态补充封面图（image 取 mediaList 第一张图片），旧缓存里的动态没有封面
+_CACHE_VERSION = "v3"
 
 # 召回规模
 _MAX_KEYWORDS = 5               # 画像物种关键词上限（每个关键词一次商品检索）
@@ -172,6 +173,27 @@ def _as_number(value: Any) -> int:
         return 0
 
 
+def _first_image_url(media_list: Any) -> str:
+    """取动态的第一张图片作为封面
+
+    SpaceVO.mediaList 按排序字段升序返回，mediaType 0-图片 1-视频：
+    逐条取第一个图片类媒体，跳过视频（视频封面拿不到，交给前端默认封面兜底）。
+    字段缺省时按图片处理，兼容早期没有 mediaType 的数据。
+    """
+    if not isinstance(media_list, list):
+        return ""
+    for media in media_list:
+        if not isinstance(media, dict):
+            continue
+        media_type = media.get("mediaType")
+        if media_type is not None and _as_number(media_type) != 0:
+            continue
+        url = media.get("url")
+        if url:
+            return str(url)
+    return ""
+
+
 def _relevance(cand: Dict[str, Any], own_groups: Set[str]) -> float:
     """相关度打分：命中自家物种加分（标题命中更高于详情命中），标题写明别家物种减分，
     画像召回优于热门兜底，动态再按点赞微调。"""
@@ -290,8 +312,10 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
             cand = {
                 "id": rid, "type": "space",
                 "title": raw.get("title") or (raw.get("content") or "")[:30],
+                # 封面取动态的第一张图片；没有图片时留空，由前端统一兜底为默认封面
+                "image": _first_image_url(raw.get("mediaList")),
                 # Java 侧 Long 统一序列化为字符串，相关度计算要用数值，先归一化
-                "image": "", "likeCount": _as_number(raw.get("likeCount")),
+                "likeCount": _as_number(raw.get("likeCount")),
                 "category": raw.get("category") or "",
             }
         cand["_targeted"] = targeted
