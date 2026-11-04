@@ -8,8 +8,9 @@
 import asyncio
 import json
 import logging
-from typing import AsyncIterator, Optional, Type
+from typing import AsyncIterator, List, Optional, Type
 
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from app.config import settings
@@ -90,23 +91,19 @@ def get_embeddings():
     return _embeddings
 
 
-async def stream_chat(messages: list) -> AsyncIterator[str]:
+async def stream_chat(messages: List[AnyMessage]) -> AsyncIterator[str]:
     """真实模式：流式对话，逐 token yield 回复文本片段
 
-    :param messages: OpenAI 消息列表 [{"role": "system"|"user"|"assistant", "content": "..."}]
+    :param messages: LangChain 消息列表（SystemMessage / HumanMessage / AIMessage 等），
+                     由调用方按对话角色直接构造，不再手写 {"role", "content"} 字典
     """
     async for chunk in get_client().astream(messages):
-        content = chunk.content
-        if content:  # 跳过空 chunk（如仅携带 usage 的尾包）
-            # 部分 OpenAI 兼容服务返回 content 为分块列表（多模态格式），统一拼接为文本
-            if isinstance(content, str):
-                yield content
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, str):
-                        yield part
-                    elif isinstance(part, dict) and part.get("type") == "text":
-                        yield part.get("text", "")
+        # BaseMessage.text 是 LangChain 内置的文本提取：字符串内容原样返回，
+        # 分块列表内容只取 text 分片（部分 OpenAI 兼容服务以多模态分块返回），
+        # 空 chunk（如仅携带 usage 的尾包）得到空串，直接跳过
+        text = chunk.text
+        if text:
+            yield text
 
 
 async def ainvoke_text(system_prompt: str, user_prompt: str,
@@ -118,14 +115,10 @@ async def ainvoke_text(system_prompt: str, user_prompt: str,
         llm = llm.bind(temperature=temperature if temperature is not None else settings.LLM_TEMPERATURE,
                        max_tokens=max_tokens or settings.LLM_MAX_TOKENS)
     resp = await llm.ainvoke([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
     ])
-    content = resp.content
-    if isinstance(content, list):
-        return "".join(p.get("text", "") for p in content
-                       if isinstance(p, dict) and p.get("type") == "text")
-    return content or ""
+    return resp.text
 
 
 # ---------- 结构化输出（跨服务商降级） ----------
@@ -166,13 +159,13 @@ async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
             if method == "json_mode":
                 client = llm.with_structured_output(schema, method="json_mode")
                 return await client.ainvoke([
-                    {"role": "system", "content": system_prompt + _json_mode_hint(schema)},
-                    {"role": "user", "content": user_prompt},
+                    SystemMessage(content=system_prompt + _json_mode_hint(schema)),
+                    HumanMessage(content=user_prompt),
                 ])
             client = llm.with_structured_output(schema, method=method)
             result = await client.ainvoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
             ])
             if result is not None:
                 _structured_method = method

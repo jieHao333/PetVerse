@@ -25,12 +25,12 @@
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Header, Path, Query, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, AnyMessage, HumanMessage
 
 from app import checkpoint, limits, llm, longterm, memstore, media, oss, persistence
 from app.config import settings
@@ -231,26 +231,21 @@ async def _graph_stream(state: dict, config: dict):
         # 不过滤掉会让整段回答被重复输出一次（前端表现为回复内容成双倍长度）
         if not isinstance(chunk, AIMessageChunk):
             continue
-        content = getattr(chunk, "content", None)
-        if not content:
-            continue
-        if isinstance(content, str):
-            yield "delta", content
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, str):
-                    yield "delta", part
-                elif isinstance(part, dict) and part.get("type") == "text":
-                    yield "delta", part.get("text", "")
+        # .text 为 LangChain 内置的文本提取：字符串内容原样返回，多模态分块只取 text 分片
+        text = chunk.text
+        if text:
+            yield "delta", text
 
 
-def _history_messages(history: list) -> list:
+def _history_messages(history: list) -> List[AnyMessage]:
     """把历史消息（role/content）转成 LangChain 消息（存量会话首次接入 checkpoint 时回填用）
 
+    历史记录来自 chat_message 表的 role/content 列（对外 HTTP 报文结构，保持不变），
+    进入图状态前统一转成 HumanMessage / AIMessage。
     id 取「回填-序号-时间戳」的确定性值：若同一轮重复触发回填，
     add_messages 按 id 覆盖而非追加，不会产生重复消息。
     """
-    messages: list = []
+    messages: List[AnyMessage] = []
     for idx, item in enumerate(history):
         content = item.get("content")
         if not content:
@@ -275,7 +270,7 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
        图状态就此收尾（next 为空），下一轮对话从 START 重新展开，不会重放未完成节点；
     2) PostgreSQL：兜底保存本轮（供前端历史回放，含多模态附件），会话已删除时原子跳过。
     """
-    messages: list = [human_msg]
+    messages: List[AnyMessage] = [human_msg]
     if partial:
         messages.append(AIMessage(content=partial, additional_kwargs={"interrupted": True}))
     if checkpoint.available():
@@ -361,7 +356,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         #    中断过的轮次也已补写进图状态，因此「用户暂停后 AI 没记忆」不再发生。
         #    兼容升级：存量会话在 checkpoint 中还没有记录（此前记忆在 Redis），
         #    首次对话时用 PostgreSQL 最近 N 条历史回填一次（回填消息 id 确定性，重复触发不叠加）。
-        input_messages: list = [human_msg]
+        input_messages: List[AnyMessage] = [human_msg]
         if checkpoint.available():
             try:
                 snapshot = await graph.aget_state(config)

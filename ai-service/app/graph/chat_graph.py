@@ -34,7 +34,7 @@ compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 t
 import logging
 from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -84,7 +84,7 @@ class ChatState(TypedDict, total=False):
     tool_context: str              # 工具查询结果
     memory_text: str               # 长期记忆上下文（recall_memory 从 runtime store 读取渲染）
     medical: bool                  # 是否命中医疗护栏
-    final_messages: List[Dict[str, str]]  # 最终发给模型的消息
+    final_messages: List[AnyMessage]  # 最终发给模型的消息（LangChain 消息对象，非 dict）
     reply: str                     # 生成结果（真实模式）
 
 
@@ -168,8 +168,8 @@ def _recent_dialogue(state: ChatState, limit: int = 4) -> str:
     lines = []
     for msg in messages[-limit:]:
         role = "用户" if isinstance(msg, HumanMessage) else "助手"
-        text = msg.content if isinstance(msg.content, str) else str(msg.content)
-        text = " ".join(text.split())[:120]
+        # .text 为 LangChain 内置的文本提取（字符串内容 / 多模态分块统一取 text）
+        text = " ".join(msg.text.split())[:120]
         if text:
             lines.append(f"{role}：{text}")
     return "\n".join(lines)
@@ -249,14 +249,11 @@ async def tool_action(state: ChatState) -> Dict[str, Any]:
             system_prompt="你是宠物社区的数据查询助手，根据用户问题调用合适的工具查询真实数据，"
                           "并简洁汇总查询结果；若工具无数据，如实说明。",
         )
-        result = await agent.ainvoke({"messages": [{"role": "user", "content": query}]})
+        result = await agent.ainvoke({"messages": [HumanMessage(content=query)]})
         messages = result.get("messages", []) if isinstance(result, dict) else []
         if messages:
-            content = messages[-1].content
-            if isinstance(content, list):
-                content = "".join(p.get("text", "") for p in content
-                                  if isinstance(p, dict) and p.get("type") == "text")
-            return {"tool_context": (content or "").strip()}
+            # 回复可能是纯文本或多模态分块，.text 统一取文本
+            return {"tool_context": messages[-1].text.strip()}
     except Exception:
         logger.warning("工具调用失败，跳过真实数据上下文", exc_info=True)
     return {"tool_context": ""}
@@ -302,12 +299,13 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
     return {"memory_text": "\n".join(lines)}
 
 
-def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> list:
-    """当前轮用户消息的多模态内容分片（OpenAI 兼容格式）
+def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """当前轮用户消息的多模态内容分片（LangChain 标准内容块）
 
-    图片以 image_url 分片直发，URL 为 OSS 公网地址，由视觉模型服务商回源拉取；
-    URL 缺失（异常数据）时跳过该图并保留文字描述。返回内容为 list 表示走
-    视觉模型；无有效图片时返回 None 由调用方退回纯文本。
+    图片以标准的 image 内容块直发（URL 为 OSS 公网地址，由视觉模型服务商回源拉取），
+    由 ChatOpenAI 统一归一化为服务商所需的 image_url 格式，因此这里不写死某家协议的字段；
+    URL 缺失（异常数据）时跳过该图并保留文字描述。返回非空列表表示走视觉模型，
+    无有效图片时返回 None 由调用方退回纯文本。
     """
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text or "请帮我看看这些内容"}]
     used = False
@@ -315,7 +313,7 @@ def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> list:
         url = (att.get("url") or "").strip()
         if att.get("type") != KIND_IMAGE or not url:
             continue
-        parts.append({"type": "image_url", "image_url": {"url": url}})
+        parts.append({"type": "image", "url": url})
         used = True
     return parts if used else None
 
@@ -326,7 +324,9 @@ async def compose(state: ChatState) -> Dict[str, Any]:
     历史窗口从图状态 messages 中取最近 HISTORY_MAX_MESSAGES 条（checkpoint 保留
     全量记忆，此处按窗口裁剪控制上下文与 token 成本）；窗口内为空内容的助手消息
     （如 LLM 空输出）直接跳过。
-    多模态：仅当前轮（窗口内最后一条 HumanMessage）携带 image_url 分片发给视觉
+    组装结果是 LangChain 消息对象（SystemMessage / HumanMessage / AIMessage），
+    与图状态 messages 通道同构，可直接交给模型调用。
+    多模态：仅当前轮（窗口内最后一条 HumanMessage）携带 image 内容块发给视觉
     模型；历史轮的附件早已以文字描述并入消息内容，不再重复发图控制 token 成本。
     """
     pet_dict = state.get("pet") or {}
@@ -343,7 +343,7 @@ async def compose(state: ChatState) -> Dict[str, Any]:
         tool_context=state.get("tool_context", ""),
         medical=medical,
     )
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    messages: List[AnyMessage] = [SystemMessage(content=system_prompt)]
     history = state.get("messages") or []
     window = history[-settings.HISTORY_MAX_MESSAGES:]
     # 当前轮用户消息：窗口内最后一条 HumanMessage（compose 运行时 generate 尚未执行）
@@ -351,19 +351,18 @@ async def compose(state: ChatState) -> Dict[str, Any]:
     multimodal = None
     if current_human is not None and settings.vision_enabled:
         multimodal = _multimodal_content(
-            current_human.content if isinstance(current_human.content, str) else str(current_human.content),
-            state.get("attachments") or [])
+            current_human.text, state.get("attachments") or [])
     for msg in window:
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        content = msg.text
         if not content.strip() and msg is not current_human:
             continue
         if isinstance(msg, HumanMessage):
             if msg is current_human and multimodal is not None:
-                messages.append({"role": "user", "content": multimodal})
+                messages.append(HumanMessage(content=multimodal))
             elif content.strip():
-                messages.append({"role": "user", "content": content})
+                messages.append(HumanMessage(content=content))
         elif isinstance(msg, AIMessage):
-            messages.append({"role": "assistant", "content": content})
+            messages.append(AIMessage(content=content))
     return {"final_messages": messages, "medical": medical}
 
 
@@ -377,15 +376,11 @@ async def generate(state: ChatState) -> Dict[str, Any]:
     if settings.is_mock:
         return {"reply": ""}
     final_messages = state.get("final_messages", [])
-    has_image = any(isinstance(m.get("content"), list) for m in final_messages)
+    has_image = any(isinstance(m.content, list) for m in final_messages)
     client = get_vision_client() if has_image else get_client()
     try:
         resp = await client.ainvoke(final_messages)
-        content = resp.content
-        if isinstance(content, list):
-            content = "".join(p.get("text", "") for p in content
-                              if isinstance(p, dict) and p.get("type") == "text")
-        content = content or ""
+        content = resp.text
         return {
             # 助手回复写回图状态：checkpoint 在本超级步结束后自动持久化，
             # 下一轮对话从 checkpoint 恢复即为跨轮记忆；空输出不落记忆
