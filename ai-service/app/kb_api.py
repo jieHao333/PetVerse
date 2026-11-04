@@ -1,31 +1,31 @@
-"""知识库管理路由（APIRouter prefix="/ai"，路径 /ai/kb/*）
+"""知识库管理接口（管理员限定）。
 
-网关 StripPrefix=1：前端请求 /api/ai/kb/documents，本服务收到 /ai/kb/documents。
+职责：为后台管理页提供知识库的增删查与重建能力——文档列表、在线预览、原文下载、上传入库、
+删除、全量重建。四个写操作与全部读操作都受同一套管理员校验保护。
 
-能力：
-  1. GET    /ai/kb/documents                  文档列表（服务端分页 + 关键字过滤 + 全库统计）
-  2. GET    /ai/kb/documents/{docId}/preview  在线预览（正文重解析原文，附入库片段清单）
-  3. GET    /ai/kb/documents/{docId}/file     回读原文文件（PDF 供浏览器内置查看器渲染）
-  4. POST   /ai/kb/documents                  上传文档（md / pdf / docx / doc）→ 解析切分 → 入库
-  5. DELETE /ai/kb/documents/{docId}          删除文档（片段级联删除 + 清理留存原文，BM25 索引失效重建）
-  6. POST   /ai/kb/reindex                    用仓库语料目录全量重建知识库
+主要导出：
+    - ``router``  FastAPI 路由（前缀 ``/ai``）
 
-权限设计（重要）：知识库是**全用户共享**的检索语料，能改它就能向所有人的回答里注入内容，
-因此本路由下的四个接口一律限管理员：
+外部依赖：``app.kb.*``（解析 / 入库 / 存储 / 词表）、``app.config.settings``、``app.schemas``。
 
-  1. 首选凭证是网关注入的 `X-User-Role`——网关会先剥离客户端自带的同名头，
-     值取自 JWT 签发时刻的角色声明，浏览器侧只有 ADMIN 能进；
-  2. `KB_ADMIN_TOKEN`（请求头 `X-Kb-Admin`）是给「不经网关直连本服务跑运维脚本」
-     留的备选凭证。没有这条通道时，任何能直接访问 8086 的进程伪造一个
-     `X-User-Role: ADMIN` 就能改写知识库；两者任一通过即可放行。
+使用示例：
+    GET    /ai/kb/documents?page=1&size=20&keyword=疫苗
+    GET    /ai/kb/documents/{docId}/preview
+    GET    /ai/kb/documents/{docId}/file?inline=true
+    POST   /ai/kb/documents         (multipart: file + title/category/species)
+    DELETE /ai/kb/documents/{docId}
+    POST   /ai/kb/reindex
 
-上传文档与仓库文档走同一套解析/切分/向量化逻辑（app/kb/ingest.py），检索行为一致；
-按 doc_id（文件名主干）覆盖，重复上传同名文件等于替换该文档。
+鉴权说明：管理员身份取网关鉴权后注入的 ``X-User-Role``（网关会先剥离客户端同名头）。
+``X-Kb-Admin`` + ``KB_ADMIN_TOKEN`` 是留给「不经网关直连本服务跑运维」的备选通道——
+没有这条通道时，任何能直连 8086 端口的进程伪造一个 ``X-User-Role: ADMIN`` 就能改写
+所有用户共享的检索语料。
 """
+
 import asyncio
 import logging
 import urllib.parse
-from pathlib import Path as FsPath   # 文件系统路径；fastapi 的 Path 是路径参数声明，两者不能同名
+from pathlib import Path as FsPath
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, Header, Path, Query, Response, UploadFile
@@ -40,12 +40,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai")
 
-# 全量重建互斥：两个人同时重建会让后完成的一方覆盖前一方，且 Embedding 调用翻倍
+# 重建是重操作（清库 + 全量向量化），用锁保证同一时刻只有一个在跑；
+# 用 locked() 先行判断，让第二个请求立刻拿到「正在重建」而不是排队等到天荒地老。
 _reindex_lock = asyncio.Lock()
 
 _ERROR_MSG = "知识库服务暂时不可用，请稍后再试"
 
-# 原文回读时的 MIME：PDF 要给对类型浏览器内置查看器才会渲染
+# 原文下载时的 MIME 映射：PDF 必须给正确的 content-type，浏览器内置查看器才会渲染而不是下载。
 _MIME_BY_SUFFIX = {
     ".md": "text/markdown; charset=utf-8",
     ".pdf": "application/pdf",
@@ -55,13 +56,27 @@ _MIME_BY_SUFFIX = {
 
 
 def _inside_allowed_dirs(target: FsPath) -> bool:
-    """文件路径是否落在语料目录或原文留存目录内（防 file_path 被改成目录外路径）"""
+    """判断路径是否落在允许读取的目录内（防路径穿越）。
+
+    ``file_path`` 来自数据库，而数据库里的值可能来自上传 / 迁移 / 手工改库，
+    不能假定它一定安全，读取前必须用 realpath 做一次归属校验。
+
+    Args:
+        target: 待校验的路径。
+
+    Returns:
+        True 表示位于语料目录或上传留存目录内，可以读取。
+
+    Raises:
+        无——路径非法（如含非法字符）时返回 False。
+    """
     try:
         resolved = target.resolve()
     except OSError:
         return False
     for root in (settings.knowledge_dir, settings.kb_storage_dir):
         try:
+            # is_relative_to 基于已解析路径比较，可识别 ``../`` 与符号链接穿越。
             if resolved.is_relative_to(root.resolve()):
                 return True
         except OSError:
@@ -70,7 +85,17 @@ def _inside_allowed_dirs(target: FsPath) -> bool:
 
 
 def _parse_uid(raw: Optional[str]) -> Optional[int]:
-    """解析网关注入的 X-User-Id 请求头；缺失或非法时返回 None（调用方返回 401）"""
+    """解析请求头里的用户 ID。
+
+    Args:
+        raw: 请求头原始值。
+
+    Returns:
+        正整数用户 ID；缺失或非法时返回 None。
+
+    Raises:
+        无。
+    """
     if not raw:
         return None
     try:
@@ -85,12 +110,23 @@ ROLE_ADMIN = "ADMIN"
 
 def _admin_denied(x_user_id: Optional[str], x_user_role: Optional[str],
                   x_kb_admin: Optional[str]) -> Optional[JSONResponse]:
-    """知识库管理鉴权：通过返回 None，否则返回对应的 401 / 403 报文
+    """管理员校验。
 
-    管理员角色（网关注入的 X-User-Role）与运维令牌（X-Kb-Admin == KB_ADMIN_TOKEN）
-    任一命中即放行；带令牌的请求视为运维通道，不要求 X-User-Id。
+    两条通道任一通过即可：备选令牌（直连运维）或网关鉴权后的 ADMIN 角色。
+
+    Args:
+        x_user_id: 用户 ID 请求头（用于区分「未登录」与「无权限」）。
+        x_user_role: 网关注入的角色。
+        x_kb_admin: 备选令牌请求头。
+
+    Returns:
+        None 表示校验通过；否则返回可直接下发的拒绝报文（401 未登录 / 403 无权限）。
+
+    Raises:
+        无。
     """
     token = (settings.KB_ADMIN_TOKEN or "").strip()
+    # 令牌必须非空才启用该通道：否则「配置为空 + 请求头为空」会直接放行所有人。
     if token and (x_kb_admin or "").strip() == token:
         return None
     if _parse_uid(x_user_id) is None:
@@ -109,10 +145,20 @@ async def list_documents(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """知识库文档列表（管理员限定，服务端分页）
+    """分页查询知识库文档。
 
-    返回 {items, total, page, size, pages} + 全库规模统计：分页只作用于 items，
-    totalDocuments / totalChunks 始终是整库统计，管理页顶部的统计卡不随翻页变化。
+    Args:
+        page: 页码（从 1 开始）。
+        size: 每页条数（1~100）。
+        keyword: 模糊过滤关键词（匹配文档名 / 来源 / 分类 / doc_id）。
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        ``ok({items, total, page, size, pages, totalDocuments, totalChunks, totalChars,
+        supportedKinds})``；非管理员返回 403。
+
+    Raises:
+        无。
     """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
@@ -123,6 +169,7 @@ async def list_documents(
     except Exception:
         logger.warning("查询知识库文档列表失败", exc_info=True)
         return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    # 向上取整算总页数，供前端分页器直接使用。
     pages = (total + size - 1) // size if size else 1
     return JSONResponse(status_code=200, content=ok({
         "items": items,
@@ -144,12 +191,21 @@ async def preview_document(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """文档在线预览（管理员限定）
+    """文档在线预览。
 
-    正文优先重解析原文文件（排版完整、无切分重叠），原文缺失时回退为按顺序拼接
-    入库片段——回退内容里会看到相邻片段的那句重叠，属预期，界面用 source 字段标注。
-    同时返回片段清单，让管理员直接看到「这篇文档被切成了哪些块、每块多少字与词」，
-    这才是排查召回问题时真正要看的东西。
+    优先重解析原文（排版完整、无切分重叠）；原文缺失或解析失败时回退为「按 chunk_index
+    拼接入库片段」——后者能看到片段边界与上下文前缀，排查召回问题时反而更有用。
+
+    Args:
+        doc_id: 文档 ID。
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        ``ok({docId, name, source, kind, format, content, contentFrom, hasFile, chunks,
+        chunkCount})``；``contentFrom`` 标明正文来源（``file`` / ``chunks``）。
+
+    Raises:
+        无。
     """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
@@ -162,15 +218,16 @@ async def preview_document(
 
         content, fmt, source = "", "", ""
         file_path = (doc.get("filePath") or "").strip()
+        # 三重条件缺一不可：有记录、路径在允许目录内、文件确实存在。
         if file_path and _inside_allowed_dirs(FsPath(file_path)) and FsPath(file_path).is_file():
             try:
                 fmt, content = documents.preview_text(FsPath(file_path), title=doc["name"])
                 source = "file"
             except (DocParseError, OSError):
-                # 原文坏了（被删、格式不支持、解析异常）不报错，退回片段拼接
                 logger.warning("预览重解析原文失败，回退片段拼接: doc_id=%s", doc_id, exc_info=True)
         if not content:
             content = "\n\n".join(c["content"] for c in chunks)
+            # md 片段按 markdown 渲染（前端会先经 DOMPurify 消毒），其它格式一律按纯文本。
             fmt = "markdown" if doc["kind"] == "md" else "text"
             source = "chunks"
 
@@ -193,12 +250,18 @@ async def download_document_file(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """回源文档原文件（管理员限定）
+    """回读文档原文文件。
 
-    PDF 靠浏览器内置查看器渲染，必须能拿到真实字节；前端用带 Authorization 头的
-    请求取 blob 再喂给 iframe，因此这里不放开跨域也不接受查询参数传令牌。
-    路径必须落在语料目录或原文留存目录内：file_path 虽然由服务端写入，
-    但仍要防历史脏数据或人工改库把路径指到 /etc/passwd 这类位置。
+    Args:
+        doc_id: 文档 ID。
+        inline: True 走浏览器内联渲染，False 作为附件下载。
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        文件字节流（带 Content-Disposition / Content-Type）；文档无留存原文时返回 404 报文。
+
+    Raises:
+        无。
     """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
@@ -210,6 +273,7 @@ async def download_document_file(
     if not file_path:
         return JSONResponse(status_code=200, content=fail(404, "该文档没有留存的原文文件"))
     target = FsPath(file_path)
+    # 越界访问在这里拦掉并留下告警日志：属于异常行为，不能只是静默 404。
     if not _inside_allowed_dirs(target) or not target.is_file():
         logger.warning("拒绝越出知识库目录的文件读取: doc_id=%s path=%s", doc_id, file_path)
         return JSONResponse(status_code=200, content=fail(403, "文档文件路径不可用"))
@@ -220,7 +284,8 @@ async def download_document_file(
         return JSONResponse(status_code=200, content=fail(500, "文档文件读取失败"))
 
     disposition = "inline" if inline else "attachment"
-    # 中文文件名按 RFC 5987 编码，同时给一份 ASCII 回退名
+    # 中文文件名必须走 RFC 5987 的 filename*（UTF-8 百分号编码），
+    # 同时保留 ASCII 兜底名，兼容不认 filename* 的老客户端。
     quoted = urllib.parse.quote(target.name)
     return Response(
         content=data,
@@ -228,6 +293,7 @@ async def download_document_file(
         headers={
             "Content-Disposition": f"{disposition}; filename=\"document{target.suffix.lower()}\"; "
                                    f"filename*=UTF-8''{quoted}",
+            # 原文可能被同名覆盖更新，禁止缓存以免看到旧版本。
             "Cache-Control": "no-store",
             "Content-Length": str(len(data)),
         },
@@ -244,15 +310,30 @@ async def upload_document(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """上传一篇知识文档并即时入库（管理权限）
+    """上传知识文档并入库（解析 → 切分 → 向量化 → 覆盖写入）。
 
-    同名文档（文件名主干相同）按覆盖处理：先删旧片段再写新片段，单事务完成。
+    按 ``doc_id``（文件名主干）覆盖：同名文件重复上传视为「更新该文档」，
+    旧片段在同一事务内先删后写，不会残留孤儿数据。
+
+    Args:
+        file: 上传文件。
+        title: 文档标题（可选）。
+        category: 分类（可选）。
+        species: 适用物种，逗号分隔（可选）。
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        ``ok({docId, source, chunks, skipped, sha256})``；格式 / 大小 / 解析错误返回 400。
+
+    Raises:
+        无。
     """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
         return denied
 
     filename = file.filename or ""
+    # 先按后缀挡掉不支持的格式：后面要落地存盘、调外部解析器，越早拒绝越安全。
     if not filename.lower().endswith(SUPPORTED_SUFFIXES):
         return JSONResponse(status_code=200, content=fail(
             400, f"不支持的文档格式，目前支持：{'、'.join(SUPPORTED_SUFFIXES)}"))
@@ -270,8 +351,7 @@ async def upload_document(
             filename, data, origin="upload", title=title, category=category,
             species=normalize_species(species) if species else None)
     except (DocParseError, ingest.IngestError) as exc:
-        # 解析/向量化失败属于用户可直接修正的问题（文档坏、格式不对、Embedding 未配），
-        # 原样回传比「服务不可用」有用，故不做兜底吞掉
+        # 解析 / 向量化失败属于「这份文件有问题」，把具体原因告诉管理员才能修文档后重传。
         return JSONResponse(status_code=200, content=fail(400, str(exc)))
     except Exception:
         logger.warning("知识库文档入库失败: %s", filename, exc_info=True)
@@ -289,11 +369,26 @@ async def delete_document(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """删除一篇文档及其全部知识片段（管理权限）"""
+    """删除知识文档。
+
+    ``kb_chunk`` 通过外键 ``ON DELETE CASCADE`` 一并删除（含向量），随后让 BM25 索引失效；
+    上传文档的留存原文会清理，**仓库语料源文件不动**——重新全量重建会把它带回来。
+
+    Args:
+        doc_id: 文档 ID。
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        ``ok({"docId": doc_id})``；文档不存在返回 404。
+
+    Raises:
+        无。
+    """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
         return denied
     try:
+        # 先取元信息再删：删完之后就拿不到 filePath，原文清理会失效。
         doc = await store.get_document(doc_id)
         deleted = await store.delete_document(doc_id)
     except Exception:
@@ -301,9 +396,9 @@ async def delete_document(
         return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
     if not deleted:
         return JSONResponse(status_code=200, content=fail(404, "文档不存在或已删除"))
-    # 片段已随外键级联删除，上传文档的留存原文也要一起清掉，否则目录里会攒孤儿文件
     if doc:
         ingest.remove_original(doc)
+    # 关键词索引是进程内缓存，删库后必须显式失效，否则会继续召回已删除片段。
     lexicon.invalidate()
     return JSONResponse(status_code=200, content=ok({"docId": doc_id}))
 
@@ -314,11 +409,18 @@ async def reindex(
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
     x_kb_admin: Optional[str] = Header(default=None, alias="X-Kb-Admin"),
 ):
-    """用仓库语料目录全量重建知识库（管理权限）
+    """用仓库语料目录全量重建知识库。
 
-    会清空当前知识库后重新导入 settings.knowledge_dir 下的全部文档，
-    耗时随文档数量线性增长（每批 10 条片段一次 Embedding 调用）；
-    同一时刻只允许一个重建任务在跑，重复请求直接返回「正在重建」。
+    语义是「清空后重建」：上传的文档也会被清掉，因此该操作应视为「恢复出厂语料」。
+
+    Args:
+        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
+
+    Returns:
+        ``ok(summary)``；已有重建任务在跑时返回 409。
+
+    Raises:
+        无。
     """
     denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
     if denied is not None:
@@ -333,6 +435,7 @@ async def reindex(
     async with _reindex_lock:
         try:
             await store.clear_all()
+            # force=True：清空后必须重新向量化，否则 sha256 未变会被跳过，库反而变空。
             summary = await ingest.ingest_directory(directory, force=True)
         except Exception:
             logger.warning("知识库全量重建失败", exc_info=True)

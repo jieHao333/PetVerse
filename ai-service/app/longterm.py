@@ -1,18 +1,24 @@
-"""长期记忆抽取引擎
+"""长期记忆的抽取与维护。
 
-每轮对话正常结束后（SSE done 之后）由 chat 路由层以后台任务调用：
-  1) 从 store 读取该用户现有长期记忆（user 级 + 当前宠物级，各限 N 条）；
-  2) 用 LLM 结构化输出比对「本轮问答 + 现有记忆」，产出增/改/删操作列表；
-  3) 逐条应用到 store（add 用新 uuid key，update 复用原 key 并刷新时间戳）。
+职责：每轮对话结束后，异步判断「本轮是否产生了值得长期记住的信息」，并把模型的判断结果
+落成 add / update / delete 操作。与 ``app.memstore`` 的分工：memstore 管存储，本模块管
+「记什么、怎么改」。
 
-设计要点：
-  - 防抖靠 update：LLM 能看到现有记忆清单，重复或演进的同一信息应输出
-    update 复用原 key 覆盖更新，避免同一信息重复堆积；
-  - 只抽取长期有效的养宠相关信息（用户偏好 / 宠物习性 / 病史等），
-    一次性提问细节（如「今天体温 39 度正常吗」）不进长期记忆；
-  - 全程异常静默降级：抽取失败仅记日志，不影响对话主流程；
-  - mock 模式直接跳过（无真实 LLM 可用）。
+主要导出：
+    - ``extract_and_apply``  抽取并应用记忆维护操作（后台任务调用）
+    - ``list_memories``      列出用户全部记忆（用户级 + 其所有宠物级）
+    - ``memory_enabled``     记忆能力总开关（配置 + 存储可用性）
+
+外部依赖：``app.llm.astructured_invoke``、``app.memstore``、``app.schemas``。
+
+使用示例：
+    # 通常在对话流结束后作为后台任务触发，不阻塞用户拿到回复
+    asyncio.create_task(longterm.extract_and_apply(user_id, pet_id, pet_name, user_msg, reply))
+
+记忆清单会作为「既有记忆」一并发给模型，使其能判断「该新增还是该更新某条」，
+避免同一事实被反复 add 成多条。
 """
+
 import logging
 import time
 import uuid
@@ -24,16 +30,27 @@ from app.schemas import MemoryUpdateResult
 
 logger = logging.getLogger(__name__)
 
-# 抽取时读取现有记忆的条数上限（user 级 + pet 级各一份，作为比对清单交给 LLM）
+# 既有记忆的回顾条数上限：太多会挤占上下文，也让模型难以判断哪条该更新。
 _REVIEW_LIMIT = 20
-# 单条记忆内容长度上限（字符）：超长内容在应用前截断，防止异常输出污染记忆
+# 单条记忆长度上限，与提示词里「50 字以内一条客观事实」的约束保持一致。
 _MAX_CONTENT_LEN = 50
-# 单轮抽取产出的操作数上限：异常输出（如把整段回复拆成几十条）截断到安全量
+# 单轮最多应用的操作数：防止模型一次输出几十条把记忆刷成噪声。
 _MAX_OPS = 8
 
 
 async def _existing_lines(user_id: int, pet_id: int) -> list[tuple[str, str, str]]:
-    """读取现有长期记忆清单，返回 (key, 归属标签, 内容) 列表供 LLM 比对"""
+    """取出既有记忆清单，供模型对比去重。
+
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+
+    Returns:
+        ``(key, 归属标签, 内容)`` 三元组列表；store 不可用时返回空列表。
+
+    Raises:
+        无。
+    """
     lines: list[tuple[str, str, str]] = []
     store = memstore.get_store()
     if store is None:
@@ -52,13 +69,27 @@ async def _existing_lines(user_id: int, pet_id: int) -> list[tuple[str, str, str
 
 async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
                             user_msg: str, reply: str) -> None:
-    """抽取本轮问答中的长期记忆并应用到 store（后台任务，异常静默）
+    """抽取本轮对话中的长期信息并写回存储。
 
-    调用方条件：真实模式 + reply 非空 + MEMORY_ENABLED + memstore.available()；
-    中断轮（partial 回复）不应调用——不完整信息易产出误导性记忆。
+    该函数设计为「可失败的后台任务」：任何异常都在内部吞掉并记日志，
+    因为它跑在对话流结束之后，失败不该影响用户已经看到的回复。
+
+    Args:
+        user_id: 用户 ID。
+        pet_id: 当前会话关联的宠物 ID（决定 pet 级记忆写入哪个命名空间）。
+        pet_name: 宠物名，写入记忆条目以便跨宠物展示时区分。
+        user_msg: 本轮用户消息（已含附件描述）。
+        reply: 本轮助手回复。
+
+    Returns:
+        None。
+
+    Raises:
+        无——内部捕获全部异常。
     """
     try:
         existing = await _existing_lines(user_id, pet_id)
+        # 没有既有记忆时给一句明确的占位，否则提示词里会出现空段落，模型容易忽略该段。
         existing_text = "\n".join(f"- key={k} | {label} | {c}" for k, label, c in existing) or "（暂无记忆）"
 
         system_prompt = (
@@ -82,6 +113,7 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
 
         result: MemoryUpdateResult = await llm.astructured_invoke(
             MemoryUpdateResult, system_prompt, user_prompt)
+        # 先滤掉 none，再截断到上限：若先截断，前面的 none 会白白占掉名额。
         ops = [op for op in result.ops if op.action != "none"][:_MAX_OPS]
         if not ops:
             return
@@ -94,6 +126,7 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
         for op in ops:
             content = (op.content or "").strip()[:_MAX_CONTENT_LEN]
             if op.action == "add":
+                # add 用 uuid 作 key：同一事实若模型判断失误重复 add，至少不会覆盖别的记忆。
                 if not content:
                     continue
                 await store.aput(
@@ -105,11 +138,11 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
                 )
                 applied += 1
             elif op.action == "update" and op.key:
-                # 更新复用原 key：保留 createdAt 需先读旧值；读取失败则按新建处理
                 if not content:
                     continue
                 ns = (memstore.user_ns(user_id) if op.scope == "user"
                       else memstore.pet_ns(user_id, pet_id))
+                # 先读旧值：put 是整体覆盖，不读回就会丢掉 createdAt（记忆的「首次记下时间」）。
                 old = await store.aget(ns, op.key)
                 old_value = old.value if old else None
                 await store.aput(
@@ -134,16 +167,25 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
                        exc_info=True)
 
 
-# ---------- 读取（管理接口用，独立于图内 recall_memory） ----------
-
 async def list_memories(user_id: int) -> list[dict]:
-    """读取该用户全部长期记忆（user 级 + 所有宠物级），转为 MemoryItem 结构返回"""
+    """列出用户的全部长期记忆（用户级 + 所有宠物级），按更新时间倒序。
+
+    Args:
+        user_id: 用户 ID。
+
+    Returns:
+        记忆字典列表；store 不可用时为空列表。
+
+    Raises:
+        无。
+    """
     items: list[dict] = []
     store = memstore.get_store()
     if store is None:
         return items
 
     def _to_item(item, scope: str, pet_id: Optional[str]) -> dict:
+        """把存储条目转成接口展示结构。"""
         value = item.value or {}
         return {
             "key": item.key,
@@ -152,23 +194,27 @@ async def list_memories(user_id: int) -> list[dict]:
             "petName": value.get("petName"),
             "kind": value.get("kind", "preference"),
             "content": str(value.get("content", "")),
-            # datetime 转秒级时间戳（store 的 created_at / updated_at 为 datetime）
             "createdAt": int(item.created_at.timestamp()) if item.created_at else 0,
             "updatedAt": int(item.updated_at.timestamp()) if item.updated_at else 0,
         }
 
-    # user 级
     for item in await store.asearch(memstore.user_ns(user_id), limit=200):
         items.append(_to_item(item, "user", None))
-    # 全部宠物级：按宠物命名空间前缀检索，namespace 第 4 段即 petId（字符串）
     for item in await store.asearch(memstore.pet_prefix(user_id), limit=200):
+        # 宠物记忆的命名空间是 (根, pet_mem, user_id, pet_id)，宠物 ID 固定在下标 3。
         pet_id = item.namespace[3] if len(item.namespace) > 3 else "0"
         items.append(_to_item(item, "pet", pet_id))
-    # 最近更新在前（前端管理弹窗展示顺序）
     items.sort(key=lambda x: x["updatedAt"], reverse=True)
     return items
 
 
 def memory_enabled() -> bool:
-    """长期记忆功能是否启用（总开关 + store 可用；供路由层判断）"""
+    """长期记忆能力是否开启（配置开关 + 存储可用）。
+
+    Returns:
+        True 表示可以读写长期记忆。
+
+    Raises:
+        无。
+    """
     return settings.MEMORY_ENABLED and memstore.available()

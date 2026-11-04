@@ -1,26 +1,29 @@
-"""结果缓存门面：推荐走 Redis 单层，其他 AI 结果走两级降级
+"""两级缓存门面与单飞（single-flight）并发控制。
 
-读取策略：
-  - 个性化推荐（get_hot / set_hot）：只读写 Redis，TTL 到期后 Redis 未命中
-    必须由调用方重新查询业务数据，不回落 PostgreSQL 温层；
-  - 评论摘要等（get_cached / set_cached）：Redis 热层未命中回落 ai_cache 温层，
-    Redis 故障 / 重启后仍可用；
-  - 两级写入为 best-effort，缓存异常绝不影响主流程；
-  - 单飞：同一 key 的并发未命中只放行一次真实计算，其余请求等待后直接取结果
-    （防止热点商品 / 热门场景在缓存过期瞬间被并发打穿）；
-  - 雪崩：两级缓存写入附加 TTL 随机抖动，避免同一批缓存同时过期。
+职责：把「Redis 热缓存」与「PostgreSQL 温缓存」组合成对上层透明的两级缓存，并提供按 key
+粒度的单飞锁——同一个 key 并发未命中时只让一个请求真正回源计算，其余等待并复用结果。
 
-为什么评论摘要仍需要第二级：Redis 是易失的热缓存——实例故障 / 重启会让全部结果缓存
-失效、请求透传重算（LLM 调用 + 外部服务查询）。ai_cache 落 PostgreSQL，
-与业务数据同库持久，Redis 缺失期间缓存能力不受单点影响。
+主要导出：
+    - ``single_flight``  按 key 的异步互斥上下文（同 key 串行、不同 key 互不影响）
+    - ``get_hot`` / ``set_hot``    仅 Redis 的热缓存（推荐结果用：不需要温层兜底）
+    - ``get_cached`` / ``set_cached``  两级缓存（评论摘要用：Redis 挂了仍能命中温层）
 
-推荐缓存不使用温层：推荐结果强调「五分钟内复用、过期即重新查业务」，
-若回落 ai_cache 会让 Redis 过期后仍返回旧推荐，弱化刷新语义。
+外部依赖：``app.memory``（Redis）、``app.pg_store``（PostgreSQL ``ai_cache`` 表）。
 
-说明：ai_cache 命中时不回填 Redis——避免「回填续期」让 TTL 语义失真
-（如评论摘要自然过期重建的意图会被持续访问无限延长）；
-温层的定位是「Redis 缺失时仍可用」，不是保温。
+使用示例：
+    from app import cache
+
+    cached = await cache.get_hot(key)
+    if cached is not None:
+        return cached
+    async with cache.single_flight(key):
+        cached = await cache.get_hot(key)   # 拿到锁后必须复查：等锁期间可能已被回填
+        if cached is None:
+            cached = await recompute()
+            await cache.set_hot(key, cached, ttl=300)
+    return cached
 """
+
 import asyncio
 import random
 from contextlib import asynccontextmanager
@@ -28,20 +31,31 @@ from typing import Optional
 
 from app import memory, pg_store
 
-# 进行中的同 key 计算（cache_key -> 等待者计数与锁）
+# key -> {"lock": asyncio.Lock, "waiters": int}
+# 用「引用计数 + 到期摘除」而非固定字典：key 数量随用户增长无上限，不回收会持续泄漏内存。
 _flights: dict = {}
 
 _flights_lock = asyncio.Lock()
 
-# TTL 抖动上限比例：实际 TTL = 配置值 + 配置值的 0~10%
+# TTL 抖动比例：同一批写入的 key 若过期时间完全一致，会在同一秒集中失效并同时回源，
+# 加 0~10% 的随机偏移把失效时间打散。
 _TTL_JITTER_RATIO = 0.1
 
 
 @asynccontextmanager
 async def single_flight(cache_key: str):
-    """同 key 串行：并发未命中时只有一个请求进入计算，其余在此等待
+    """按 key 的异步单飞锁。
 
-    等待者计数归零后从表中移除锁，避免锁对象随 key 无限堆积。
+    进入时登记等待者，退出时递减；最后一个等待者离开时摘除该 key 的锁对象。
+
+    Args:
+        cache_key: 缓存键（同一 key 的并发调用会被串行化）。
+
+    Yields:
+        None：``async with`` 内即临界区。
+
+    Raises:
+        无——业务异常原样透传给调用方，锁状态在 finally 中保证释放。
     """
     async with _flights_lock:
         flight = _flights.get(cache_key)
@@ -53,6 +67,8 @@ async def single_flight(cache_key: str):
         async with flight["lock"]:
             yield
     finally:
+        # 用「登记/注销配对」而不是 try/finally 删 key：若直接删除，仍在排队的等待者
+        # 会持有已被摘除的旧锁对象，新来的请求又新建一把锁，串行化就失效了。
         async with _flights_lock:
             flight["waiters"] -= 1
             if flight["waiters"] <= 0:
@@ -60,21 +76,49 @@ async def single_flight(cache_key: str):
 
 
 async def get_hot(cache_key: str) -> Optional[dict]:
-    """只读 Redis 热层；未命中返回 None，由调用方直接重新查询业务数据
+    """读热缓存（仅 Redis）。
 
-    推荐缓存使用此方法：Redis 过期/缺失时不能回落到 ai_cache，
-    否则“Redis 五分钟过期后重新计算”的语义会被温层破坏。
+    Args:
+        cache_key: 缓存键。
+
+    Returns:
+        缓存值；未命中或 Redis 不可用时返回 None。
+
+    Raises:
+        无。
     """
     return await memory.cache_get(cache_key)
 
 
 async def set_hot(cache_key: str, payload: dict, ttl: int) -> None:
-    """只写 Redis 热层（不做 PostgreSQL 温层双写），异常由 Redis 层内部降级"""
+    """写热缓存（仅 Redis）。
+
+    Args:
+        cache_key: 缓存键。
+        payload: 可序列化的结果体。
+        ttl: 过期秒数。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     await memory.cache_set(cache_key, payload, ttl)
 
 
 async def get_cached(cache_key: str) -> Optional[dict]:
-    """两级读取：Redis 未命中回落 ai_cache；都未命中返回 None"""
+    """读两级缓存：先 Redis，未命中再回落 PostgreSQL。
+
+    Args:
+        cache_key: 缓存键。
+
+    Returns:
+        缓存值；两级都未命中时返回 None。
+
+    Raises:
+        无。
+    """
     cached = await memory.cache_get(cache_key)
     if cached is not None:
         return cached
@@ -82,9 +126,18 @@ async def get_cached(cache_key: str) -> Optional[dict]:
 
 
 async def set_cached(cache_key: str, payload: dict, ttl: int) -> None:
-    """两级写入：Redis 与 ai_cache 并行双写（TTL 一致）；单边失败不影响另一边
+    """双写两级缓存（并行写，互不阻塞）。
 
-    写入 TTL 加入随机抖动，避免同一时间写入的一批缓存同时到期引发重算高峰。
+    Args:
+        cache_key: 缓存键。
+        payload: 可序列化的结果体。
+        ttl: 过期秒数（实际写入值附带抖动）。
+
+    Returns:
+        None。
+
+    Raises:
+        无——各层内部已吞掉异常，任一层失败仍会写另一层。
     """
     ttl_with_jitter = ttl + random.randint(0, max(1, int(ttl * _TTL_JITTER_RATIO)))
     await asyncio.gather(

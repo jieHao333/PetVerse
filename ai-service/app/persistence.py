@@ -1,28 +1,29 @@
-"""PostgreSQL 会话与对话消息持久化（psycopg3 同步连接池 + asyncio.to_thread）
+"""会话与消息持久化（PostgreSQL）。
 
-存储表（与 LangGraph checkpoint、pgvector 同在 petverse_ai 库）：
-  - chat_session：会话表（user_id + pet_id 隔离，一只宠物可建多个会话）
-  - chat_message：消息表（session_id 关联会话）
+职责：为前端提供可回放的对话历史——会话表 ``chat_session`` 与消息表 ``chat_message``。
+与 LangGraph checkpoint 的分工：checkpoint 存「给模型看的上下文」，本模块存「给人看的历史」，
+两者独立写入，任一方故障都不影响另一方。
 
-为什么用同步连接池：与 pg_store / checkpoint / kb.store 同一约束——psycopg 的
-异步连接在 Windows 默认的 ProactorEventLoop 下不可用；同步池 + asyncio.to_thread
-跨平台一致，断线重连与坏连接淘汰由 psycopg_pool 内部完成。
+主要导出：
+    - ``init`` / ``close``           连接池生命周期
+    - ``create_session``             新建会话
+    - ``list_sessions`` / ``get_session``  会话查询（后者同时用于归属校验）
+    - ``delete_session``             删除会话及其全部消息（单事务）
+    - ``save_turn``                  写入一轮问答（问题 + 回答 + 会话标题维护）
+    - ``save_turn_if_exists``        会话仍存在时才写入（用于中断收尾，避免复活已删会话）
+    - ``read_history``               按时间正序读取历史
 
-设计要点：
-  1. 本层是对话历史的持久层（前端展示 / 会话管理从这里读）；LLM 上下文记忆
-     由 LangGraph checkpoint 承载，两者定位不同、互不替代；
-  2. 业务表由 init() 自动创建（CREATE TABLE IF NOT EXISTS，幂等）；建表失败
-     带 30s 冷却重试，PG 恢复后无需重启服务；
-  3. 会话管理方法（create/list/delete_session、get_session）失败时抛出异常，
-     由路由层转换为业务错误响应——会话是对话的前提，不允许静默降级；
-  4. 消息读写方法均做异常降级：PG 故障时绝不让对话主流程报错，
-     save_* 静默失败仅记日志，read_history 返回空列表；
-  5. save_turn_if_exists 用于流式对话客户端中途断开的兜底保存——
-     若用户此刻已删除该会话（chat_session 无行），跳过写入避免复活历史；
-     用户消息无条件落库（即使中止时尚未产出任何回复），保证记忆完整；
-  6. 每轮对话显式刷新会话 update_time（列表按最近活跃排序；PG 无 MySQL 的
-     ON UPDATE CURRENT_TIMESTAMP，等价语义在此显式实现）。
+外部依赖：``psycopg`` / ``psycopg_pool``、``app.config.settings``。
+
+使用示例：
+    from app import persistence
+
+    await persistence.init()
+    session_id = await persistence.create_session(user_id=42, pet_id=7)
+    await persistence.save_turn(42, 7, session_id, "猫咪打疫苗要注意什么", "……")
+    rows = await persistence.read_history(42, session_id, limit=40)
 """
+
 import asyncio
 import json
 import logging
@@ -35,20 +36,19 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 会话标题最大长度（与 chat_session.title VARCHAR(64) 对齐）
+# 会话标题取首条用户消息的前 N 个字；列宽为 64，这里提前收窄以适配列表展示。
 TITLE_MAX_LEN = 30
 
-# 建表失败后的重试冷却（秒）：PG 未就绪期间不反复打建表请求
+# 建表失败后的冷却时间：PG 未就绪时每次请求都去重试建表会拖慢主链路，
+# 冷却期内直接判定「不可用」，到期后自动再试（PG 恢复无需重启服务）。
 _TABLES_RETRY_COOLDOWN = 30.0
 
-# 连接池单例（由 main.py 的 lifespan 在启动 / 停机时初始化与关闭）
 _pool: Optional[ConnectionPool] = None
-_tables_ready = False      # 业务表是否已建好
-_last_tables_try = 0.0     # 上次建表尝试时刻（monotonic），用于冷却重试
+_tables_ready = False
+_last_tables_try = 0.0
 
-# 业务表 DDL（幂等；服务启动时自动执行，等价定义见 db/schema_pgvector.sql）：
-# - 时间戳统一 TIMESTAMPTZ；update_time 由写入轮次时显式刷新
-# - interrupted 用 BOOLEAN（仅 assistant 消息置位）
+# 建表语句全部幂等（IF NOT EXISTS / ADD COLUMN IF NOT EXISTS），可在任意时刻重复执行，
+# 因此既能用于首次部署，也能用于老库平滑升级。
 _SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS chat_session (
          id          BIGSERIAL   PRIMARY KEY,
@@ -58,6 +58,7 @@ _SCHEMA_STATEMENTS = (
          create_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
          update_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )""",
+    # 会话列表按「用户 + 宠物 + 最近活跃」排序，索引列顺序与查询完全对齐。
     """CREATE INDEX IF NOT EXISTS idx_chat_session_user_pet_update
          ON chat_session (user_id, pet_id, update_time DESC)""",
     """CREATE TABLE IF NOT EXISTS chat_message (
@@ -70,10 +71,8 @@ _SCHEMA_STATEMENTS = (
          interrupted BOOLEAN     NOT NULL DEFAULT FALSE,
          create_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )""",
-    # 多模态附件（图片/音频/视频，JSONB 数组，仅用户消息携带）。
-    # CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，存量库靠这条幂等 ALTER 升级
+    # 后加的两列用 ALTER 补：老库已有数据，重建表会丢历史。
     """ALTER TABLE chat_message ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb""",
-    # RAG 引用来源（JSONB 数组，仅 assistant 消息携带）：历史回放时还原「这条回答依据哪些文档」
     """ALTER TABLE chat_message ADD COLUMN IF NOT EXISTS refs JSONB NOT NULL DEFAULT '[]'::jsonb""",
     """CREATE INDEX IF NOT EXISTS idx_chat_message_user_session_time
          ON chat_message (user_id, session_id, create_time)""",
@@ -83,24 +82,38 @@ _SCHEMA_STATEMENTS = (
 
 
 def _init_sync() -> None:
-    """在线程中创建连接池（psycopg 池创建为同步操作）
+    """同步创建连接池（供 ``asyncio.to_thread`` 调用）。
 
-    open(wait=False)：PG 未就绪时不阻塞启动，连接由池在首次使用时按需建立；
-    池自带断线重连与「坏连接淘汰」，PG 恢复后自动回到可用状态。
+    Returns:
+        None。
+
+    Raises:
+        Exception: 连接池构造失败时抛出，由 ``init`` 捕获并降级。
     """
     global _pool
     _pool = ConnectionPool(
         conninfo=settings.pg_dsn,
         min_size=settings.PG_POOL_MIN,
         max_size=settings.PG_POOL_MAX,
-        timeout=5.0,        # 取连接等待上限（秒）：超过视为 PG 不可用，快速降级
+        timeout=5.0,
+        # open=False + open(wait=False)：不在启动时阻塞等待连接，
+        # PG 暂时不可达也能把服务拉起来（后续由池自身重连）。
         open=False,
     )
     _pool.open(wait=False)
 
 
 async def init() -> None:
-    """初始化连接池并确保业务表存在（服务启动时调用一次）；失败不抛出，读写自动降级"""
+    """初始化连接池并确保业务表存在。
+
+    失败不抛出：持久化不可用时服务仍应启动（历史为空、写入静默失败）。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _pool
     try:
         await asyncio.to_thread(_init_sync)
@@ -114,13 +127,21 @@ async def init() -> None:
 
 
 async def _ensure_tables() -> bool:
-    """确保业务表已建好；失败带冷却重试，绝不抛出（返回当前是否就绪）"""
+    """确保业务表就绪（带冷却的惰性建表）。
+
+    Returns:
+        True 表示表已就绪，可以执行 SQL；False 表示当前不可用。
+
+    Raises:
+        无——建表失败只记日志，等冷却结束后重试。
+    """
     global _tables_ready, _last_tables_try
     if _tables_ready:
         return True
     pool = _pool
     if pool is None:
         return False
+    # 冷却判断放在建表之前：PG 宕机期间每个请求都尝试连接会让超时时间叠加到响应耗时上。
     if time.monotonic() - _last_tables_try < _TABLES_RETRY_COOLDOWN:
         return False
     _last_tables_try = time.monotonic()
@@ -142,8 +163,16 @@ async def _ensure_tables() -> bool:
 
 
 async def close() -> None:
-    """关闭连接池（服务停机时调用）"""
+    """关闭连接池。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _pool
+    # 先摘引用再关闭：即使 close 卡住，后续请求也不会再拿到已失效的池。
     pool, _pool = _pool, None
     if pool is not None:
         try:
@@ -153,10 +182,19 @@ async def close() -> None:
 
 
 async def _run(sql: str, params: tuple = (), fetch: bool = False):
-    """在线程中执行单条 SQL；池 / 表未就绪时抛 RuntimeError，由调用方决定降级或上抛
+    """在连接池上执行单条 SQL。
 
-    连接上下文（pool.connection()）正常退出时自动提交；连接已断时 psycopg_pool
-    会丢弃该连接并重建，实现「PG 重启 / 网络闪断后无需重启服务」的自愈。
+    Args:
+        sql: SQL 语句（使用 ``%s`` 占位符）。
+        params: 参数元组。
+        fetch: True 时返回 ``fetchall()`` 结果，否则返回 None。
+
+    Returns:
+        查询结果行列表；``fetch=False`` 时为 None。
+
+    Raises:
+        RuntimeError: 表尚未就绪时抛出，让调用方走各自的降级分支。
+        Exception: 透传 psycopg 异常。
     """
     if not await _ensure_tables():
         raise RuntimeError("PostgreSQL 未就绪")
@@ -171,7 +209,21 @@ async def _run(sql: str, params: tuple = (), fetch: bool = False):
 
 
 async def _run_tx(statements: List[tuple]) -> None:
-    """在线程中以单事务执行多条 SQL（全成或全败）；未就绪时抛 RuntimeError"""
+    """在单个事务中顺序执行多条 SQL（全成或全败）。
+
+    一轮问答要写「用户消息 + 助手消息 + 更新会话时间」，中途失败会留下半截历史，
+    因此必须包在事务里。
+
+    Args:
+        statements: ``(sql, params)`` 列表。
+
+    Returns:
+        None。
+
+    Raises:
+        RuntimeError: 表尚未就绪时抛出。
+        Exception: 透传 psycopg 异常（事务自动回滚）。
+    """
     if not await _ensure_tables():
         raise RuntimeError("PostgreSQL 未就绪")
 
@@ -185,14 +237,21 @@ async def _run_tx(statements: List[tuple]) -> None:
     await asyncio.to_thread(_exec)
 
 
-# ---------- 会话管理（失败抛异常，由路由层统一转业务错误） ----------
-
 async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
-    """为指定宠物创建一个新会话，返回自增会话 ID
+    """新建会话。
 
-    title 为空时使用默认标题「新会话」；首轮对话落库时会自动
-    用首条用户消息刷新标题（见 save_turn 的自动命名逻辑）。
+    Args:
+        user_id: 用户 ID。
+        pet_id: 关联宠物 ID；0 表示未指定宠物。
+        title: 初始标题；为空时用「新会话」，等首条消息写入时再替换。
+
+    Returns:
+        新会话自增 ID。
+
+    Raises:
+        RuntimeError: 持久化不可用时抛出（会话是后续所有操作的前提，不能静默失败）。
     """
+    # 按列宽截断，避免超长标题触发数据库长度错误。
     clean_title = (title or "").strip()[:TITLE_MAX_LEN] or "新会话"
     rows = await _run(
         "INSERT INTO chat_session (user_id, pet_id, title) VALUES (%s, %s, %s) RETURNING id",
@@ -201,21 +260,40 @@ async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
 
 
 async def list_sessions(user_id: int) -> List[dict]:
-    """查询用户的全部会话（跨宠物统一展示，最近活跃在前），每条带归属宠物 petId"""
+    """列出用户的全部会话（跨宠物，最近活跃在前）。
+
+    Args:
+        user_id: 用户 ID。
+
+    Returns:
+        会话字典列表，时间字段为 Unix 秒；``petId`` 统一转字符串与历史契约保持一致。
+
+    Raises:
+        Exception: 透传数据库异常（路由层转成统一错误报文）。
+    """
+    # 时间在 SQL 侧直接转 epoch 秒，省掉 Python 侧的时区换算（TIMESTAMPTZ → 本地时区易错）。
     sql = ("SELECT id, pet_id, title, "
            "EXTRACT(EPOCH FROM create_time)::bigint, EXTRACT(EPOCH FROM update_time)::bigint "
            "FROM chat_session WHERE user_id=%s ORDER BY update_time DESC, id DESC")
     rows = await _run(sql, (user_id,), fetch=True)
-    # petId 转字符串下发：宠物 ID 是雪花 ID（19 位），以 JSON number 返回会在前端被截断
     return [{"id": r[0], "petId": str(r[1] or 0), "title": r[2],
              "createTime": int(r[3]), "updateTime": int(r[4])}
             for r in rows]
 
 
 async def get_session(user_id: int, session_id: int) -> Optional[dict]:
-    """按 ID 查询会话（仅限本人），不存在返回 None
+    """查询会话基本信息，同时充当归属校验。
 
-    对话前用它做归属校验，防止跨用户 / 跨宠物串会话。
+    Args:
+        user_id: 用户 ID。
+        session_id: 会话 ID。
+
+    Returns:
+        会话字典；不存在或不属于该用户时返回 None（两种情况刻意不区分，
+        避免通过错误信息探测他人会话是否存在）。
+
+    Raises:
+        Exception: 透传数据库异常。
     """
     rows = await _run(
         "SELECT id, pet_id, title FROM chat_session WHERE id=%s AND user_id=%s",
@@ -227,11 +305,20 @@ async def get_session(user_id: int, session_id: int) -> Optional[dict]:
 
 
 async def delete_session(user_id: int, session_id: int) -> None:
-    """删除会话及其全部消息（仅限本人）
+    """删除会话及其全部消息。
 
-    两条 DELETE 显式包在同一事务里：否则先删消息后删会话，
-    若第二条失败就会残留一个没有任何消息的空会话（侧栏还能看到、
-    点进去却是空的）。失败时回滚并向上抛，由路由层转为业务错误响应。
+    两条 DELETE 放在同一事务里：只删会话会留下孤儿消息，只删消息会留下空会话。
+    checkpoint 记忆由调用方并发清理（见 ``chat.delete_session``）。
+
+    Args:
+        user_id: 用户 ID。
+        session_id: 会话 ID。
+
+    Returns:
+        None。
+
+    Raises:
+        Exception: 透传数据库异常。
     """
     await _run_tx([
         ("DELETE FROM chat_message WHERE session_id=%s AND user_id=%s", (session_id, user_id)),
@@ -239,18 +326,10 @@ async def delete_session(user_id: int, session_id: int) -> None:
     ])
 
 
-# ---------- 消息读写（异常降级，不影响对话主流程） ----------
-
-# 一轮对话的插入 / 会话刷新语句统一在此定义，save_turn 与 save_turn_if_exists 共用：
-# - 用户消息永远落库（含中止时零产出的场景），保证这轮提问不丢；
-# - reply 为空时只写用户消息，不产生空回复条目；
-# - interrupted 仅标记 assistant 消息（该回复是否被用户中止生成）；
-# - 多模态附件（attachments）仅随用户消息落库（JSONB，assistant 回复恒为空数组）；
-# - _TOUCH_SQL 每轮刷新会话活跃时间（列表排序依据），并在标题仍为默认
-#   「新会话」时用首条用户消息自动命名（对中断兜底保存同样生效）。
 _INSERT_SQL = ("INSERT INTO chat_message (user_id, pet_id, session_id, role, content, "
                "interrupted, attachments, refs, create_time) "
                "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, NOW())")
+# 只在标题仍为默认值时替换：后续轮次不应把会话标题改成最后一句话。
 _TOUCH_SQL = ("UPDATE chat_session SET title = CASE WHEN title = '新会话' THEN %s ELSE title END, "
               "update_time = NOW() WHERE id = %s AND user_id = %s")
 
@@ -259,10 +338,27 @@ def _turn_statements(user_id: int, pet_id: int, session_id: int,
                      user_msg: str, reply: str, interrupted: bool,
                      attachments: Optional[list] = None,
                      refs: Optional[list] = None) -> List[tuple]:
-    """构造一轮对话的事务语句列表（用户消息 + 可选助手回复 + 会话刷新）"""
+    """组装一轮问答的 SQL 列表（用户消息 + 可选助手消息 + 会话标题/时间维护）。
+
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        session_id: 会话 ID。
+        user_msg: 用户消息文本。
+        reply: 助手回复文本；为空时不写助手消息（被中断且零产出时只保留提问）。
+        interrupted: 该条助手消息是否为「生成中被中止」。
+        attachments: 用户消息携带的附件，落 ``attachments`` JSONB。
+        refs: 助手消息引用的知识库来源，落 ``refs`` JSONB。
+
+    Returns:
+        ``(sql, params)`` 组成的语句列表。
+
+    Raises:
+        无。
+    """
     att_json = json.dumps(attachments or [], ensure_ascii=False)
-    # 引用来源属于「这条回答的依据」，只随助手消息落库
     refs_json = json.dumps(refs or [], ensure_ascii=False)
+    # 附件只挂在用户消息上，助手消息的 attachments 恒为空数组。
     statements = [(_INSERT_SQL, (user_id, pet_id, session_id, "user", user_msg, False,
                                  att_json, "[]"))]
     if reply:
@@ -276,13 +372,23 @@ async def save_turn(user_id: int, pet_id: int, session_id: int,
                     user_msg: str, reply: str, interrupted: bool = False,
                     attachments: Optional[list] = None,
                     refs: Optional[list] = None) -> None:
-    """持久化一轮对话（用户消息 + 助手回复）到 PostgreSQL
+    """保存一轮问答（失败仅记日志，不影响本次对话）。
 
-    一次事务写入，保证顺序与原子性；顺带刷新会话活跃时间、
-    首轮时用首条用户消息命名会话；reply 为空（模型空输出）时只写用户消息。
-    attachments 为多模态附件列表（仅用户消息携带）；
-    refs 为 RAG 引用来源列表（仅助手消息携带）。
-    任何异常仅记日志，不影响对话主流程。
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        session_id: 会话 ID。
+        user_msg: 用户消息文本。
+        reply: 助手回复文本。
+        interrupted: 回复是否被中止（前端据此渲染「已停止」标记）。
+        attachments: 用户消息附件列表。
+        refs: 回复引用的知识库来源列表。
+
+    Returns:
+        None。
+
+    Raises:
+        无——历史落库是「尽力而为」，不能因为写库失败就让用户看不到已经生成的答案。
     """
     try:
         await _run_tx(_turn_statements(user_id, pet_id, session_id,
@@ -295,21 +401,33 @@ async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
                               user_msg: str, reply: str, interrupted: bool = False,
                               attachments: Optional[list] = None,
                               refs: Optional[list] = None) -> None:
-    """条件持久化一轮对话：仅当该会话仍然存在时才写入
+    """仅当会话仍然存在时保存一轮问答。
 
-    客户端中途断开 / 用户停止生成的兜底保存走这里：若用户此刻已删除该会话
-    （chat_session 中无该会话行），跳过写入避免把刚删掉的历史复活。
-    存在性检查按会话表（chat_session）而非消息表——首轮即被中止的会话还没有
-    任何消息行，按消息表检查会把它误判为「已删除」而丢掉这轮提问；
-    先查后写在「会话删除」与「写入」之间存在极小竞态窗口，兜底保存允许这一轻量代价。
-    任何异常仅记日志，不影响对话主流程。
+    用于「客户端中途断开 / 用户点停止生成」的收尾路径：此时会话可能已被用户删除，
+    无条件写入会因外键缺失而失败，或在无外键的表结构下写出孤儿数据。
+
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        session_id: 会话 ID。
+        user_msg: 用户消息文本。
+        reply: 已产出的部分回复（可为空串）。
+        interrupted: 固定传 True 的场景见 ``chat._persist_interrupted``。
+        attachments: 用户消息附件列表。
+        refs: 已产出的引用来源列表。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
     """
     try:
+        # 先做存在性检查而非依赖外键报错：报错会污染日志且无法区分「会话已删」与真实故障。
         rows = await _run(
             "SELECT 1 FROM chat_session WHERE id=%s AND user_id=%s LIMIT 1",
             (session_id, user_id), fetch=True)
         if not rows:
-            # 会话已被删除：跳过写入，避免复活历史
             return
         await _run_tx(_turn_statements(user_id, pet_id, session_id,
                                        user_msg, reply, interrupted, attachments, refs))
@@ -318,15 +436,23 @@ async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
 
 
 async def read_history(user_id: int, session_id: int, limit: Optional[int] = None) -> List[dict]:
-    """读取指定会话的对话历史（时间正序：旧 → 新）
+    """读取会话历史（时间正序）。
 
-    - limit=None：返回全部历史（GET /chat/history 场景，前端展示完整对话）；
-    - limit=N：仅返回最近 N 条（存量会话接入 checkpoint 时的历史回填上限）。
-    PG 异常或连接池未就绪时返回空列表，绝不抛错。
+    Args:
+        user_id: 用户 ID。
+        session_id: 会话 ID。
+        limit: 只取最近 N 条；None 表示全部。
+
+    Returns:
+        消息字典列表（role / content / petId / attachments / refs / ts / interrupted）。
+        读取失败时返回空列表——历史缺失只影响上下文，不应让接口 500。
+
+    Raises:
+        无。
     """
-    # 用子查询先按时间倒序取最近 N 条，再外层按时间正序返回，避免 ORDER BY + LIMIT 组合的方向陷阱；
-    # 子查询必须同时 SELECT id，否则外层无法用 id 作为同时间戳下的次级排序键
     if limit is not None and limit > 0:
+        # 先按倒序取最近 N 条，再在外层翻回正序：直接正序 + LIMIT 会拿到「最早的 N 条」，
+        # 那是错误的窗口方向。两层排序都带 id 兜底，避免同秒消息顺序不稳。
         sql = ("SELECT role, content, pet_id, attachments, refs, EXTRACT(EPOCH FROM create_time)::bigint AS ts, interrupted FROM ("
                "  SELECT id, role, content, pet_id, attachments, refs, interrupted, create_time FROM chat_message "
                "  WHERE user_id=%s AND session_id=%s ORDER BY create_time DESC, id DESC LIMIT %s"
@@ -338,10 +464,6 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
         params = (user_id, session_id)
     try:
         rows = await _run(sql, params, fetch=True)
-        # petId 转字符串下发防前端截断；pet_id 为 0 / NULL 时视为未知，返回 None；
-        # interrupted 标记助手回复是否被用户中止（前端历史回放展示「（已停止）」）；
-        # attachments 为该条消息的多模态附件（JSONB 数组，psycopg 反序列化为 list）；
-        # refs 为该条回答的 RAG 引用来源（仅 assistant 消息非空，前端据此还原「参考来源」）
         return [{"role": r[0], "content": r[1], "petId": str(r[2]) if r[2] else None,
                  "attachments": _clean_attachments(r[3]), "refs": _clean_json_list(r[4]),
                  "ts": int(r[5]), "interrupted": bool(r[6])}
@@ -352,7 +474,20 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
 
 
 def _clean_json_list(raw) -> list:
-    """JSONB 数组列的容错清洗：非列表（旧版本空值 / 脏数据 / 字符串）一律归一为空列表"""
+    """把 JSONB 列读出的值统一成列表。
+
+    psycopg 通常已把 JSONB 解析为 Python 对象，但历史数据或手工改库可能留下字符串，
+    因此两种形态都要兼容。
+
+    Args:
+        raw: 列值（list / str / None）。
+
+    Returns:
+        列表；无法解析时返回空列表。
+
+    Raises:
+        无。
+    """
     if isinstance(raw, list):
         return raw
     if isinstance(raw, str):
@@ -365,7 +500,20 @@ def _clean_json_list(raw) -> list:
 
 
 def _clean_attachments(raw) -> list:
-    """附件列容错清洗：非 list（旧版本空值 / 脏数据）一律归一为空列表"""
+    """把附件列值统一成「结构合法的附件列表」。
+
+    与 ``_clean_json_list`` 的差别：这里逐项校验 ``type`` 与 ``url`` 是否存在，
+    避免脏数据传到前端后渲染出坏图 / 空附件卡片。
+
+    Args:
+        raw: 列值（list / str / None）。
+
+    Returns:
+        合法附件字典列表。
+
+    Raises:
+        无。
+    """
     if isinstance(raw, list):
         return [a for a in raw if isinstance(a, dict) and a.get("type") and a.get("url")]
     if isinstance(raw, str):

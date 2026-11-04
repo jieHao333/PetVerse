@@ -1,10 +1,18 @@
-"""个性化推荐路由（APIRouter prefix="/ai"）
+"""个性化推荐接口。
 
-接口：
-  1. GET /ai/recommend/feed?scene=home|shop   个性化推荐流（结果按用户缓存）
+职责：暴露 ``GET /ai/recommend/feed``，为首页推荐流与商城「猜你喜欢」提供内容列表。
+业务逻辑（画像聚合、候选召回、重排、缓存）在 ``app.graph.recommend_graph``。
 
-鉴权：依赖网关注入的 X-User-Id；推荐按用户隔离并缓存。
+主要导出：
+    - ``router``  FastAPI 路由（前缀 ``/ai``）
+
+外部依赖：``app.graph.recommend_graph.recommend``、``app.schemas``。
+
+使用示例：
+    GET /ai/recommend/feed?scene=home
+    GET /ai/recommend/feed?scene=shop&refresh=true   # 跳过缓存强制重算
 """
+
 import logging
 from typing import Optional
 
@@ -18,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai")
 
-# 推荐结果随用户画像与库存实时变化，禁止浏览器 / 代理缓存，避免复用上一次的列表
+# 推荐结果因人而异，禁止任何中间层缓存——否则用户可能看到别人的推荐（共享缓存/CDN 场景）。
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
@@ -28,10 +36,18 @@ async def recommend_feed(
     refresh: bool = Query(default=False, description="是否跳过缓存强制刷新"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """个性化推荐流
+    """获取个性化推荐流。
 
-    返回 data：{items: [{id,type,title,image,price?,reason,score,...}], summary}。
-    数据来源：用户宠物 / 订单 / 购物车 / 评价 / 动态画像 + 商品与社区候选。
+    Args:
+        scene: 场景，``home`` 首页（商品 + 动态混排）/ ``shop`` 商城（仅商品）。
+        refresh: True 时跳过缓存强制重算（用户主动下拉刷新）。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok({"items": [...], "summary": "..."})``；未登录返回 401。
+
+    Raises:
+        无。
     """
     if not x_user_id:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))

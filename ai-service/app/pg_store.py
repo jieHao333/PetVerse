@@ -1,17 +1,23 @@
-"""PostgreSQL 存储层（psycopg3 同步连接池 + asyncio.to_thread）
+"""健康评估报告与温层缓存的 PostgreSQL 存储。
 
-承载两类数据：
-  1. pet_health_report：健康评估报告（按用户 + 宠物保留历史）；
-  2. ai_cache：AI 结果缓存（Redis 不可用时的兜底）。
+职责：存放两类「可丢但有用」的数据——宠物健康评估历史（``pet_health_report``）与
+两级缓存中的**温层**（``ai_cache``，Redis 未命中时回落读取）。与 ``app.persistence``
+（会话与消息）分开，是因为两者的可靠性要求不同：会话历史要尽量保住，这里全部可降级。
 
-为什么用同步连接池：psycopg 的异步连接在 Windows 默认的 ProactorEventLoop 下无法运行
-（会抛 "Psycopg cannot use the 'ProactorEventLoop'"）。为保证 Windows / Linux 一致可用，
-这里使用同步 psycopg_pool.ConnectionPool，所有查询通过 asyncio.to_thread 丢到线程池执行，
-既不阻塞事件循环，也规避了各平台事件循环差异。
+主要导出：
+    - ``init`` / ``close`` / ``available``  生命周期
+    - ``save_health_report`` / ``list_health_reports``  健康报告读写
+    - ``cache_get`` / ``cache_set``  温层缓存读写
 
-所有方法异常降级：PG 不可用时读返回空、写静默失败仅记日志，
-绝不让 AI 主流程报错（与 memory.py / persistence.py 的策略一致）。
+外部依赖：``psycopg`` / ``psycopg_pool``、``app.config.settings``。
+
+使用示例：
+    from app import pg_store
+
+    await pg_store.save_health_report(user_id=42, pet_id=7, score=88, level="excellent", payload=report)
+    history = await pg_store.list_health_reports(42, 7, limit=10)
 """
+
 import asyncio
 import json
 import logging
@@ -25,7 +31,17 @@ _pool = None
 
 
 def _init_pool_sync():
-    """同步创建并打开连接池（在线程中调用）"""
+    """同步创建连接池（供 ``asyncio.to_thread`` 调用）。
+
+    与其它存储层的差别：这里 ``open(wait=True, timeout=5)``，启动时确认一次连通性，
+    使表结构缺失 / 认证错误能在启动阶段就暴露出来。
+
+    Returns:
+        已打开的连接池。
+
+    Raises:
+        Exception: 5 秒内连不上时抛出。
+    """
     from psycopg_pool import ConnectionPool
 
     pool = ConnectionPool(
@@ -39,7 +55,14 @@ def _init_pool_sync():
 
 
 async def init() -> None:
-    """创建 PG 连接池（服务启动时调用）；失败不抛出，功能自动降级"""
+    """初始化连接池；失败时健康报告与温层缓存降级为不可用。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _pool
     try:
         _pool = await asyncio.to_thread(_init_pool_sync)
@@ -51,7 +74,14 @@ async def init() -> None:
 
 
 async def close() -> None:
-    """关闭 PG 连接池（服务停机时调用）"""
+    """关闭连接池。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _pool
     if _pool is not None:
         try:
@@ -62,12 +92,31 @@ async def close() -> None:
 
 
 def available() -> bool:
-    """PG 是否可用"""
+    """连接池是否已初始化。
+
+    Returns:
+        True 表示可以尝试读写。
+
+    Raises:
+        无。
+    """
     return _pool is not None
 
 
 async def _run(sql: str, params: tuple, fetch: bool = False):
-    """在线程中执行单条 SQL；连接池未就绪返回 None"""
+    """执行单条 SQL。
+
+    Args:
+        sql: SQL 语句（``%s`` 占位符）。
+        params: 参数元组。
+        fetch: True 时返回 ``fetchall()`` 结果。
+
+    Returns:
+        查询结果行列表；连接池未初始化或 ``fetch=False`` 时返回 None。
+
+    Raises:
+        Exception: 透传 psycopg 异常，由各业务函数捕获降级。
+    """
     if _pool is None:
         return None
 
@@ -80,11 +129,25 @@ async def _run(sql: str, params: tuple, fetch: bool = False):
     return await asyncio.to_thread(_exec)
 
 
-# ---------- 健康评估报告 ----------
-
 async def save_health_report(user_id: int, pet_id: int, score: int,
                              level: str, payload: dict) -> None:
-    """保存一次健康评估报告（失败仅记日志）"""
+    """保存一次健康评估结果。
+
+    只追加不更新：历史报告的价值在于可对比趋势，覆盖写会丢掉变化过程。
+
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        score: 综合评分（0-100）。
+        level: 评级（excellent / good / fair / warning）。
+        payload: 完整报告（落 ``payload`` JSONB，供回放）。
+
+    Returns:
+        None。
+
+    Raises:
+        无——保存失败仅记日志，报告已返回给用户。
+    """
     sql = ("INSERT INTO pet_health_report (user_id, pet_id, score, level, payload) "
            "VALUES (%s, %s, %s, %s, %s::jsonb)")
     try:
@@ -95,7 +158,19 @@ async def save_health_report(user_id: int, pet_id: int, score: int,
 
 
 async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> List[dict]:
-    """查询某宠物的历史健康评估（时间倒序），失败返回空列表"""
+    """查询宠物的历史健康报告（最近在前）。
+
+    Args:
+        user_id: 用户 ID（同时作为归属校验，防止越权查他人宠物）。
+        pet_id: 宠物 ID。
+        limit: 返回条数上限。
+
+    Returns:
+        报告列表（id / score / level / report / createTime）；失败时为空列表。
+
+    Raises:
+        无。
+    """
     sql = ("SELECT id, score, level, payload, "
            "EXTRACT(EPOCH FROM create_time)::bigint AS ts "
            "FROM pet_health_report WHERE user_id=%s AND pet_id=%s "
@@ -108,6 +183,7 @@ async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> Lis
     reports = []
     for r in rows or []:
         payload = r[3]
+        # 兼容驱动返回字符串的情况（未注册 JSONB 适配器时会出现）。
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
@@ -118,10 +194,19 @@ async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> Lis
     return reports
 
 
-# ---------- 通用缓存 ----------
-
 async def cache_get(cache_key: str) -> Optional[dict]:
-    """读取未过期的缓存，未命中返回 None（两级缓存的温层兜底，由 app/cache.py 门面调用）"""
+    """读取温层缓存（仅返回未过期的行）。
+
+    Args:
+        cache_key: 缓存键。
+
+    Returns:
+        缓存值；不存在、已过期或读取失败时返回 None。
+
+    Raises:
+        无。
+    """
+    # 过期判断放在 SQL 里而不是取回后在 Python 里比时间：避免把过期数据带出数据库。
     sql = "SELECT payload FROM ai_cache WHERE cache_key=%s AND expire_time > NOW()"
     try:
         rows = await _run(sql, (cache_key,), fetch=True)
@@ -140,7 +225,19 @@ async def cache_get(cache_key: str) -> Optional[dict]:
 
 
 async def cache_set(cache_key: str, payload: dict, ttl_seconds: int) -> None:
-    """写入缓存（UPSERT，带过期时间；两级缓存的温层，由 app/cache.py 门面调用）"""
+    """写入温层缓存（同键覆盖并刷新过期时间）。
+
+    Args:
+        cache_key: 缓存键。
+        payload: 可序列化的结果体。
+        ttl_seconds: 过期秒数；``<= 0`` 视为不缓存。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     if ttl_seconds <= 0:
         return
     sql = ("INSERT INTO ai_cache (cache_key, payload, expire_time) "

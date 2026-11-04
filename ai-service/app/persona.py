@@ -1,20 +1,31 @@
-"""咨询上下文构建
+"""System Prompt 组装。
 
-根据宠物档案信息 + RAG 知识检索结果 + 工具调用结果生成 System Prompt（纯函数，无副作用）。
+职责：把「人设与规则」「宠物档案」「长期记忆」「参考知识」「用户真实数据」「就医护栏」
+拼成一条完整的 System Prompt。所有可变内容都做成「有则插入、无则整段省略」，
+避免出现空标题干扰模型。
 
-定位说明：AI 对话用于用户咨询宠物健康、习性等养宠问题，
-助手以中立的养宠顾问身份回答，不扮演宠物、不使用宠物语气。
+主要导出：
+    - ``build_system_prompt``  组装对话用 System Prompt
 
-LangGraph 编排中，本模块负责最终的 Prompt 组装（compose 节点调用）：
-  - 长期记忆块：runtime store 沉淀的用户 / 宠物偏好与习性（跨会话，见 app/memstore.py）；
-  - 宠物档案块：来自前端传入的宠物信息；
-  - 知识块：RAG 检索到的养宠知识（带来源，供回答引用、降低幻觉）；
-  - 业务块：Agent 工具查到的用户真实数据（宠物 / 订单 / 购物车 / 评论等）；
-  - 医疗块：命中医疗意图时，强制附加就医免责话术（安全护栏）。
+外部依赖：``app.schemas.PetInfo``（仅取字段，不触发任何 IO）。
+
+使用示例：
+    from app.persona import build_system_prompt
+
+    prompt = build_system_prompt(
+        pet=PetInfo(name="豆豆", species="猫"),
+        knowledge_context=kb_context,
+        medical=True,
+    )
+
+注意：这里的文案直接决定回答风格与引用格式（``[1] [2]`` 标注规则），
+改动前请确认与前端「引用来源」面板的解析逻辑一致。
 """
+
 from app.schemas import PetInfo
 
-# 基础人设与回答要求
+# 模板占位符必须与 build_system_prompt 的 format 参数一一对应；
+# 模板里出现的花括号都会触发格式化，新增示例文本时注意转义。
 _SYSTEM_PROMPT_TEMPLATE = """你是一名专业、友善的养宠顾问，为用户提供宠物健康、习性、喂养、行为等方面的咨询解答。
 {profile_block}{memory_block}{knowledge_block}{tool_block}要求：
 1. 以专业顾问的身份回答，语气自然平实，不扮演宠物、不使用撒娇或拟声等语气化表达。
@@ -27,32 +38,28 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一名专业、友善的养宠顾问，为用
    不要在回复中提及「记忆」「系统记录」等实现细节；与当前表述冲突时以用户本轮所述为准。
 {medical_rule}"""
 
-# 宠物档案块模板（仅拼入非空字段）
 _PROFILE_TEMPLATE = """当前用户正在咨询的宠物档案：
 {profile_lines}
 请在回答时结合上述宠物信息给出针对性建议。
 """
 
-# 长期记忆块模板（runtime store 沉淀的跨会话记忆；recall_memory 节点已渲染为 bullet 行）
 _MEMORY_TEMPLATE = """用户与宠物的长期记忆（历史对话沉淀，回答时自然结合）：
 {memory}
 """
 
-# 知识块模板
 _KNOWLEDGE_TEMPLATE = """参考知识（来自养宠知识库，请优先参考）：
 {knowledge}
 """
 
-# 业务数据块模板
 _TOOL_TEMPLATE = """用户数据（来自系统真实查询，可直接引用）：
 {tool_context}
 """
 
-# 医疗安全护栏：命中医疗 / 急症意图时追加
+# 命中医疗 / 急症意图时追加：这段是合规底线，避免模型给出用药剂量等可致害建议。
 _MEDICAL_RULE = """6. 【重要】用户的问题可能涉及疾病、用药或急症。请明确说明你无法替代兽医诊断，务必尽快带宠物到正规宠物医院就诊，不要仅凭线上建议自行用药。
 """
 
-# 健康信息类别键 -> 中文标签（与前端身份卡健康模块 / pet 表字段一致）
+# 健康档案字段的中文标签；键名与前端 health 对象的约定一致，缺一个就会在档案里整行丢失。
 _HEALTH_LABELS = {
     "weight": "体重",
     "bcs": "BCS体况评分",
@@ -67,11 +74,21 @@ _HEALTH_LABELS = {
 def build_system_prompt(pet: PetInfo, memory_context: str = "",
                         knowledge_context: str = "", tool_context: str = "",
                         medical: bool = False) -> str:
-    """根据长期记忆、宠物信息、RAG 知识与工具结果构建养宠顾问 System Prompt
+    """组装本轮对话的 System Prompt。
 
-    各块内容为空时对应模板块整体省略，保证模板始终可完整渲染。
+    Args:
+        pet: 当前咨询的宠物档案；字段全空时整段「宠物档案」都会省略。
+        memory_context: 长期记忆文本（每行一条，已带 ``- [归属]`` 前缀）。
+        knowledge_context: 知识库检索结果（已格式化，每条以 ``[n]`` 开头）。
+        tool_context: 工具查询到的真实业务数据（宠物 / 订单 / 购物车 / 评论等）。
+        medical: 是否命中医疗 / 急症意图；True 时追加就医护栏。
+
+    Returns:
+        完整的 System Prompt 字符串。
+
+    Raises:
+        无（所有输入都做了空值与类型兜底）。
     """
-    # 各档案字段：为空则跳过该行
     profile_lines = []
     name = (pet.name or "").strip()
     if name:
@@ -82,21 +99,21 @@ def build_system_prompt(pet: PetInfo, memory_context: str = "",
     breed = (pet.breed or "").strip()
     if breed:
         profile_lines.append(f"- 品种：{breed}")
-    # 年龄优先用前端按生日换算的精确文本（含月龄），缺失时回退数值年龄
+    # 优先用前端给的文字年龄（如「3 岁 2 个月」），它比整型 age 更能表达幼宠月龄。
     age_text = (pet.ageText or "").strip()
     if age_text:
         profile_lines.append(f"- 年龄：{age_text}")
     elif pet.age is not None:
         profile_lines.append(f"- 年龄：{pet.age} 岁")
 
-    # 健康信息（猫/狗身份卡维护）：仅拼入非空项，供顾问结合健康状况作答
     health = pet.health or {}
     for key, label in _HEALTH_LABELS.items():
         value = (health.get(key) or "").strip()
         if value:
             profile_lines.append(f"- {label}：{value}")
 
-    # 档案全空则整块省略，避免出现只有标题没有内容的尴尬段落
+    # 四段上下文都是「有内容才插入」：空标题会让模型以为该段信息缺失并主动追问，
+    # 反而制造出「请问您的宠物叫什么」这类无意义反问。
     profile_block = (
         _PROFILE_TEMPLATE.format(profile_lines="\n".join(profile_lines))
         if profile_lines else ""

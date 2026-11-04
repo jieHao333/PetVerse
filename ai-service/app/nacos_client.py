@@ -1,16 +1,27 @@
-"""Nacos 服务注册封装（全项目唯一允许 import nacos SDK 的文件）
+"""Nacos 服务注册与心跳保活。
 
-注册策略（双保险）：
-1. 优先走 nacos-sdk-python 1.0.0 的 NacosClient.add_naming_instance；
-2. SDK 不可用 / 注册失败时，降级为裸调 Nacos OpenAPI（POST /nacos/v1/ns/instance）；
-3. 无论走哪条路径，都额外启动一个 daemon 心跳线程，每 5 秒调一次
-   PUT /nacos/v1/ns/instance/beat 保活（SDK 自身心跳行为不可靠，自建心跳兜底，双保险无害）；
-   心跳若发现实例已丢失（Nacos 重启等原因，beat 返回 RESOURCE_NOT_FOUND / 20404 或连续失败），
-   会自动重新注册（带 30 秒节流），兑现「由心跳线程继续尝试保活」的承诺。
+职责：启动时把 ai-service 注册进 Nacos（供网关 ``lb://ai-service`` 发现），并在后台线程
+持续发送心跳；心跳发现实例丢失时自动重新注册。注册失败**不阻断启动**——服务照常对外
+提供能力，只是网关可能发现不到它。
 
-注意：nacos SDK 是同步库，本模块只能被 main.py 在启动 / 停机阶段
-（经由 asyncio.to_thread 放入后台线程）调用，绝不能进入请求处理路径。
+主要导出：
+    - ``NacosRegistrar``  注册器（SDK 优先、OpenAPI 兜底）
+    - ``registrar``       进程级实例
+    - ``register`` / ``deregister``  供应用生命周期钩子调用的无异常版本
+
+外部依赖：``httpx``（OpenAPI 与心跳）、可选 ``nacos-sdk-python``、
+``app.config.settings``。
+
+使用示例：
+    from app import nacos_client
+
+    await asyncio.to_thread(nacos_client.register)     # 启动时（同步实现，放线程池）
+    await asyncio.to_thread(nacos_client.deregister)   # 停机时
+
+为什么有两套注册实现：``nacos-sdk-python`` 是可选依赖（未装则 import 失败），
+而心跳保活又必须可靠，因此 SDK 不可用时直接走 HTTP OpenAPI，功能等价。
 """
+
 import logging
 import threading
 import time
@@ -22,44 +33,62 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 心跳线程间隔（秒）
 _BEAT_INTERVAL_SECONDS = 5
-# 所有 OpenAPI 请求的超时（秒）
 _HTTP_TIMEOUT_SECONDS = 5
-# 重注册最小间隔（秒）：实例丢失后若不节流，每 5 秒一次的心跳都会触发注册请求打爆 Nacos
+# 重注册节流：Nacos 抖动时心跳会连续失败，若每次都重注册会打成自我 DDoS。
 _REREGISTER_MIN_INTERVAL_SECONDS = 30
-# 心跳连续失败多少次后判定实例可能丢失（Nacos 不可达 / 返回异常），触发一次重注册
+# 连续失败多少次才判定实例已丢失（偶发一两次网络抖动不应触发重注册）。
 _BEAT_FAIL_THRESHOLD = 3
 
 
 class NacosRegistrar:
-    """Nacos 注册器：SDK 优先注册，OpenAPI 降级，自带心跳保活线程"""
+    """Nacos 服务实例注册器。
+
+    实例以 ``ephemeral=true``（临时实例）注册，健康状态由心跳维持——心跳停了实例会被
+    自动摘除，这也是进程被 kill 后网关不再路由到它的原因。
+    """
 
     def __init__(self, server_addr: str, service_name: str, ip: str, port: int,
                  group: str = "DEFAULT_GROUP"):
-        self._server_addr = server_addr    # 形如 localhost:8848
+        self._server_addr = server_addr
         self._service_name = service_name
         self._ip = ip
         self._port = port
         self._group = group
-        self._sdk_client = None            # nacos SDK 客户端句柄（SDK 注册成功后保留，供反注册用）
+        self._sdk_client = None
         self._beat_thread: Optional[threading.Thread] = None
-        self._running = False              # 心跳线程运行开关
-        self._last_reregister_ts = 0.0     # 上次自动重注册的时间戳（time.monotonic，用于节流）
+        self._running = False
+        self._last_reregister_ts = 0.0
 
-    # ---------- 对外主入口 ----------
 
     def register(self) -> None:
-        """注册服务实例（同步阻塞方法，务必在后台线程或启动阶段调用）"""
+        """注册实例并启动心跳线程。
+
+        注册失败只记日志，不发异常：服务可用性优先于服务发现的完整性。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         registered = self._register_via_sdk() or self._register_via_openapi()
         if not registered:
-            # 注册失败只打日志，绝不阻断服务启动
             logger.warning("Nacos 注册失败（SDK 与 OpenAPI 均未成功），ai-service 照常启动，稍后由心跳线程继续尝试保活")
-        # 无论注册走哪条路径，都启动自建心跳线程（SDK 心跳不可靠，自建心跳兜底）
+        # 即使首次注册失败也要起心跳：心跳会触发重注册，实现「Nacos 后启动也能自动补注册」。
         self._start_beat_thread()
 
     def deregister(self) -> None:
-        """停机反注册：SDK remove 优先，失败或无 SDK 句柄时降级裸 DELETE"""
+        """注销实例并停止心跳线程。
+
+        先停心跳再注销，避免刚注销就被心跳线程重新注册回去。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         self._stop_beat_thread()
         done = False
         if self._sdk_client is not None:
@@ -73,12 +102,18 @@ class NacosRegistrar:
         if not done:
             self._deregister_via_openapi()
 
-    # ---------- 注册：SDK 与 OpenAPI 两条路径 ----------
 
     def _register_via_sdk(self) -> bool:
-        """尝试用 nacos-sdk-python 注册，成功返回 True"""
+        """优先用官方 SDK 注册（自带心跳与重连）。
+
+        Returns:
+            True 表示注册成功；SDK 未安装或调用失败时返回 False，由调用方降级 OpenAPI。
+
+        Raises:
+            无。
+        """
         try:
-            import nacos  # 延迟导入：SDK 未安装时自动走 OpenAPI 降级路径
+            import nacos
         except ImportError:
             logger.warning("nacos-sdk-python 未安装，跳过 SDK 注册，直接走 OpenAPI")
             return False
@@ -96,17 +131,26 @@ class NacosRegistrar:
             return False
 
     def _register_via_openapi(self) -> bool:
-        """降级路径：裸调 Nacos v1 OpenAPI 注册临时实例"""
+        """用 HTTP OpenAPI 注册（不依赖 SDK）。
+
+        Returns:
+            True 表示注册成功（HTTP 200 且响应体含 ``ok``）。
+
+        Raises:
+            无。
+        """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance"
         params = {
             "serviceName": self._service_name,
             "ip": self._ip,
             "port": self._port,
             "groupName": self._group,
-            "ephemeral": "true",   # 临时实例：靠心跳保活，服务下线自动摘除
+            # 临时实例：靠心跳存活，进程退出后自动摘除，不必手工清理。
+            "ephemeral": "true",
         }
         try:
             resp = httpx.post(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS)
+            # Nacos v1 接口成功时返回纯文本 "ok"（大小写与前后缀不稳定，故用小写包含判断）。
             if resp.status_code == 200 and "ok" in resp.text.lower():
                 logger.info("Nacos OpenAPI 注册成功: %s @ %s:%s", self._service_name, self._ip, self._port)
                 return True
@@ -117,7 +161,14 @@ class NacosRegistrar:
             return False
 
     def _deregister_via_openapi(self) -> None:
-        """降级路径：裸调 Nacos v1 OpenAPI 反注册"""
+        """用 HTTP OpenAPI 注销实例。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance"
         params = {
             "serviceName": self._service_name,
@@ -135,10 +186,18 @@ class NacosRegistrar:
         except Exception:
             logger.warning("Nacos OpenAPI 反注册请求失败", exc_info=True)
 
-    # ---------- 自建心跳线程 ----------
 
     def _start_beat_thread(self) -> None:
-        """启动 daemon 心跳线程（重复调用安全）"""
+        """启动守护心跳线程（已启动则跳过）。
+
+        ``daemon=True``：主进程退出时线程不阻塞关闭流程。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         if self._beat_thread is not None and self._beat_thread.is_alive():
             return
         self._running = True
@@ -147,27 +206,39 @@ class NacosRegistrar:
         self._beat_thread.start()
 
     def _stop_beat_thread(self) -> None:
-        """停止心跳线程（最多等待 2 秒）"""
+        """通知心跳线程退出并等待其结束（最多 2 秒）。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         self._running = False
         if self._beat_thread is not None and self._beat_thread.is_alive():
             self._beat_thread.join(timeout=2)
         self._beat_thread = None
 
     def _reregister_if_needed(self, reason: str) -> None:
-        """实例疑似丢失后的自动重注册（带节流，两次重注册至少间隔 30 秒）
+        """在节流窗口内重新注册实例。
 
-        复用注册双保险路径（SDK 优先、OpenAPI 降级）；节流是为了避免
-        心跳每 5 秒触发一次注册请求打爆 Nacos。心跳线程内串行调用，同一时刻只有一个请求在途。
+        Args:
+            reason: 触发原因（写入日志便于排查是「心跳失败」还是「实例被摘除」）。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
         """
         now = time.monotonic()
         if now - self._last_reregister_ts < _REREGISTER_MIN_INTERVAL_SECONDS:
-            return  # 节流窗口内：跳过，等下一次心跳再试
+            return
         self._last_reregister_ts = now
         logger.warning("心跳检测到 Nacos 实例可能丢失（%s），尝试重新注册", reason)
         try:
             registered = self._register_via_sdk() or self._register_via_openapi()
         except Exception:
-            # 双注册路径内部已各自捕获异常，这里再兜一层，绝不让心跳线程崩溃
             logger.warning("Nacos 重新注册过程出现未预期异常（忽略，下次心跳继续尝试）", exc_info=True)
             return
         if registered:
@@ -176,13 +247,16 @@ class NacosRegistrar:
             logger.warning("Nacos 重新注册失败，将在下次心跳继续尝试（受 30 秒节流约束）")
 
     def _beat_loop(self) -> None:
-        """心跳循环：每 5 秒 PUT 一次 beat 接口为实例保活
+        """心跳主循环（同步线程）。
 
-        实例可能因 Nacos 重启等原因丢失，此时对不存在的实例继续发 beat 无效，
-        因此心跳中顺带检测实例丢失信号并自动重新注册（见 _reregister_if_needed）：
-        - 显式信号：beat 响应体含 RESOURCE_NOT_FOUND / not found / 20404
-          （20404 是 Nacos 2.x 对不存在实例的 beat 响应错误码，随 HTTP 200 + JSON body 返回）；
-        - 兜底信号：beat 请求异常或响应非 200 连续达到 _BEAT_FAIL_THRESHOLD 次。
+        每 5 秒发一次心跳；识别两类异常：显式「实例不存在」即刻重注册，
+        其它失败累计到阈值后重注册。
+
+        Returns:
+            None（线程结束）。
+
+        Raises:
+            无——循环内捕获所有异常，单次失败不会终止线程。
         """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance/beat"
         params = {
@@ -191,43 +265,39 @@ class NacosRegistrar:
             "port": self._port,
             "groupName": self._group,
         }
-        fail_count = 0  # 心跳连续失败计数（任何一次成功即清零）
+        fail_count = 0
         while self._running:
             try:
                 resp = httpx.put(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS)
                 body = (resp.text or "").lower()
+                # Nacos 对已摘除的实例返回 200 + RESOURCE_NOT_FOUND：这是明确信号，
+                # 不必等失败计数攒满，立即重注册。
                 if resp.status_code == 200 and (
                         "resource_not_found" in body or "not found" in body or "20404" in body):
-                    # Nacos 明确告知实例 / 服务不存在：实例已丢失，立即重注册（受节流约束）。
-                    # 注意：Nacos 2.x（如 2.4.3）对不存在的实例，beat 接口返回
-                    # HTTP 200 + JSON {"clientBeatInterval":5000,"code":20404,"lightBeatEnabled":true}，
-                    # 响应文本里没有 "resource_not_found"/"not found" 字样，必须同时匹配数字错误码
-                    # 20404（字符串包含匹配；20404 足够特殊，正常响应 code=0/10200，误报概率极低）。
                     fail_count = 0
                     self._reregister_if_needed("beat 返回实例不存在（RESOURCE_NOT_FOUND / not found / 20404）")
                 elif resp.status_code == 200:
-                    # 常见成功体为 "ok"，部分版本返回 JSON，这里只做宽松判定
                     fail_count = 0
                 else:
                     fail_count += 1
                     logger.warning("Nacos 心跳响应异常: status=%s body=%s", resp.status_code, resp.text)
                     if fail_count >= _BEAT_FAIL_THRESHOLD:
                         self._reregister_if_needed(f"心跳连续失败 {fail_count} 次")
-                        fail_count = 0  # 触发过一次重注册后重置计数，避免每轮心跳都触发
+                        fail_count = 0
             except Exception:
                 fail_count += 1
                 logger.warning("Nacos 心跳请求失败（Nacos 不可达时实例会被自动摘除）", exc_info=True)
                 if fail_count >= _BEAT_FAIL_THRESHOLD:
                     self._reregister_if_needed(f"心跳连续失败 {fail_count} 次")
                     fail_count = 0
-            # 分片 sleep，保证停机时能及时退出
+            # 分 10 次小睡而不是一次 sleep(5)：停机时最多 0.5 秒就能退出线程，
+            # 避免关闭流程被心跳间隔拖住。
             for _ in range(10):
                 if not self._running:
                     return
                 time.sleep(_BEAT_INTERVAL_SECONDS / 10)
 
 
-# 模块级注册器单例：按配置初始化，main.py 的 lifespan 负责调用
 registrar = NacosRegistrar(
     server_addr=settings.NACOS_SERVER_ADDR,
     service_name=settings.AI_SERVICE_NAME,
@@ -237,7 +307,14 @@ registrar = NacosRegistrar(
 
 
 def register() -> None:
-    """注册服务（供 main.py 启动时经后台线程调用）；内部再兜一层，确保绝不向外抛异常"""
+    """注册实例（吞掉所有异常，保证启动流程不被注册中心问题阻断）。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     try:
         registrar.register()
     except Exception:
@@ -245,7 +322,14 @@ def register() -> None:
 
 
 def deregister() -> None:
-    """反注册（供 main.py 停机时经后台线程调用）"""
+    """注销实例（吞掉所有异常，保证停机流程不被注册中心问题阻断）。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     try:
         registrar.deregister()
     except Exception:

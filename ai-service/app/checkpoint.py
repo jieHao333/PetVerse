@@ -1,22 +1,30 @@
-"""LangGraph 官方 checkpoint 会话记忆(PostgreSQL 存储)
+"""LangGraph 对话记忆（checkpoint）适配层。
 
-记忆机制:
-  对话图状态(messages 通道)由 LangGraph 官方 PostgresSaver 在每个超级步自动
-  持久化到 PostgreSQL,thread_id = 「用户 + 会话」;下一轮对话自动从 checkpoint
-  恢复历史,不再手工读写上下文缓存。用户中止生成时,路由层把用户问题与已产出的
-  部分回复补写回图状态(见 chat._persist_interrupted),被中断的轮次同样进入
-  后续对话的记忆。
+职责：把 LangGraph 官方的 ``PostgresSaver`` 包装成「Windows 可用的异步 saver」。官方实现走
+psycopg 异步连接，而本服务运行在 Windows 默认的 ProactorEventLoop 上（psycopg 异步连接不可用），
+因此这里把所有异步方法改为**经线程池调用同步实现**，对外仍是标准的 ``BaseCheckpointSaver``。
 
-为什么这样接(Windows 兼容):
-  官方 PostgresSaver 是同步实现(psycopg 同步连接);本服务在 Windows 上运行,
-  psycopg 的异步连接在默认 ProactorEventLoop 下不可用(与 pg_store.py 同一约束),
-  因此保留官方存储引擎与建表迁移,仅补一层线程适配——异步方法统一经
-  asyncio.to_thread 代理执行,与项目既有 PG 用法(同步池 + to_thread)一致。
+主要导出：
+    - ``init`` / ``close``        连接池与 saver 生命周期
+    - ``get_saver``               取 saver（未就绪时返回 None，图编译时允许 None）
+    - ``available``               saver 是否可用
+    - ``thread_config``           生成 ``thread_id`` 配置（用户 + 会话）
+    - ``adelete_thread``          删除某会话的全部记忆
 
-存储韧性(PG 故障不阻断对话):
-  - 读(恢复记忆)失败降级为「无历史」;写(保存状态)失败静默仅记日志;
-  - 建表(setup)失败带冷却重试,PG 恢复后无需重启服务即可重新启用记忆。
+外部依赖：``langgraph-checkpoint-postgres``、``psycopg`` / ``psycopg_pool``、
+``app.config.settings``。
+
+使用示例：
+    from app import checkpoint
+
+    config = checkpoint.thread_config(user_id=42, session_id=7)
+    graph = get_chat_graph()                      # 编译时已注入 checkpoint.get_saver()
+    state = await graph.aget_state(config)        # 取回上一轮上下文
+
+设计取舍：所有读失败一律降级为「无历史」、写失败仅记日志。记忆是增强项，
+不能因为 PG 抖动就让用户这一轮问不出话。
 """
+
 import asyncio
 import logging
 import time
@@ -38,38 +46,44 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# checkpoint 连接池参数:读写均为毫秒级短操作,小池足够(全局对话并发闸 20 路)
+# 记忆链路独立于业务库连接池：池小、单独限额，避免大量对话把业务查询的连接抢光。
 _POOL_MIN = 1
 _POOL_MAX = 4
-# 从池取连接的等待上限(秒):超过即视为 PG 不可用并立即降级
 _POOL_TIMEOUT = 5.0
-# setup(建表)失败后的重试冷却(秒):PG 未就绪期间不反复打建表请求
+# 建表失败冷却，避免 PG 未就绪时每个超级步都去重试建表。
 _SETUP_RETRY_COOLDOWN = 30.0
-# thread_id 前缀:便于在 checkpoint 表中识别业务来源与人工排查
+# thread_id 前缀：同一张表里可能还有别的图，用前缀区分用途，删除时也不会误删。
 _THREAD_PREFIX = "petverse-chat"
 
 
 class _ThreadedMemorySaver(PostgresSaver):
-    """官方 PostgresSaver 的异步线程适配 + 存储降级
+    """把 ``PostgresSaver`` 的同步实现桥接成异步接口。
 
-    官方同步方法(建表/读写)在线程池中执行:既不阻塞事件循环,
-    也兼容 Windows ProactorEventLoop;PG 故障时读返回 None / 空、写静默失败,
-    任何存储异常都不向对话主流程传播(与 memory / persistence 的降级策略一致)。
+    每个异步方法都是「确保就绪 → ``asyncio.to_thread`` 调同步实现 → 异常降级」三段式，
+    这样调用方（LangGraph 运行时）感知不到线程边界。
     """
 
     def __init__(self, pool: ConnectionPool) -> None:
         super().__init__(pool)
-        self._ready = False       # checkpoint 表是否已就绪
-        self._last_setup = 0.0    # 上次建表尝试时刻(monotonic),用于冷却重试
+        self._ready = False
+        self._last_setup = 0.0
 
     async def _ensure_ready(self) -> bool:
-        """确保 checkpoint 表就绪;失败带冷却重试,绝不抛出"""
+        """确保 checkpoint 表已建好（带冷却的惰性建表）。
+
+        Returns:
+            True 表示可以读写；False 表示当前不可用，调用方应走降级分支。
+
+        Raises:
+            无。
+        """
         if self._ready:
             return True
         if time.monotonic() - self._last_setup < _SETUP_RETRY_COOLDOWN:
             return False
         self._last_setup = time.monotonic()
         try:
+            # setup() 是同步建表方法，必须放线程池，否则阻塞事件循环。
             await asyncio.to_thread(self.setup)
             self._ready = True
             logger.info("LangGraph checkpoint 表已就绪")
@@ -78,9 +92,19 @@ class _ThreadedMemorySaver(PostgresSaver):
                            int(_SETUP_RETRY_COOLDOWN), exc_info=True)
         return self._ready
 
-    # ---------- 异步接口:线程代理 + 异常降级 ----------
 
     async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        """读取某 thread 的最新 checkpoint。
+
+        Args:
+            config: LangGraph 运行配置（含 ``thread_id``）。
+
+        Returns:
+            checkpoint 元组；不可用或读取失败时返回 None（等价于「没有历史」）。
+
+        Raises:
+            无。
+        """
         if not await self._ensure_ready():
             return None
         try:
@@ -93,6 +117,22 @@ class _ThreadedMemorySaver(PostgresSaver):
                     filter: Optional[dict] = None,
                     before: Optional[RunnableConfig] = None,
                     limit: Optional[int] = None) -> AsyncIterator[CheckpointTuple]:
+        """按条件列举 checkpoint。
+
+        同步实现返回生成器，无法直接跨线程迭代，因此先 ``list`` 物化再逐条 yield。
+
+        Args:
+            config: 运行配置；None 表示不限 thread。
+            filter: 元数据过滤条件。
+            before: 只取该 checkpoint 之前的记录。
+            limit: 条数上限。
+
+        Yields:
+            CheckpointTuple。
+
+        Raises:
+            无。
+        """
         if not await self._ensure_ready():
             return
         try:
@@ -107,6 +147,20 @@ class _ThreadedMemorySaver(PostgresSaver):
     async def aput(self, config: RunnableConfig, checkpoint: Checkpoint,
                    metadata: CheckpointMetadata,
                    new_versions: ChannelVersions) -> RunnableConfig:
+        """写入一个 checkpoint（每个超级步调用一次）。
+
+        Args:
+            config: 运行配置。
+            checkpoint: 状态快照。
+            metadata: 元数据（来源、步号等）。
+            new_versions: 本步各 channel 的版本号。
+
+        Returns:
+            写入后的配置；失败时原样返回入参，图执行继续（记忆缺一步好过对话中断）。
+
+        Raises:
+            无。
+        """
         if not await self._ensure_ready():
             return config
         try:
@@ -117,6 +171,20 @@ class _ThreadedMemorySaver(PostgresSaver):
 
     async def aput_writes(self, config: RunnableConfig, writes: Sequence[tuple[str, Any]],
                           task_id: str, task_path: str = "") -> None:
+        """写入节点的中间结果（LangGraph 用于并行分支的暂存与恢复）。
+
+        Args:
+            config: 运行配置。
+            writes: ``(channel, value)`` 列表。
+            task_id: 产生这些写入的任务 ID。
+            task_path: 任务在图中的路径。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         if not await self._ensure_ready():
             return
         try:
@@ -125,6 +193,17 @@ class _ThreadedMemorySaver(PostgresSaver):
             logger.warning("写入对话 checkpoint 中间结果失败(忽略)", exc_info=True)
 
     async def adelete_thread(self, thread_id: str) -> None:
+        """删除一个 thread 的全部记忆（删会话时调用）。
+
+        Args:
+            thread_id: 线程标识（由 ``thread_config`` 生成）。
+
+        Returns:
+            None。
+
+        Raises:
+            无。
+        """
         if not await self._ensure_ready():
             return
         try:
@@ -133,17 +212,18 @@ class _ThreadedMemorySaver(PostgresSaver):
             logger.warning("删除对话 checkpoint 失败(忽略): thread=%s", thread_id, exc_info=True)
 
 
-# 模块级单例(由 main.py 的 lifespan 启动 / 停机时初始化与关闭)
 _saver: Optional[_ThreadedMemorySaver] = None
 _pool: Optional[ConnectionPool] = None
 
 
 def _init_sync() -> None:
-    """在线程中创建连接池与 saver(psycopg 池创建为同步操作)
+    """同步创建连接池与 saver（供 ``asyncio.to_thread`` 调用）。
 
-    open(wait=False):PG 未就绪时不阻塞启动,连接由池在首次使用时按需建立(池内建重试);
-    连接参数与官方 from_conn_string 保持一致(autocommit / prepare_threshold=0 /
-    row_factory=dict_row),保证官方 SQL 的行为与行访问方式正确。
+    Returns:
+        None。
+
+    Raises:
+        Exception: 连接池构造失败时抛出。
     """
     global _pool, _saver
     pool = ConnectionPool(
@@ -151,6 +231,8 @@ def _init_sync() -> None:
         min_size=_POOL_MIN,
         max_size=_POOL_MAX,
         timeout=_POOL_TIMEOUT,
+        # autocommit + prepare_threshold=0：LangGraph 的建表语句与动态 SQL 不适合
+        # 服务端预编译；dict_row 让同步实现直接拿到字典形式的结果行。
         kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
         open=False,
     )
@@ -160,7 +242,14 @@ def _init_sync() -> None:
 
 
 async def init() -> None:
-    """初始化 checkpoint 存储(服务启动时调用一次);失败不抛出,记忆功能自动降级"""
+    """初始化 checkpoint saver；失败降级为「无记忆」但服务继续启动。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _saver
     try:
         await asyncio.to_thread(_init_sync)
@@ -172,7 +261,14 @@ async def init() -> None:
 
 
 async def close() -> None:
-    """关闭 checkpoint 连接池(服务停机时调用)"""
+    """关闭连接池并清空 saver 引用。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     global _pool, _saver
     pool, _pool, _saver = _pool, None, None
     if pool is not None:
@@ -183,22 +279,62 @@ async def close() -> None:
 
 
 def get_saver() -> Optional[BaseCheckpointSaver]:
-    """获取 saver(供图编译时注入 checkpoint);未初始化返回 None,图退化为无记忆"""
+    """获取 saver 实例，供图编译时注入。
+
+    Returns:
+        saver；未初始化成功时返回 None——``StateGraph.compile(checkpointer=None)`` 是合法的，
+        此时图退化为无记忆执行。
+
+    Raises:
+        无。
+    """
     return _saver
 
 
 def available() -> bool:
-    """checkpoint 是否可用(供路由层决定是否读写图状态)"""
+    """saver 是否可用（仅代表对象已创建，不代表此刻 PG 可达）。
+
+    Returns:
+        True 表示可以尝试读写记忆。
+
+    Raises:
+        无。
+    """
     return _saver is not None
 
 
 def thread_config(user_id: int, session_id: int) -> dict:
-    """构造 checkpoint 线程配置:thread_id = 「用户 + 会话」(会话级记忆隔离)"""
+    """构造 LangGraph 运行配置。
+
+    thread_id 用「用户 + 会话」两个维度拼成：会话级隔离保证不同会话互不串味，
+    带上 user_id 则顺手形成归属校验，跨用户猜 session_id 也读不到别人的记忆。
+
+    Args:
+        user_id: 用户 ID。
+        session_id: 会话 ID。
+
+    Returns:
+        可直接传给 ``graph.ainvoke`` / ``aget_state`` 的 config 字典。
+
+    Raises:
+        无。
+    """
     return {"configurable": {"thread_id": f"{_THREAD_PREFIX}:{user_id}:{session_id}"}}
 
 
 async def adelete_thread(user_id: int, session_id: int) -> None:
-    """删除会话对应的 checkpoint 记忆(与 PostgreSQL 会话消息删除联动;失败仅记日志)"""
+    """删除指定会话的对话记忆。
+
+    Args:
+        user_id: 用户 ID。
+        session_id: 会话 ID。
+
+    Returns:
+        None。
+
+    Raises:
+        无（saver 不可用时直接返回）。
+    """
     saver = _saver
     if saver is None:
         return

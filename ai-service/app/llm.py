@@ -1,10 +1,31 @@
-"""LLM / Embedding 客户端封装
+"""LLM / Embedding 客户端封装。
 
-- 真实模式：langchain-openai 接任意 OpenAI 兼容服务（DeepSeek / 阿里云百炼等），
-  只认 LLM_BASE_URL + LLM_MODEL + LLM_API_KEY 三个配置项，切换服务商只改配置；
-- Embedding：同样 OpenAI 格式，供 RAG 向量检索使用（DeepSeek 无 embedding 接口，需另配）；
-- mock 模式：不依赖任何外部服务，按打字机节奏输出内置的养宠咨询回复。
+职责：把 LangChain 的模型客户端收敛为「按需创建 + 进程内复用」的三个惰性单例，并在其上提供
+三类调用方式——流式对话、纯文本调用、结构化（Pydantic）输出；同时内置结构化输出的
+多方式自动降级与无 Key 环境下的模拟流。
+
+主要导出：
+    - ``get_client``        对话模型客户端（OpenAI 兼容，支持任意服务商）
+    - ``get_vision_client`` 视觉模型客户端（多模态看图）
+    - ``get_embeddings``    Embedding 客户端（RAG 向量化）
+    - ``stream_chat``       流式产出增量文本
+    - ``ainvoke_text``      一次性取回完整文本（可临时覆盖温度 / 长度）
+    - ``astructured_invoke`` 让模型按 Pydantic schema 输出结构化结果
+    - ``mock_stream``       模拟回复流（MOCK 模式或无 Key 时使用）
+
+外部依赖：``langchain-openai``（延迟 import，避免未装依赖时整个服务起不来）、
+``langchain_core.messages``、``app.config.settings``。
+
+使用示例：
+    from app.llm import astructured_invoke, stream_chat
+    from app.schemas import ReviewSummary
+
+    async for delta in stream_chat(messages):
+        print(delta, end="")
+
+    summary = await astructured_invoke(ReviewSummary, system_prompt, user_prompt)
 """
+
 import asyncio
 import json
 import logging
@@ -17,42 +38,55 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 真实模式客户端单例（惰性创建；mock 模式下永远不会触发创建）
+# 三个客户端均为「首次使用时创建」：模块 import 阶段不建立连接，
+# 这样既能让无凭证环境正常启动，也避免配置错误在 import 时就抛异常导致进程退不出。
 _client = None
 _vision_client = None
 _embeddings = None
 
 
 def get_client():
-    """获取 ChatOpenAI 客户端单例（首次调用时创建）
+    """获取（并缓存）对话模型客户端。
 
-    langchain_openai 的 import 放在函数内部做惰性加载：
-    一是 mock 模式下省去模块加载开销，二是该依赖缺失时 mock 模式依旧可用。
+    客户端内部自带连接池，重复创建会浪费连接并丢失重试状态，因此按进程复用。
+
+    Returns:
+        ``langchain_openai.ChatOpenAI`` 实例。``streaming=True`` 是硬性要求——对话链路以 SSE
+        逐字下发，走非流式接口会导致首字延迟等于整段生成时间。
+
+    Raises:
+        ImportError: 未安装 ``langchain-openai`` 时抛出。
     """
     global _client
     if _client is None:
         from langchain_openai import ChatOpenAI
 
         _client = ChatOpenAI(
-            base_url=settings.LLM_BASE_URL,          # OpenAI 兼容地址（DeepSeek / 阿里云百炼等）
+            base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,
-            streaming=True,                          # 流式输出
+            streaming=True,
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
-            timeout=60,                              # 单次请求 60 秒超时：避免长期占用并发信号量
-            max_retries=1,                           # 重试上限 1 次：失败快速暴露给心跳超时兜底
+            # 单次请求 60s 上限 + 仅重试 1 次：对话场景宁可快速失败走首帧重试逻辑，
+            # 也不要在服务端长时间挂住占用并发名额。
+            timeout=60,
+            max_retries=1,
         )
     return _client
 
 
 def get_vision_client():
-    """获取视觉理解（多模态）ChatOpenAI 客户端单例
+    """获取（并缓存）视觉模型客户端。
 
-    与文本客户端分开配置（LLM_VISION_*）：文本走 DeepSeek、图片走百炼 qwen-vl
-    这类「不同服务商混搭」是常见形态；Key / BaseURL 缺省时已回落到 LLM_*。
-    调用方（chat_graph.generate）保证仅在 settings.vision_enabled 时才会走到这里，
-    未配置视觉模型时图片不会进入消息内容（降级为文字占位，见 app/media.py）。
+    与对话客户端分开配置（base_url / key / model 均独立），因为多数服务商的视觉模型
+    是另一个型号。
+
+    Returns:
+        ``ChatOpenAI`` 实例。超时放宽到 90s——图片上传与视觉推理明显慢于纯文本。
+
+    Raises:
+        ImportError: 未安装 ``langchain-openai`` 时抛出。
     """
     global _vision_client
     if _vision_client is None:
@@ -65,17 +99,20 @@ def get_vision_client():
             streaming=True,
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
-            timeout=90,                              # 图片上下行体积大，超时略宽于文本客户端
+            timeout=90,
             max_retries=1,
         )
     return _vision_client
 
 
 def get_embeddings():
-    """获取 OpenAIEmbeddings 单例（RAG 向量化用）
+    """获取（并缓存）Embedding 客户端。
 
-    Embedding 未配置时抛出异常，由 app/kb/search.py 转为 RagUnavailable——检索链路
-    明确失败并向上抛出，由调用方转为错误事件。
+    Returns:
+        ``OpenAIEmbeddings`` 实例，向量维度由 ``EMBEDDING_DIM`` 指定。
+
+    Raises:
+        ImportError: 未安装 ``langchain-openai`` 时抛出。
     """
     global _embeddings
     if _embeddings is None:
@@ -85,22 +122,27 @@ def get_embeddings():
             base_url=settings.EMBEDDING_BASE_URL,
             api_key=settings.EMBEDDING_API_KEY,
             model=settings.EMBEDDING_MODEL,
-            dimensions=settings.EMBEDDING_DIM,       # 阿里云 text-embedding-v3 支持指定维度
-            check_embedding_ctx_length=False,         # 兼容非 OpenAI 官方服务（避免 tiktoken 分词报错）
+            dimensions=settings.EMBEDDING_DIM,
+            # 关闭客户端侧的 token 长度预检：部分 OpenAI 兼容服务商不返回模型上下文长度，
+            # 开启校验会直接报错；真实超长由服务端返回错误处理。
+            check_embedding_ctx_length=False,
         )
     return _embeddings
 
 
 async def stream_chat(messages: List[AnyMessage]) -> AsyncIterator[str]:
-    """真实模式：流式对话，逐 token yield 回复文本片段
+    """流式调用对话模型，逐块产出新增文本。
 
-    :param messages: LangChain 消息列表（SystemMessage / HumanMessage / AIMessage 等），
-                     由调用方按对话角色直接构造，不再手写 {"role", "content"} 字典
+    Args:
+        messages: 完整的消息序列（System / Human / AI），由调用方负责裁剪历史窗口。
+
+    Yields:
+        str: 模型增量输出的文本片段；空片段（仅工具调用或思考标记）已被过滤。
+
+    Raises:
+        Exception: 透传底层 SDK 异常（超时、鉴权失败、限流），由调用方决定重试或降级。
     """
     async for chunk in get_client().astream(messages):
-        # BaseMessage.text 是 LangChain 内置的文本提取：字符串内容原样返回，
-        # 分块列表内容只取 text 分片（部分 OpenAI 兼容服务以多模态分块返回），
-        # 空 chunk（如仅携带 usage 的尾包）得到空串，直接跳过
         text = chunk.text
         if text:
             yield text
@@ -109,8 +151,22 @@ async def stream_chat(messages: List[AnyMessage]) -> AsyncIterator[str]:
 async def ainvoke_text(system_prompt: str, user_prompt: str,
                        temperature: Optional[float] = None,
                        max_tokens: Optional[int] = None) -> str:
-    """一次性（非流式）调用，返回完整文本；用于摘要 / 分类 / 意图识别等短任务"""
+    """一次性取回完整文本（非流式），用于摘要、改写等中间步骤。
+
+    Args:
+        system_prompt: 系统提示词。
+        user_prompt: 用户侧输入。
+        temperature: 临时覆盖全局温度；None 表示沿用 ``settings.LLM_TEMPERATURE``。
+        max_tokens: 临时覆盖全局长度上限；None 表示沿用 ``settings.LLM_MAX_TOKENS``。
+
+    Returns:
+        模型输出的纯文本。
+
+    Raises:
+        Exception: 透传底层 SDK 异常。
+    """
     llm = get_client()
+    # 仅在需要覆盖时才 bind，避免无谓地克隆一份 Runnable 配置。
     if temperature is not None or max_tokens is not None:
         llm = llm.bind(temperature=temperature if temperature is not None else settings.LLM_TEMPERATURE,
                        max_tokens=max_tokens or settings.LLM_MAX_TOKENS)
@@ -121,18 +177,26 @@ async def ainvoke_text(system_prompt: str, user_prompt: str,
     return resp.text
 
 
-# ---------- 结构化输出（跨服务商降级） ----------
-
-# 依次尝试的结构化输出方式：
-#   json_schema      —— 最优，服务端强约束（OpenAI 等支持）
-#   function_calling —— 工具调用实现（部分服务商的思考模式不支持 tool_choice）
-#   json_mode        —— 仅要求返回 JSON，再在客户端按 Pydantic 校验（兼容性最好）
+# 结构化输出的三种实现方式，按「表达力从强到弱」排列：
+# json_schema 由服务端强制约束；function_calling 借工具调用协议；json_mode 只保证返回 JSON。
+# 不同 OpenAI 兼容服务商支持程度不一，逐级降级是兼容性兜底。
 _STRUCTURED_METHODS = ("json_schema", "function_calling", "json_mode")
-_structured_method: Optional[str] = None   # 缓存已探明可用的方式，避免每次都试错
+# 记住上一次成功的方式，后续优先复用：既能省掉一轮失败尝试，也避免同一进程内行为漂移。
+_structured_method: Optional[str] = None
 
 
 def _json_mode_hint(schema: Type[BaseModel]) -> str:
-    """json_mode 下把 JSON Schema 显式写进 System Prompt（否则模型不知道字段结构）"""
+    """把 Pydantic schema 拼成提示词片段，供不支持原生 schema 约束的服务商使用。
+
+    Args:
+        schema: 目标输出模型。
+
+    Returns:
+        追加到 system prompt 末尾的约束文本（含完整 JSON Schema）。
+
+    Raises:
+        无。
+    """
     schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
     return ("\n\n必须严格按以下 JSON Schema 输出一个 JSON 对象，只输出 JSON，不要任何额外文字：\n"
             + schema_json)
@@ -140,16 +204,24 @@ def _json_mode_hint(schema: Type[BaseModel]) -> str:
 
 async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
                              user_prompt: str) -> BaseModel:
-    """跨服务商的结构化输出调用，返回 schema 实例
+    """让模型按给定 schema 输出结构化结果，失败时自动换一种实现方式重试。
 
-    OpenAI 兼容服务对结构化输出的支持差异很大：DeepSeek 的思考模型既不支持
-    json_schema，也不支持 tool_choice。这里按 json_schema → function_calling →
-    json_mode 顺序尝试，并缓存首次成功的方式；json_mode 会附带显式 Schema 提示。
-    全部失败时抛出最后一次异常，由调用方决定是否降级为规则逻辑。
+    Args:
+        schema: 目标 Pydantic 模型（其 ``Field(description=...)`` 会随 schema 一起下发，
+            因此字段描述写得好不好直接决定抽取质量）。
+        system_prompt: 系统提示词。
+        user_prompt: 用户侧输入。
+
+    Returns:
+        已校验的 ``schema`` 实例。
+
+    Raises:
+        Exception: 三种方式全部失败时，抛出最后一次遇到的异常（保留原始错误便于定位）。
+        RuntimeError: 各方式都未报错但也没返回结果（模型返回空）。
     """
     global _structured_method
     llm = get_client()
-    # 已探明方式优先，失败则回退到其余方式重新探测
+    # 上次成功的方式排到最前；其余保持原顺序补齐，保证总能尝试全部方式。
     order = ([_structured_method] if _structured_method else []) + \
             [m for m in _STRUCTURED_METHODS if m != _structured_method]
 
@@ -157,6 +229,7 @@ async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
     for method in order:
         try:
             if method == "json_mode":
+                # json_mode 不做 schema 校验，只能把 schema 塞进提示词里「请求」模型遵守。
                 client = llm.with_structured_output(schema, method="json_mode")
                 return await client.ainvoke([
                     SystemMessage(content=system_prompt + _json_mode_hint(schema)),
@@ -167,12 +240,13 @@ async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt),
             ])
+            # 个别服务商在 schema 模式下会返回 None 而不抛错，这里当作失败继续降级。
             if result is not None:
                 _structured_method = method
                 return result
         except Exception as exc:
             last_error = exc
-            # 缓存的方式失效则清除，后续重新探测
+            # 已缓存的方式失效（如服务商临时不支持）就清掉，避免后续每次都先失败一轮。
             if _structured_method == method:
                 _structured_method = None
             logger.debug("结构化输出方式 %s 不可用：%s", method, str(exc)[:120])
@@ -181,9 +255,8 @@ async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
     raise RuntimeError("结构化输出失败：模型未返回有效结果")
 
 
-# ---------- mock 模式 ----------
-
-# 内置候选回复池：{name} 会被替换为宠物名字（养宠顾问口吻的中立回复，供联调使用）
+# 模拟回复语料：覆盖健康、喂养、行为、就医四类常见问法，让前端在无 Key 环境下
+# 也能看到接近真实的流式效果与排版。
 _MOCK_REPLIES = [
     "收到你的问题。当前是本地模拟回复模式：关于{name}的健康与习性咨询，建议在 .env 中配置 LLM_API_KEY 后获取真实解答。",
     "这是模拟回复。一般来说，宠物出现食欲下降、精神萎靡等异常时，建议先记录症状持续时间，必要时尽快就医排查。",
@@ -195,19 +268,25 @@ _MOCK_REPLIES = [
 
 
 async def mock_stream(message: str, pet_name: str = "") -> AsyncIterator[str]:
-    """mock 模式：按 2-4 字符为块逐段输出，模拟打字机效果的咨询回复
+    """产出模拟回复流，行为与真实流式接口保持一致。
 
-    :param message: 用户消息（仅用来做简单分流，让不同输入得到不同回复）
-    :param pet_name: 宠物名字，会嵌入回复内容中
+    Args:
+        message: 用户输入，用于按长度稳定地挑选一条回复（同一问题重复提问结果一致）。
+        pet_name: 宠物名，用于替换回复里的 ``{name}`` 占位。
+
+    Yields:
+        str: 长度为 2~4 个字符的文本片段，模拟逐字输出。
+
+    Raises:
+        asyncio.CancelledError: 客户端断开时由调用方取消，属正常收尾路径。
     """
     name = (pet_name or "").strip() or "你的宠物"
-    # 依据消息长度取模挑选回复：同一输入稳定复现，不同输入有差异
     reply = _MOCK_REPLIES[len(message.strip()) % len(_MOCK_REPLIES)].format(name=name)
 
+    # 片段长度在 2~4 之间轮换并夹带 sleep，模拟网络抖动；固定长度会让前端看起来像假数据。
     pos = 0
     while pos < len(reply):
-        # 块大小在 2~4 字符之间循环变化，模拟真人打字节奏
         size = 2 + ((pos // 2) % 3)
         yield reply[pos:pos + size]
         pos += size
-        await asyncio.sleep(0.05)  # 每段间隔 0.05 秒，模拟打字机效果
+        await asyncio.sleep(0.05)

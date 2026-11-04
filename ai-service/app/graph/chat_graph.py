@@ -1,36 +1,30 @@
-"""LangGraph 对话编排图（chat graph）
+"""养宠顾问对话编排图。
 
-把原先手写的「拼消息 → 调模型」升级为显式状态图编排，节点职责单一、可观测、可扩展：
+职责：把一轮对话拆成可组合的节点并编排执行——
+``意图识别 →（并行扇出）知识检索 / 工具调用 → 汇合 → 长期记忆召回 → Prompt 组装 → 生成``。
+知识类与工具类意图可同时命中（用 ``Send`` 并行），互不阻塞。
 
-    START → classify_intent ──┬─(知识类, Send)──→ retrieve_knowledge ──┐
-                              ├─(工具类, Send)──→ tool_action ────────┼→ recall_memory → compose → generate → END
-                              └─(闲聊)───────────────────────────────┘
+主要导出：
+    - ``ChatState``        图状态定义
+    - ``get_chat_graph``   取得（并编译一次）图实例
+    - ``initial_state``    构造初始状态
+    - 各节点函数（``classify_intent`` / ``retrieve_knowledge`` / ``tool_action`` /
+      ``recall_memory`` / ``compose`` / ``generate``），供单测或调试直接调用
 
-  知识类（knowledge / health / medical_urgent）与工具类（tool_query）可以同时命中：
-  路由层用 Send 并行扇出两个分支，两个分支各自写入互不重叠的状态字段，随后在
-  recall_memory 汇合（同一超级步完成后只执行一次）。
+外部依赖：``langgraph``（StateGraph / Send / add_messages）、``app.llm``、``app.kb.search``、
+``app.persona``、``app.tools``、``app.checkpoint`` / ``app.memstore``。
 
-  - classify_intent   意图识别（多标签：一句话可同时命中多个意图；联网用 LLM 结构化
-                       输出，mock / 失败降级为关键词规则）
-  - retrieve_knowledge RAG 检索：多轮追问先改写成自包含查询，再做向量+BM25 混合检索
-                       （见 app/kb/search.py），检索链路不可用时直接报错（不降级）
-  - tool_action       Agent 工具调用：查询用户真实宠物 / 订单 / 购物车 / 评论 / 动态
-  - recall_memory     并行分支的汇合点 + 长期记忆读取：从 runtime store 读取用户级 + 宠物级记忆
-  - compose           组装最终 System Prompt（人设 + 宠物档案 + 长期记忆 + 参考知识 + 真实数据 + 医疗护栏）
-  - generate          调用 LLM 生成回答（真实模式；mock 模式由路由层走打字机 mock 流）
+使用示例：
+    from app.graph.chat_graph import get_chat_graph, initial_state
 
-会话记忆（LangGraph 官方 checkpoint）：
-  图状态中的 messages 通道（add_messages reducer）跨轮累积对话消息，编译时注入
-checkpoint.get_saver() 提供的官方 PostgresSaver 后由 checkpoint 自动持久化
-（thread_id = 用户+会话），下一轮对话自动恢复历史；被用户中止的轮次由路由层
-补写回 messages（见 chat._persist_interrupted）。
-compose 组装上下文时只取最近 HISTORY_MAX_MESSAGES 条窗口，控制 token 成本。
+    graph = get_chat_graph()
+    state = initial_state(query="猫咪打疫苗要注意什么", pet=pet, user_id=42, messages=[])
+    result = await graph.ainvoke(state, config=checkpoint.thread_config(42, 7))
 
-长期记忆（LangGraph 官方 runtime store）：
-  编译时另注入 memstore.get_store() 提供的官方 PostgresStore，recall_memory 节点
-  经 config["store"] 读取（用户 + 宠物命名空间隔离，跨会话生效，见 app/memstore.py）；
-  store 不可用或 MEMORY_ENABLED 关闭时降级为无长期记忆，不影响对话。
+降级策略：意图识别 / 查询改写 / 工具调用失败都退回规则或空上下文，只有生成节点的异常
+向上抛出（由路由层转成 error 帧）。
 """
+
 import logging
 from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
 
@@ -50,10 +44,11 @@ from app.tools import build_tools
 
 logger = logging.getLogger(__name__)
 
-# 需要 RAG 检索的意图
+# 这些意图需要知识库支撑；chitchat / tool_query 不触发检索。
 _KB_INTENTS = {"knowledge", "health", "medical_urgent"}
 
-# 意图关键词规则（mock 模式与 LLM 失败时的降级判断）
+# 规则兜底用的关键词表。模型不可用（mock / 超时 / 结构化输出失败）时靠它分类，
+# 因此词表要覆盖真实问法中的高频说法，宁可多召回也不要漏掉急症。
 _URGENT_WORDS = ["急救", "抽搐", "呼吸困难", "中毒", "大量出血", "尿不出", "尿闭",
                  "误食", "车祸", "昏迷", "高烧", "窒息", "站不起来"]
 _MEDICAL_WORDS = ["病", "呕吐", "腹泻", "拉稀", "发烧", "体温", "症状", "用药", "吃药",
@@ -65,44 +60,56 @@ _CHITCHAT_WORDS = ["你好", "您好", "hi", "hello", "在吗", "谢谢", "再�
 
 
 class ChatState(TypedDict, total=False):
-    """对话图状态（messages 走 add_messages reducer，其余字段后写覆盖前值）"""
+    """对话图状态。
 
-    query: str                     # 用户本轮输入（纯附件时为附件摘要文本，含音频转写）
-    pet: Dict[str, Any]            # 宠物档案（dict 形式）
-    user_id: int                   # 当前用户 ID
-    attachments: List[Dict[str, Any]]  # 本轮多模态附件（图片/音频/视频，dict 形式）
-    # 对话消息（跨轮累积）：输入的本轮 HumanMessage、generate 写回的 AIMessage、
-    # 中断补写的人机消息都汇聚于此，由 checkpoint 按 thread 持久化，构成长期记忆；
-    # 消息内容恒为纯文本（附件描述 / 转写以文字并入），图片分片仅在 compose 组装
-    # 最终请求时按当前轮附件现算——避免图片分片进 checkpoint 撑爆记忆存储
+    ``total=False``：节点只需返回自己产出的字段，未返回的字段保持原值。
+    ``messages`` 用 ``add_messages`` reducer 做「追加 + 按 id 去重」，这是多轮记忆的基础。
+    """
+
+    query: str
+    pet: Dict[str, Any]
+    user_id: int
+    attachments: List[Dict[str, Any]]
     messages: Annotated[List[AnyMessage], add_messages]
-    intents: List[str]             # 本轮命中的全部意图（知识类与工具类可同时命中）
+    intents: List[str]
     intent_reason: str
-    search_query: str              # 实际用于检索的查询（多轮追问改写后的自包含问法，空表示未改写）
-    knowledge: List[Dict[str, Any]]  # RAG 检索结果（同时作为前端「参考来源」数据）
-    knowledge_text: str            # 拼接后的知识上下文
-    tool_context: str              # 工具查询结果
-    memory_text: str               # 长期记忆上下文（recall_memory 从 runtime store 读取渲染）
-    medical: bool                  # 是否命中医疗护栏
-    final_messages: List[AnyMessage]  # 最终发给模型的消息（LangChain 消息对象，非 dict）
-    reply: str                     # 生成结果（真实模式）
+    search_query: str
+    knowledge: List[Dict[str, Any]]
+    knowledge_text: str
+    tool_context: str
+    memory_text: str
+    medical: bool
+    final_messages: List[AnyMessage]
+    reply: str
 
-
-# ---------- 节点实现 ----------
 
 def _rule_intents(query: str) -> List[str]:
-    """关键词规则意图识别（mock / 降级），知识类与工具类可以同时命中"""
+    """基于关键词的意图分类（模型不可用时的兜底）。
+
+    优先级：急症/疾病 > 健康养护；工具查询独立并存；都没有时按「是否寒暄」区分
+    chitchat 与 knowledge。
+
+    Args:
+        query: 用户问题原文。
+
+    Returns:
+        意图列表，至少一项。
+
+    Raises:
+        无。
+    """
     q = query.lower()
     intents: List[str] = []
-    # 知识类只取一个：医疗优先，其次健康，否则交给默认的 knowledge
     if any(w in q for w in _URGENT_WORDS) or any(w in q for w in _MEDICAL_WORDS):
+        # 用 elif 而非独立 if：命中疾病词时不必再判健康词——两者都会触发检索，
+        # 但医疗意图还要额外追加就医护栏，优先级更高。
         intents.append("medical_urgent")
     elif any(w in q for w in _HEALTH_WORDS):
         intents.append("health")
-    # 工具查询与知识类正交，可并存（如「猫吐了，顺便查下订单」）
     if any(w in q for w in _TOOL_WORDS):
         intents.append("tool_query")
     if not intents:
+        # 两个字符以内的短句（「在吗」「嗯嗯」）几乎都是寒暄，按后者处理可省一次检索。
         if any(w in q for w in _CHITCHAT_WORDS) or len(query.strip()) <= 2:
             intents.append("chitchat")
         else:
@@ -111,15 +118,19 @@ def _rule_intents(query: str) -> List[str]:
 
 
 async def classify_intent(state: ChatState) -> Dict[str, Any]:
-    """意图识别节点：真实模式用 LLM 结构化输出（多标签），其余走规则
+    """意图识别节点。
 
-    一句话可能同时命中多个意图（如「猫吐了，顺便看下我之前买的猫粮订单」
-    既要知识检索又要查用户数据），因此输出意图列表，由路由层并行扇出。
-    纯附件消息（无文字）没有可分类的文本：养宠场景发图片 / 音频 / 视频
-    绝大多数是「看看这是什么情况」的知识或健康咨询，直接归 knowledge，
-    不再让分类器对「用户发送了 N 张图片」这类摘要文本猜意图。
+    Args:
+        state: 图状态（使用 ``query`` / ``attachments``）。
+
+    Returns:
+        ``{"intents": [...], "intent_reason": str}``。多意图去重且保持模型输出顺序。
+
+    Raises:
+        无——模型异常降级为关键词规则。
     """
     query = state.get("query", "")
+    # 纯附件消息（如只发一张照片）无法用文字分类，直接按知识类处理让检索 / 生成接手。
     if state.get("attachments") and not query.strip():
         return {"intents": ["knowledge"], "intent_reason": "attachment/no-text"}
     if settings.is_mock:
@@ -133,11 +144,15 @@ async def classify_intent(state: ChatState) -> Dict[str, Any]:
         "- knowledge：养宠知识咨询（喂养、疫苗、驱虫、行为、护理等）\n"
         "- health：宠物健康评估、体检、养护计划\n"
         "- medical_urgent：疑似生病、症状描述、用药、急症（如中毒/抽搐/尿不出）\n"
-        "- tool_query：需要查询用户本人数据（我的宠物、订单、购物车、商品评论、社区动态）\n"
+        "- tool_query：需要查询用户本人数据（我的宠物、订单、购物车、商品评论、社区动态），"
+        "或需要商城的真实商品信息（找商品、商品推荐、比价、查价格 / 库存 / 是否在售）\n"
+        "注意：只问养宠知识或选购常识（如「猫粮怎么选」「幼猫吃什么」）时归 knowledge；"
+        "明确想在商城里找、买、看价格库存时才加 tool_query。\n"
         "只输出意图分类结果。\n"
     )
     try:
         result: IntentResult = await astructured_invoke(IntentResult, prompt, query)
+        # dict.fromkeys 去重并保序：模型偶尔会把同一意图输出两次。
         intents = list(dict.fromkeys(result.intents or []))
         if intents:
             return {"intents": intents, "intent_reason": result.reason}
@@ -147,13 +162,24 @@ async def classify_intent(state: ChatState) -> Dict[str, Any]:
     return {"intents": _rule_intents(query), "intent_reason": "fallback/rule"}
 
 
-# 追问指代词：命中任一，或问题很短，说明脱离上下文就检索不到东西，需要改写
+# 追问信号词：出现这些词说明当前问句脱离了上文就无法检索（「那它呢」「怎么办」）。
 _FOLLOWUP_HINTS = ["它", "他", "她", "这个", "那个", "这样", "那样", "还有", "可是", "但是",
                    "那", "呢", "怎么办", "为什么", "多久", "几次", "要不要", "能不能", "可以"]
 
 
 def _needs_rewrite(query: str) -> bool:
-    """是否需要改写：短问句或含指代/省略词时改写，自包含长问句直接检索（省一次 LLM 调用）"""
+    """判断问句是否需要先改写再检索。
+
+    Args:
+        query: 用户原句。
+
+    Returns:
+        True 表示过短或含指代/追问信号，需要结合上下文补全。
+        过短必改写：几个字很难带出可检索的实体词。
+
+    Raises:
+        无。
+    """
     q = query.strip()
     if len(q) <= settings.RAG_REWRITE_MIN_CHARS:
         return True
@@ -161,14 +187,27 @@ def _needs_rewrite(query: str) -> bool:
 
 
 def _recent_dialogue(state: ChatState, limit: int = 4) -> str:
-    """取最近若干条对话作为改写上下文（当前轮 HumanMessage 已在末尾，排除掉）"""
+    """抽取最近几轮对话作为改写上下文。
+
+    Args:
+        state: 图状态（读 ``messages``）。
+        limit: 取最近多少条消息。
+
+    Returns:
+        形如「用户：…\\n助手：…」的文本；无历史时为空串。
+
+    Raises:
+        无。
+    """
     messages = [m for m in (state.get("messages") or []) if isinstance(m, (HumanMessage, AIMessage))]
+    # 末尾的 HumanMessage 就是本轮问题本身，不能当「历史」喂给改写器，
+    # 否则它会把自己的问句再复述一遍。
     if messages and isinstance(messages[-1], HumanMessage):
         messages = messages[:-1]
     lines = []
     for msg in messages[-limit:]:
         role = "用户" if isinstance(msg, HumanMessage) else "助手"
-        # .text 为 LangChain 内置的文本提取（字符串内容 / 多模态分块统一取 text）
+        # 压平空白并截断：改写只需要语义线索，长段落会浪费 token。
         text = " ".join(msg.text.split())[:120]
         if text:
             lines.append(f"{role}：{text}")
@@ -176,17 +215,24 @@ def _recent_dialogue(state: ChatState, limit: int = 4) -> str:
 
 
 async def _build_search_query(state: ChatState) -> Dict[str, Any]:
-    """构造检索查询：多轮追问时结合上下文补全指代，返回 {query, species}
+    """把追问改写成可独立检索的完整问句。
 
-    改写只影响检索用文本，不改用户可见消息，也不写回 messages（不污染对话记忆）；
-    无需改写、mock 模式或 LLM 调用失败时一律退回原句——改写是召回优化，
-    不是对话前提，失败必须静默降级而不是让本轮报错。
+    Args:
+        state: 图状态。
+
+    Returns:
+        ``{"query": str, "species": [...]}``；无需或无法改写时返回原句 + 空物种。
+        物种由改写器顺带抽取，用于后续过滤。
+
+    Raises:
+        无。
     """
     query = state.get("query", "")
     if not settings.RAG_QUERY_REWRITE or settings.is_mock or not _needs_rewrite(query):
         return {"query": query, "species": []}
 
     context = _recent_dialogue(state)
+    # 首轮提问没有上下文可补全，改写只会引入臆测，直接跳过。
     if not context:
         return {"query": query, "species": []}
     prompt = (
@@ -207,13 +253,18 @@ async def _build_search_query(state: ChatState) -> Dict[str, Any]:
 
 
 async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
-    """RAG 检索节点：命中知识类意图时做混合检索（向量 + BM25 关键词）
+    """知识检索节点。
 
-    检索链路不可用时抛 RagUnavailable（由路由层转成 error 事件），不降级为
-    关键词检索、也不静默跳过——避免让模型在没有知识依据的情况下作答。
+    Args:
+        state: 图状态。
 
-    物种信号优先取本轮提问里显式提到的物种（用户可能在替别人的宠物问），
-    提问没提到时才回退到宠物档案物种。
+    Returns:
+        ``{"knowledge": [...], "knowledge_text": str, "search_query": str}``；
+        不需要检索时三者均为空。
+
+    Raises:
+        ``kb.search.RagUnavailable``：知识库不可用时向上抛出——知识类提问宁可明确失败，
+        也不要让模型「无依据却答得像真的」。
     """
     intents = state.get("intents") or []
     if not _KB_INTENTS.intersection(intents) or not settings.RAG_ENABLED:
@@ -221,6 +272,8 @@ async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
 
     rewritten = await _build_search_query(state)
     pet_species = (state.get("pet") or {}).get("species") or []
+    # 改写器抽到的物种更贴近本轮问题，优先于档案物种：用户问「狗能不能…」时
+    # 即便档案里养的是猫，也应按狗来过滤。
     results = await kb_search.retrieve(
         rewritten["query"],
         pet_species=rewritten["species"] or pet_species,
@@ -233,7 +286,20 @@ async def retrieve_knowledge(state: ChatState) -> Dict[str, Any]:
 
 
 async def tool_action(state: ChatState) -> Dict[str, Any]:
-    """工具调用节点：命中 tool_query 意图时运行 ReAct Agent 查询真实数据"""
+    """工具调用节点：让模型自主查询用户真实数据。
+
+    用 ``create_agent`` 而非固定编排，是因为「问档案 + 问订单」这类组合问题需要模型
+    自行决定调用哪些工具、调用几次。
+
+    Args:
+        state: 图状态。
+
+    Returns:
+        ``{"tool_context": str}``：工具执行结果的文字汇总；无工具可用或失败时为空串。
+
+    Raises:
+        无——工具链路失败只降级为「没有真实数据」，不影响回答。
+    """
     user_id = state.get("user_id", 0)
     query = state.get("query", "")
     if "tool_query" not in (state.get("intents") or []) or settings.is_mock:
@@ -242,17 +308,20 @@ async def tool_action(state: ChatState) -> Dict[str, Any]:
     if not tools:
         return {"tool_context": ""}
     try:
+        # 延迟 import：``langchain.agents`` 的导入较重，只有真正需要工具时才加载。
         from langchain.agents import create_agent
         agent = create_agent(
             get_client(),
             tools,
-            system_prompt="你是宠物社区的数据查询助手，根据用户问题调用合适的工具查询真实数据，"
-                          "并简洁汇总查询结果；若工具无数据，如实说明。",
+            system_prompt="你是宠物社区的数据查询助手。根据用户问题调用合适的工具查询真实数据；"
+                          "问题同时涉及多类数据（例如既问宠物档案又问购物车或订单）时，"
+                          "可以连续调用多个工具，再统一汇总；"
+                          "汇总要简洁准确，某个工具返回空数组时如实说明该项没有数据。",
         )
         result = await agent.ainvoke({"messages": [HumanMessage(content=query)]})
         messages = result.get("messages", []) if isinstance(result, dict) else []
         if messages:
-            # 回复可能是纯文本或多模态分块，.text 统一取文本
+            # 最后一条即 agent 对工具结果的汇总；中间的工具调用消息不注入 Prompt。
             return {"tool_context": messages[-1].text.strip()}
     except Exception:
         logger.warning("工具调用失败，跳过真实数据上下文", exc_info=True)
@@ -260,12 +329,19 @@ async def tool_action(state: ChatState) -> Dict[str, Any]:
 
 
 async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, Any]:
-    """长期记忆读取节点：从 runtime store 读取用户级 + 当前宠物级记忆
+    """长期记忆召回节点。
 
-    store 由图编译时注入（config["store"]，LangGraph 官方 runtime store 机制）；
-    store 缺失（未初始化 / 未注入）、MEMORY_ENABLED 关闭或读取失败时降级为
-    空字符串，compose 对应省略记忆块，对话主流程不受影响。
-    记忆条数按 MEMORY_MAX_ITEMS 截断（用户级 + 宠物级合计），控制 token 成本。
+    从 LangGraph store 读取「用户级 + 当前宠物级」两个命名空间的记忆，拼成提示词片段。
+
+    Args:
+        state: 图状态（读 ``pet`` / ``user_id``）。
+        config: 运行配置，必须携带 ``store``（编译期注入），否则直接跳过。
+
+    Returns:
+        ``{"memory_text": str}``：每行一条，形如 ``- [用户] 偏好…``；失败或未开启时为空串。
+
+    Raises:
+        无。
     """
     if not settings.MEMORY_ENABLED:
         return {"memory_text": ""}
@@ -280,6 +356,7 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
 
     lines: List[str] = []
     try:
+        # 先用户级再宠物级：用户偏好通常比单只宠物的细节更「全局」，放前面更醒目。
         for ns, label in (
             (memstore.user_ns(user_id), "用户"),
             (memstore.pet_ns(user_id, pet_id), pet_name or "宠物"),
@@ -289,6 +366,7 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
                 content = str((item.value or {}).get("content", "")).strip()
                 if content:
                     lines.append(f"- [{label}] {content}")
+                # 两级共享同一个总量上限：避免记忆过多把知识和档案挤出上下文窗口。
                 if len(lines) >= settings.MEMORY_MAX_ITEMS:
                     break
             if len(lines) >= settings.MEMORY_MAX_ITEMS:
@@ -300,17 +378,24 @@ async def recall_memory(state: ChatState, config: RunnableConfig) -> Dict[str, A
 
 
 def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    """当前轮用户消息的多模态内容分片（LangChain 标准内容块）
+    """构造多模态消息内容（文字 + 图片）。
 
-    图片以标准的 image 内容块直发（URL 为 OSS 公网地址，由视觉模型服务商回源拉取），
-    由 ChatOpenAI 统一归一化为服务商所需的 image_url 格式，因此这里不写死某家协议的字段；
-    URL 缺失（异常数据）时跳过该图并保留文字描述。返回非空列表表示走视觉模型，
-    无有效图片时返回 None 由调用方退回纯文本。
+    Args:
+        text: 用户文字。
+        attachments: 附件列表。
+
+    Returns:
+        多模态 content 列表；没有可用图片时返回 None，调用方据此保持纯文本消息
+        （纯文本模型的接口不接受 list 形式的 content）。
+
+    Raises:
+        无。
     """
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text or "请帮我看看这些内容"}]
     used = False
     for att in attachments or []:
         url = (att.get("url") or "").strip()
+        # 只处理图片；音频已在路由层转成文字，视频当前不支持。
         if att.get("type") != KIND_IMAGE or not url:
             continue
         parts.append({"type": "image", "url": url})
@@ -319,20 +404,22 @@ def _multimodal_content(text: str, attachments: List[Dict[str, Any]]) -> Optiona
 
 
 async def compose(state: ChatState) -> Dict[str, Any]:
-    """组装节点：拼装最终消息列表（不调用模型）
+    """Prompt 组装节点：把 System Prompt 与裁剪后的历史消息拼成最终输入。
 
-    历史窗口从图状态 messages 中取最近 HISTORY_MAX_MESSAGES 条（checkpoint 保留
-    全量记忆，此处按窗口裁剪控制上下文与 token 成本）；窗口内为空内容的助手消息
-    （如 LLM 空输出）直接跳过。
-    组装结果是 LangChain 消息对象（SystemMessage / HumanMessage / AIMessage），
-    与图状态 messages 通道同构，可直接交给模型调用。
-    多模态：仅当前轮（窗口内最后一条 HumanMessage）携带 image 内容块发给视觉
-    模型；历史轮的附件早已以文字描述并入消息内容，不再重复发图控制 token 成本。
+    Args:
+        state: 图状态。
+
+    Returns:
+        ``{"final_messages": [...], "medical": bool}``。
+
+    Raises:
+        无（``PetInfo`` 校验失败时退化为空档案）。
     """
     pet_dict = state.get("pet") or {}
     try:
         pet = PetInfo(**pet_dict)
     except Exception:
+        # 前端可能多传/传错字段，档案不合法不应让整轮对话失败。
         pet = PetInfo()
     medical = "medical_urgent" in (state.get("intents") or [])
 
@@ -345,8 +432,9 @@ async def compose(state: ChatState) -> Dict[str, Any]:
     )
     messages: List[AnyMessage] = [SystemMessage(content=system_prompt)]
     history = state.get("messages") or []
+    # 只取最近 N 条：checkpoint 会无限累积，全量送模型会超上下文并显著增加成本。
     window = history[-settings.HISTORY_MAX_MESSAGES:]
-    # 当前轮用户消息：窗口内最后一条 HumanMessage（compose 运行时 generate 尚未执行）
+    # 本轮问题（最后一条 HumanMessage）要替换成多模态版本，先定位它。
     current_human = next((m for m in reversed(window) if isinstance(m, HumanMessage)), None)
     multimodal = None
     if current_human is not None and settings.vision_enabled:
@@ -354,6 +442,7 @@ async def compose(state: ChatState) -> Dict[str, Any]:
             current_human.text, state.get("attachments") or [])
     for msg in window:
         content = msg.text
+        # 跳过空消息（如只有工具调用没有文本的 AI 消息），但保留本轮问题以免丢失输入。
         if not content.strip() and msg is not current_human:
             continue
         if isinstance(msg, HumanMessage):
@@ -362,28 +451,36 @@ async def compose(state: ChatState) -> Dict[str, Any]:
             elif content.strip():
                 messages.append(HumanMessage(content=content))
         elif isinstance(msg, AIMessage):
+            # 重建消息对象而不是直接复用：丢弃 checkpoint 里的 id / additional_kwargs，
+            # 避免历史「中断标记」等元信息影响本次生成。
             messages.append(AIMessage(content=content))
     return {"final_messages": messages, "medical": medical}
 
 
 async def generate(state: ChatState) -> Dict[str, Any]:
-    """生成节点：真实模式调用 LLM 并把回复写回 messages（随 checkpoint 持久化）；
-    mock 模式不调用（由路由层走 mock 流，回复由路由层补写进图状态）
+    """生成节点：调用 LLM 产出最终回复。
 
-    最终消息含多模态分片（当前轮带图）时切换视觉模型客户端；视觉模型不可用
-    的兜底由 compose 保证（不会组装出带图内容），此处仅按内容形态选客户端。
+    Args:
+        state: 图状态（读 ``final_messages``）。
+
+    Returns:
+        ``{"messages": [AIMessage] 或 [], "reply": str}``：AI 消息写回图状态形成记忆，
+        ``reply`` 供路由层使用。mock 模式下返回空 reply，由路由层接管模拟流。
+
+    Raises:
+        Exception: 模型调用失败时向上抛出，由路由层决定重试或返回 error 帧。
     """
     if settings.is_mock:
         return {"reply": ""}
     final_messages = state.get("final_messages", [])
+    # 多模态消息的 content 是 list，据此判断要不要换视觉模型（两者可能是不同服务商/型号）。
     has_image = any(isinstance(m.content, list) for m in final_messages)
     client = get_vision_client() if has_image else get_client()
     try:
         resp = await client.ainvoke(final_messages)
         content = resp.text
         return {
-            # 助手回复写回图状态：checkpoint 在本超级步结束后自动持久化，
-            # 下一轮对话从 checkpoint 恢复即为跨轮记忆；空输出不落记忆
+            # 空回复不写入 messages：否则下一轮会在历史里出现一条空 AI 消息。
             "messages": [AIMessage(content=content)] if content.strip() else [],
             "reply": content,
         }
@@ -392,22 +489,27 @@ async def generate(state: ChatState) -> Dict[str, Any]:
         raise
 
 
-# ---------- 路由 ----------
-
 def _route_after_classify(state: ChatState) -> Sequence[Send]:
-    """多意图路由：知识类与工具类可同时命中，用 Send 并行扇出后在 recall_memory 汇合
+    """意图识别后的条件路由：按意图并行扇出。
 
-    每个 Send 的第二个参数是目标节点本次执行的输入，只携带该节点真正用到的
-    字段：检索分支需要 query / pet / messages（多轮追问改写）与 intents，
-    工具分支需要 query / user_id / intents，闲聊直达记忆分支只需 pet / user_id。
-    分支返回的增量会合并回主图状态，因此 compose 仍能拿到完整上下文。
-    两个分支写入互不重叠的字段（检索结果 / 工具结果），状态通道无需 reducer。
+    用 ``Send`` 而非条件边，是为了让「知识检索」与「工具调用」同时进行；
+    两条分支都在 ``recall_memory`` 汇合（LangGraph 会等所有入边完成）。
+
+    Args:
+        state: 图状态。
+
+    Returns:
+        待执行的分支列表；什么意图都没命中时兜底走 ``recall_memory``，保证图能走到终点。
+
+    Raises:
+        无。
     """
     intents = state.get("intents") or []
     pet = state.get("pet") or {}
     res: List[Send] = []
 
     if _KB_INTENTS.intersection(intents):
+        # 显式传参而不是让分支继承全量状态：并行分支之间不应互相看到对方的中间结果。
         res.append(Send("retrieve_knowledge", {
             "query": state.get("query", ""),
             "pet": pet,
@@ -423,6 +525,7 @@ def _route_after_classify(state: ChatState) -> Sequence[Send]:
         }))
 
     if not res:
+        # chitchat 之类不需要外部上下文，但仍要召回记忆（用户可能只是打招呼）。
         res.append(Send("recall_memory", {
             "pet": pet,
             "user_id": state.get("user_id", 0),
@@ -431,18 +534,19 @@ def _route_after_classify(state: ChatState) -> Sequence[Send]:
     return res
 
 
-# ---------- 图构建 ----------
-
 _graph = None
 
 
 def get_chat_graph():
-    """构建并缓存对话编排图（编译一次，进程内复用）
+    """取得（首次调用时编译）对话图。
 
-    编译时注入 checkpoint saver（PostgreSQL 持久化图状态 / 会话记忆，
-    见 app/checkpoint.py）与 runtime store（PostgreSQL 持久化长期记忆，
-    见 app/memstore.py）；任一不可用时对应能力退化（无会话记忆 / 无长期记忆），
-    保证对话功能仍可用。
+    编译成本不低，且图本身无状态（状态在 checkpoint 里），因此按进程缓存一份。
+
+    Returns:
+        已编译的 ``CompiledStateGraph``，注入了 checkpointer（对话记忆）与 store（长期记忆）。
+
+    Raises:
+        无——checkpointer / store 为 None 时图退化为无记忆模式，仍可正常对话。
     """
     global _graph
     if _graph is not None:
@@ -458,6 +562,7 @@ def get_chat_graph():
 
     builder.add_edge(START, "classify_intent")
     builder.add_conditional_edges("classify_intent", _route_after_classify)
+    # 检索与工具两条分支都汇入 recall_memory：LangGraph 会等待全部入边完成再执行下游。
     builder.add_edge("retrieve_knowledge", "recall_memory")
     builder.add_edge("tool_action", "recall_memory")
     builder.add_edge("recall_memory", "compose")
@@ -473,8 +578,24 @@ def get_chat_graph():
 def initial_state(query: str, pet: Dict[str, Any], user_id: int,
                   messages: List[AnyMessage],
                   attachments: Optional[List[Dict[str, Any]]] = None) -> ChatState:
-    """构造图初始状态：messages 为本轮输入消息（本轮 HumanMessage，老会话首次接入时为回填历史 + 本轮）；
-    attachments 为本轮多模态附件（compose 组装带图内容时用，消息通道本身只存文本）"""
+    """构造对话图的初始状态。
+
+    显式列出全部字段（含空默认值）而不是只传输入项：并行分支读取未初始化字段时
+    会拿到 None，统一成空容器可省掉各节点里的判空分支。
+
+    Args:
+        query: 本轮检索用查询（文字，或纯语音时的转写拼接）。
+        pet: 宠物档案字典。
+        user_id: 用户 ID。
+        messages: 已拼接历史的输入消息（含本轮 HumanMessage）。
+        attachments: 附件列表。
+
+    Returns:
+        可直接传给 ``graph.ainvoke`` 的状态字典。
+
+    Raises:
+        无。
+    """
     return {
         "query": query,
         "pet": pet or {},

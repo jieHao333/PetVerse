@@ -1,23 +1,29 @@
-"""RAG 召回率评测（黄金集 + 消融对比）
+"""RAG 召回率评测脚本（消融对比）。
 
-用法（在 ai-service 目录下执行）：
-    python -m scripts.eval_rag --validate           # 只校验期望答案串是否存在于知识库
-    python -m scripts.eval_rag                      # 跑全部模式并输出对比表
-    python -m scripts.eval_rag --mode hybrid        # 只跑某一个模式
+职责：用一份「黄金查询集」（问题 + 答案证据子串）批量跑不同检索方案，统计 hit@1 / hit@3 /
+hit@5 / MRR / 空召回率，用于回答「这套检索到底比改造前好多少、好在哪一环」。
 
-三种模式刻意对应「改造的三个阶段」，用于分离每一改动的贡献：
+主要导出：无（作为脚本执行）。
 
-  A baseline-vector4  改造前线上行为：旧 langchain_pg_embedding 集合（11 条片段）
-                      + 纯向量 top_k=4 + 余弦相似度阈值 0.35；
-  B corpus-vector4    只换语料与切分，检索算法不变（新 kb_chunk 库 + 纯向量 top4 + 0.35）；
-  D hybrid            最终方案：混合检索（向量 + BM25 关键词加权序值融合、物种降权、双门槛）。
+三种评测模式（对应改造的三个阶段，差异只在检索实现）：
+    - ``baseline``：改造前——旧集合（LangChain PGVector）+ 纯向量 top4 + 0.35 阈值
+    - ``corpus``：  只换语料与切分——新库（kb_chunk）+ 同样的纯向量 top4 + 0.35 阈值
+    - ``hybrid``：  最终方案——向量 + BM25 混合检索、物种过滤、双门槛
 
-判定标准不依赖人工标注片段 ID（切分一变 ID 就失效），改用「答案证据是否进候选」：
-每条查询给出 expect 列表，**同一个片段内包含全部期望子串**即视为召回成功（hit）。
-另外记录第一个命中片段的名次用于 MRR、以及各模式的空召回率。
+外部依赖：``app.kb.search`` / ``app.kb.store``、``app.llm.get_embeddings``，
+``baseline`` 模式额外需要 ``langchain_postgres`` / ``sqlalchemy``（仅评测使用）。
 
-指标：hit@1 / hit@3 / hit@5 / recall@5（=命中查询占比）/ MRR / 空召回率。
+使用示例：
+    python -m scripts.eval_rag --validate      # 先校验期望子串确实存在于知识库
+    python -m scripts.eval_rag                 # 跑全部三种模式
+    python -m scripts.eval_rag --mode hybrid --verbose
+    python -m scripts.eval_rag --out report.json
+
+判定口径：只要「期望证据子串」全部出现在某个命中片段的正文里，即视为该条命中；
+记录它出现的排名用于算 hit@k 与 MRR。这个口径衡量的是「证据是否进了候选」，
+而非「最终答案是否正确」——后者受生成质量影响，不适合用来评价检索。
 """
+
 import argparse
 import asyncio
 import json
@@ -25,6 +31,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+# 使脚本可直接执行时也能 import app 包。
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
@@ -33,12 +40,13 @@ from app.config import settings  # noqa: E402
 from app.kb import search, store  # noqa: E402
 from app.logging_setup import setup_logging  # noqa: E402
 
-# 改造前的线上检索参数（不要跟着新配置改，这里就是要复现旧行为）
+# 改造前的检索参数，用于复现 baseline / corpus 两个对照组的原始口径。
 _LEGACY_TOP_K = 4
 _LEGACY_THRESHOLD = 0.35
 
-# 黄金集：expect 内的子串必须出现在同一个知识片段中
-# 覆盖此前基线探针里系统性漏召的长尾问题（黑下巴、皮肤癣用药、老年犬关节等）
+# 黄金查询集：覆盖疫苗、皮肤病、泌尿、中毒、急症、营养、口腔、绝育、行为、出行、
+# 老年照护、寄生虫、日常护理等语料主题。每个 ``expect`` 里的子串都必须能在知识库中
+# 找到（用 --validate 校验），否则该条永远不可能命中，会虚低整体分数。
 GOLDEN: List[Dict] = [
     {"q": "两个月的小猫什么时候打疫苗", "expect": ["幼猫", "8～9 周"]},
     {"q": "幼犬最后一针疫苗必须在多少周龄之后打", "expect": ["16 周龄"]},
@@ -127,12 +135,24 @@ GOLDEN: List[Dict] = [
 
 
 async def _legacy_results(query: str) -> List[dict]:
-    """模式 A：改造前的线上链路（langchain PGVector 旧集合 + top4 + 0.35 阈值）"""
+    """baseline 模式：查改造前的旧向量集合。
+
+    Args:
+        query: 查询语句。
+
+    Returns:
+        命中片段列表（仅低于阈值的被过滤掉）。
+
+    Raises:
+        Exception: 旧集合不存在或依赖未安装时抛出，由调用方跳过该条。
+    """
     from langchain_postgres import PGVector
     from sqlalchemy import create_engine
 
     from app.llm import get_embeddings
 
+    # 每次查询都新建引擎：评测是一次性脚本，不必优化连接复用；
+    # 用 engine 而非连接串是为了适配 PGVector 的同步接口。
     engine = create_engine(settings.pg_conn_str, pool_pre_ping=True)
     pg = PGVector(embeddings=get_embeddings(), connection=engine,
                   collection_name="petverse_kb", embedding_length=settings.EMBEDDING_DIM,
@@ -140,6 +160,7 @@ async def _legacy_results(query: str) -> List[dict]:
     pairs = await asyncio.to_thread(pg.similarity_search_with_score, query, _LEGACY_TOP_K)
     out = []
     for doc, distance in pairs:
+        # 旧实现返回的是余弦距离，这里换算成相似度以保持与其它模式可比。
         score = 1.0 - float(distance)
         if score < _LEGACY_THRESHOLD:
             continue
@@ -148,7 +169,19 @@ async def _legacy_results(query: str) -> List[dict]:
 
 
 async def _corpus_vector_results(query: str) -> List[dict]:
-    """模式 B：新语料新切分，但沿用旧的纯向量 top4 + 0.35 单阈值"""
+    """corpus 模式：新库 + 纯向量检索（不加关键词通道）。
+
+    作用是把「换语料」与「换算法」两个变量的影响拆开——这正是消融实验的核心。
+
+    Args:
+        query: 查询语句。
+
+    Returns:
+        过阈值后的片段列表。
+
+    Raises:
+        Exception: 向量化或查询失败时抛出，由调用方跳过该条。
+    """
     from app.llm import get_embeddings
 
     vector = await asyncio.to_thread(get_embeddings().embed_query, query)
@@ -157,7 +190,17 @@ async def _corpus_vector_results(query: str) -> List[dict]:
 
 
 async def _hybrid_results(query: str) -> List[dict]:
-    """模式 D：最终混合检索链路"""
+    """hybrid 模式：走线上真实的混合检索链路。
+
+    Args:
+        query: 查询语句。
+
+    Returns:
+        检索结果列表。
+
+    Raises:
+        Exception: 检索链路异常时抛出，由调用方跳过该条。
+    """
     return await search.retrieve(query)
 
 
@@ -169,8 +212,22 @@ _MODES = {
 
 
 def _judge(results: Sequence[dict], expect: Sequence[str], depth: int = 5) -> Tuple[bool, int]:
-    """判定：同一个片段内包含全部期望子串即算命中；返回 (是否命中, 首个命中的名次 0 表示未命中)"""
+    """判断某条查询是否命中，并返回命中排名。
+
+    Args:
+        results: 检索结果（按相关度降序）。
+        expect: 期望出现的证据子串（必须全部出现才算命中）。
+        depth: 只在前 depth 条里找。
+
+    Returns:
+        ``(是否命中, 排名)``；未命中时排名为 0。
+
+    Raises:
+        无。
+    """
     for rank, item in enumerate(results[:depth], start=1):
+        # 去掉空格再比较：知识库文本里的数字/单位常带空格（"72 小时"），
+        # 而模型与用户写法不一定一致，去掉空格能减少无意义的漏判。
         content = (item.get("content") or "").replace(" ", "")
         if all(e.replace(" ", "") in content for e in expect):
             return True, rank
@@ -178,6 +235,19 @@ def _judge(results: Sequence[dict], expect: Sequence[str], depth: int = 5) -> Tu
 
 
 async def run_mode(name: str, golden: List[Dict], verbose: bool) -> dict:
+    """跑完一个模式的全部查询并汇总指标。
+
+    Args:
+        name: 模式名（``_MODES`` 的键）。
+        golden: 查询集。
+        verbose: 是否逐条打印命中情况。
+
+    Returns:
+        ``{label, hit1, hit3, hit5, rr_sum, empty, misses, total, recall, mrr}``。
+
+    Raises:
+        无——单条查询异常按「未命中」计入，避免个别坏样本中断整轮评测。
+    """
     label, runner = _MODES[name]
     stats = {"label": label, "hit1": 0, "hit3": 0, "hit5": 0, "rr_sum": 0.0,
              "empty": 0, "misses": []}
@@ -189,13 +259,16 @@ async def run_mode(name: str, golden: List[Dict], verbose: bool) -> dict:
             results = []
         hit, rank = _judge(results, case["expect"])
         if not results:
+            # 空召回单独计数：它与「召回了但不相关」是两类问题，排查方向完全不同。
             stats["empty"] += 1
         if hit:
+            # 一次判定即可同时得出 hit@1/@3/@5：命中排名落在哪个区间就累加哪个计数。
             if rank <= 1:
                 stats["hit1"] += 1
             if rank <= 3:
                 stats["hit3"] += 1
             stats["hit5"] += 1
+            # MRR 用排名倒数累加，越靠前贡献越大。
             stats["rr_sum"] += 1.0 / rank
         else:
             stats["misses"].append({"q": case["q"], "expect": case["expect"],
@@ -210,7 +283,20 @@ async def run_mode(name: str, golden: List[Dict], verbose: bool) -> dict:
 
 
 async def validate_expectations(golden: List[Dict]) -> int:
-    """校验每条 expect 的子串能否在新知识库中找到（避免评测集自身写错）"""
+    """校验期望子串确实存在于知识库中。
+
+    这一步很容易被跳过、却很重要：写错一个字的期望子串会让该条永远 MISS，
+    从而把整体召回率算低，误导后续所有优化判断。
+
+    Args:
+        golden: 查询集。
+
+    Returns:
+        0 表示全部通过，1 表示存在缺失（供 CI 判断）。
+
+    Raises:
+        无。
+    """
     await store.init()
     try:
         joined = " ".join((r or "").replace(" ", "") for r in await store.all_contents())
@@ -231,6 +317,17 @@ async def validate_expectations(golden: List[Dict]) -> int:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    """评测主流程。
+
+    Args:
+        args: 命令行参数。
+
+    Returns:
+        进程退出码（0 正常完成）。
+
+    Raises:
+        无。
+    """
     setup_logging()
     golden = GOLDEN
     if args.limit:
@@ -241,6 +338,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     modes = [args.mode] if args.mode else ["baseline", "corpus", "hybrid"]
     if not args.skip_legacy_check and "baseline" in modes:
+        # 旧集合不存在时提前提示，否则每条 baseline 查询都会抛异常、刷屏。
         await _check_legacy_collection_exists()
 
     await store.init()
@@ -269,6 +367,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"明细已写入 {args.out}")
         elif args.verbose:
+            # 未指定输出文件时，把漏召回明细直接打到终端，方便当场看「为什么没命中」。
             for mode in modes:
                 for miss in report[mode]["misses"]:
                     print(f"[{mode}] MISS {miss['q']} 期望={miss['expect']}")
@@ -280,7 +379,14 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 async def _check_legacy_collection_exists() -> None:
-    """模式 A 依赖改造前的 langchain 集合仍在库里（默认导入不会删除它）"""
+    """检查旧向量集合是否存在（不存在则 baseline 无意义）。
+
+    Returns:
+        None。
+
+    Raises:
+        无——表不存在只打印提示，不中断评测。
+    """
     import psycopg
 
     def _count():
@@ -298,6 +404,14 @@ async def _check_legacy_collection_exists() -> None:
 
 
 def main() -> int:
+    """命令行入口。
+
+    Returns:
+        进程退出码。
+
+    Raises:
+        SystemExit: 参数非法时由 argparse 抛出。
+    """
     parser = argparse.ArgumentParser(description="RAG 召回率评测")
     parser.add_argument("--mode", choices=list(_MODES), default=None, help="只跑指定模式")
     parser.add_argument("--validate", action="store_true", help="只校验评测集期望子串是否存在")

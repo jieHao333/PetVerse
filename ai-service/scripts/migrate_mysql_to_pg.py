@@ -1,29 +1,28 @@
-"""存量数据迁移脚本（MySQL chat_session / chat_message -> PostgreSQL）
+"""MySQL → PostgreSQL 一次性数据迁移脚本。
 
-背景：ai-service 的会话与消息表已从 MySQL 整体迁移到 PostgreSQL 库
-petverse_ai（与 LangGraph checkpoint 同库）；本脚本把历史遗留 MySQL 库中的
-存量数据搬运过来。
+职责：把旧版存在 MySQL 里的 ``chat_session`` / ``chat_message`` 搬到 PostgreSQL，
+保留原会话 ID（前端历史链接与 checkpoint 的 thread_id 都依赖它），并修正自增序列。
 
-用法（在 ai-service 目录下执行）：
-    .venv\\Scripts\\python -m scripts.migrate_mysql_to_pg
-    （需要一次性安装 MySQL 驱动：pip install aiomysql；迁移完成后可卸载）
+主要导出：无（作为脚本执行）。
 
-特性：
-  - 只读源库：绝不写 MySQL，连不上时直接提示退出；
-  - 幂等：目标表同 ID 行已存在时跳过（ON CONFLICT DO NOTHING），可反复执行；
-  - 保留原 ID：前端 currentSessionId 与 LangGraph checkpoint 的 thread_id 都
-    内嵌了会话 ID，换 ID 会造成记忆断链；写完后对齐 PG 序列避免新会话撞主键；
-  - 时间戳按本地时区补全后写入 TIMESTAMPTZ，与原库的展示时间保持一致。
+外部依赖：``aiomysql``（仅迁移需要，完成后可卸载）、``psycopg``、``app.persistence``。
 
-MySQL 连接参数从 .env 的 MYSQL_* 键读取（若已删除配置则用默认值）。
+使用示例：
+    pip install aiomysql          # 仅迁移时需要
+    python -m scripts.migrate_mysql_to_pg
+
+幂等性：插入使用 ``ON CONFLICT (id) DO NOTHING``，重复执行不会产生重复数据，
+只会报告「已存在跳过 N 条」。迁移完成后无需额外处理 checkpoint 记忆——
+它按会话 ID 直接沿用。
 """
+
 import asyncio
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
-# 支持 `python scripts/migrate_mysql_to_pg.py` 直接运行：把包根目录补进 sys.path
+# 使脚本可直接执行时也能 import app 包。
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
@@ -34,12 +33,13 @@ from app import persistence  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.logging_setup import setup_logging  # noqa: E402
 
-# 本地时区（用于把 MySQL 的 naive DATETIME 补全为带时区时间写入 TIMESTAMPTZ）
+# 源库时间戳通常是「本地时间但无时区」，用当前进程的时区补上 tzinfo，
+# 否则写入 TIMESTAMPTZ 时会被当成 UTC，导致历史消息时间偏移数小时。
 _LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
 class _MySQLSource(BaseSettings):
-    """仅迁移脚本使用的 MySQL 连接配置（主配置已不再声明 MYSQL_*，此处独立读取 .env）"""
+    """源库连接配置（独立于主配置，便于迁移时只改 MySQL 参数）。"""
 
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
@@ -56,14 +56,32 @@ class _MySQLSource(BaseSettings):
 
 
 def _localize(dt: datetime) -> datetime:
-    """naive DATETIME 按本地时区补全（MySQL DATETIME 无时区，存的是本地时间）"""
+    """给无时区的时间戳补上本地时区。
+
+    Args:
+        dt: 源库读出的时间（可能为 None）。
+
+    Returns:
+        带时区的时间；已有时区或为 None 时原样返回。
+
+    Raises:
+        无。
+    """
     if dt is None or dt.tzinfo is not None:
         return dt
     return dt.replace(tzinfo=_LOCAL_TZ)
 
 
 async def _read_mysql() -> Tuple[List[tuple], List[tuple]]:
-    """读取 MySQL 全部会话与消息（只读）"""
+    """读取源库的会话与消息。
+
+    Returns:
+        ``(sessions, messages)`` 两个元组列表。按 id 升序读取，保证迁移顺序稳定。
+
+    Raises:
+        SystemExit: 未安装 aiomysql 或连接源库失败（迁移是可选操作，
+            源库不可用时直接退出并说明即可）。
+    """
     try:
         import aiomysql
     except ImportError:
@@ -96,7 +114,21 @@ async def _read_mysql() -> Tuple[List[tuple], List[tuple]]:
 
 
 def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
-    """写入 PostgreSQL：保留原 ID + 幂等跳过 + 末尾对齐序列"""
+    """把数据写入 PostgreSQL。
+
+    显式带上主键 id 插入（而不是让 PG 重新生成），这样会话 ID、消息归属、
+    checkpoint 的 thread_id 都能原样沿用。
+
+    Args:
+        sessions: 会话元组列表。
+        messages: 消息元组列表。
+
+    Returns:
+        ``(新增会话数, 新增消息数)``；已存在的记录不计入。
+
+    Raises:
+        Exception: 透传 psycopg 异常（整个事务回滚，不会留下半截数据）。
+    """
     import psycopg
 
     ins_session = ("INSERT INTO chat_session "
@@ -105,8 +137,8 @@ def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
     ins_message = ("INSERT INTO chat_message "
                    "(id, user_id, pet_id, session_id, role, content, interrupted, create_time) "
                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING")
-    # 显式写入 id 不会推进 BIGSERIAL 序列，必须手动 setval；
-    # 第三参 false 表示「下次 nextval 返回该值」，空表时从 1 开始
+    # 手工写入 id 不会推进 BIGSERIAL 的序列，必须把序列重设到 MAX(id) 之后，
+    # 否则应用后续插入会撞上已存在的主键。
     seq_sql = ("SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
                "COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)")
 
@@ -115,6 +147,7 @@ def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
             s_ok = 0
             for sid, uid, pid, title, ct, ut in sessions:
                 cur.execute(ins_session, (sid, uid, pid, title, _localize(ct), _localize(ut)))
+                # rowcount 为 1 表示确实插入，0 表示命中 DO NOTHING（已存在）。
                 s_ok += cur.rowcount
             m_ok = 0
             for mid, uid, pid, sid, role, content, interrupted, ct in messages:
@@ -128,11 +161,19 @@ def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
 
 
 async def main() -> None:
+    """迁移主流程：读源库 → 确保目标表存在 → 写入 → 打印统计。
+
+    Returns:
+        None。
+
+    Raises:
+        无（连接类错误以 SystemExit 退出）。
+    """
     setup_logging()
     sessions, messages = await _read_mysql()
     print(f"读取完成: 会话 {len(sessions)} 条, 消息 {len(messages)} 条")
 
-    # 确保目标表存在（幂等；PG 不可用时 init 内部降级，写入阶段会明确报错）
+    # 复用业务层的初始化逻辑：目标表结构与线上完全一致（含索引与新增列）。
     await persistence.init()
     try:
         s_ok, m_ok = _write_pg(sessions, messages)

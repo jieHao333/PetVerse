@@ -1,17 +1,28 @@
-"""个性化推荐工作流（recommend graph）
+"""个性化推荐编排图。
 
-LangGraph 编排：
-    gather_profile → recall_candidates → rerank → persist_cache
-  - gather_profile：并发拉取用户画像数据（宠物 / 订单 / 购物车 / 评价 / 我的动态）；
-  - recall_candidates：按画像物种召回商品与同物种动态、热门内容兜底，再做物种相关度排序；
-  - rerank：真实模式用 LLM 结合画像重排并生成推荐理由；mock / 失败时按相关度排序；
-  - persist_cache：按用户 + 场景写 Redis 热缓存（TTL 5 分钟，不写 PostgreSQL 温层）。
+职责：结合用户画像（宠物、订单、购物车、评价、动态）从商城商品与社区动态中挑选并排序，
+产出「带推荐理由」的推荐流。排序优先用 LLM 重排，失败或 mock 模式下退回启发式排序。
 
-为什么相关度要先在 Python 侧算一遍：商品只有「用品/食品/活体」三分类、动态只有自由话题，
-两侧都没有物种字段，物种信号只存在于标题与详情的自由文本里。只靠 LLM 重排兜不住——候选池
-里大半是猫狗内容时模型照样会选错，所以先按物种归组打分、把别家物种专属的候选挡在召回门外，
-再交给模型排序并写理由。
+主要导出：
+    - ``RecommendState``      图状态定义
+    - ``recommend``           对外入口（带缓存与单飞）
+    - ``get_recommend_graph`` 取得（并编译一次）图实例
+    - 各节点与打分函数（``gather_profile`` / ``recall_candidates`` / ``rerank`` /
+      ``persist_cache`` 等）
+
+外部依赖：``app.clients.biz``（业务数据）、``app.llm``、``app.cache``、``app.schemas``。
+
+使用示例：
+    from app.graph.recommend_graph import recommend
+
+    feed = await recommend(user_id=42, scene="home")          # 走缓存
+    feed = await recommend(user_id=42, scene="shop", use_cache=False)   # 强制重算
+
+核心约束：**不推荐与用户饲养物种无关的内容**（只养花枝鼠的用户不该看到猫爬架）。
+这条约束在候选过滤（``_is_off_species``）、提示词、以及合并阶段三处同时施加，
+因为单靠提示词无法保证模型遵守。
 """
+
 import asyncio
 import logging
 from typing import Any, Dict, List, Set, Tuple, TypedDict
@@ -26,26 +37,26 @@ from app.schemas import RecommendResult
 
 logger = logging.getLogger(__name__)
 
-# 缓存命名空间版本：推荐结果结构 / 去重逻辑变更时递增，
-# 保证旧版本写入的缓存（可能含重复项）不会再被复用
-# v3：动态补充封面图（image 取 mediaList 第一张图片），旧缓存里的动态没有封面
+# 缓存版本号：调整召回/排序逻辑后手动 +1，可让旧结构缓存立即失效（避免上线后仍吐旧数据）。
 _CACHE_VERSION = "v3"
 
-# 召回规模
-_MAX_KEYWORDS = 5               # 画像物种关键词上限（每个关键词一次商品检索）
-_MAX_POST_KEYWORDS = 2          # 动态按物种检索的关键词上限
-_PRODUCT_PER_KEYWORD = 6        # 单词召回的商品条数
-_POST_PER_KEYWORD = 4           # 单词召回的动态条数
-_PRODUCT_BACKUP_LIMIT = 8       # 商品泛化兜底条数（无画像时放宽到 _BLANK_PRODUCT_LIMIT）
-_BLANK_PRODUCT_LIMIT = 12       # 无画像时泛化召回的商品条数
-_HOT_POST_LIMIT = 8             # 热门动态兜底条数
-_CANDIDATE_POOL = 24            # 送入重排层的候选总数
-_TOP_N = 8                      # 最终返回条数
-_HOME_SPACE_MAX = _TOP_N // 2   # 首页动态条数上限，避免整屏都是动态
+# ── 召回规模参数 ──────────────────────────────────────────────────────────
+# 关键词数量直接决定并发请求数：商品每词 6 条、动态每词 4 条，5 个词 ≈ 50 条候选。
+_MAX_KEYWORDS = 5
+_MAX_POST_KEYWORDS = 2
+_PRODUCT_PER_KEYWORD = 6
+_POST_PER_KEYWORD = 4
+# 无关键词时的兜底召回量（比有关键词时多，因为缺少定向性）。
+_PRODUCT_BACKUP_LIMIT = 8
+_BLANK_PRODUCT_LIMIT = 12
+_HOT_POST_LIMIT = 8
+# 送入 LLM 重排的候选上限：再多会超出上下文且显著增加成本。
+_CANDIDATE_POOL = 24
+_TOP_N = 8
+# 首页最多几条社区动态：商品是主诉求，动态太多会让推荐流看起来像信息流。
+_HOME_SPACE_MAX = _TOP_N // 2
 
-# 养宠人群分组 -> 标题/详情里可能出现的别名词（与前端 petOptions.js 的物种表对齐，
-# 并补上用户自定义填写的花枝鼠、蜜袋鼯等）。按词长倒序匹配并整词消费，
-# 所以「龙猫」「花枝鼠」归小宠，不会被拆成「猫」「鼠」错判成猫用品。
+# 物种同义词表：用于从商品名/标题里识别物种，并判断候选是否与用户饲养的物种相关。
 _SPECIES_TOKENS: Dict[str, List[str]] = {
     "猫": ["猫", "喵"],
     "狗": ["狗", "犬"],
@@ -56,12 +67,14 @@ _SPECIES_TOKENS: Dict[str, List[str]] = {
     "爬宠": ["守宫", "蜥蜴", "角蛙", "蛇", "蜘蛛", "寄居蟹"],
     "鱼": ["观赏鱼", "金鱼", "锦鲤", "斗鱼", "鱼"],
 }
+# 按词长倒序排列，配合 _species_order 的「最长优先」扫描：
+# 「花枝鼠」必须先于「鼠」命中，否则会被归到错误的物种组。
 _TOKEN_INDEX = tuple(sorted(
     ((token, group) for group, tokens in _SPECIES_TOKENS.items() for token in tokens),
     key=lambda x: (-len(x[0]), x[0])))
 
-# 组内常见商品检索词：只拿宠物档案里的物种名去搜会漏掉同属「小宠」的仓鼠笼、龙猫浴沙等
-# 商品，按组补几个代表词进召回关键词（单词太泛，如「鼠」会命中猫玩具「猫抓老鼠」，不收）
+# 用于发起搜索的词：只取多字词。「猫」「狗」这类单字搜出来的结果噪声太大，
+# 而「花枝鼠」「金丝熊」足够精确。
 _GROUP_SEARCH_LEADS: Dict[str, List[str]] = {
     group: [token for token in tokens if len(token) > 1]
     for group, tokens in _SPECIES_TOKENS.items()
@@ -69,21 +82,35 @@ _GROUP_SEARCH_LEADS: Dict[str, List[str]] = {
 
 
 class RecommendState(TypedDict, total=False):
-    """推荐图状态"""
+    """推荐图状态。``total=False`` 让各节点只返回自己产出的字段。"""
 
     user_id: int
-    scene: str                   # home / shop
-    profile: Dict[str, Any]      # 画像原始数据
-    keywords: List[str]          # 画像物种关键词
-    own_groups: List[str]        # 用户饲养物种所属人群分组
-    own_words: List[str]         # 用户宠物物种展示词（生成理由用）
-    candidates: List[Dict[str, Any]]  # 候选（商品 + 动态），已按相关度降序
-    items: List[Dict[str, Any]]  # 最终推荐项
+    scene: str
+    profile: Dict[str, Any]
+    keywords: List[str]
+    own_groups: List[str]
+    own_words: List[str]
+    candidates: List[Dict[str, Any]]
+    items: List[Dict[str, Any]]
     summary: str
 
 
 def _species_order(text: str) -> List[str]:
-    """按出现先后返回文本涉及的养宠人群分组（最长匹配优先，命中即消费掉该词）"""
+    """按出现顺序抽取文本中的物种组（去重）。
+
+    逐字符扫描 + 最长匹配，而不是简单 ``in`` 判断：一句话里可能同时出现「猫」和「猫砂」，
+    也可能出现「花枝鼠」这种必须整体匹配的词；顺序信息在 ``_is_off_species`` 里用于
+    判断「标题首要说的是哪个物种」。
+
+    Args:
+        text: 待分析文本（商品名 / 标题 / 描述）。
+
+    Returns:
+        物种组列表，按首次出现位置排序。
+
+    Raises:
+        无。
+    """
     ordered: List[str] = []
     lowered = (text or "").lower()
     pos = 0
@@ -92,6 +119,7 @@ def _species_order(text: str) -> List[str]:
             if lowered.startswith(token, pos):
                 if group not in ordered:
                     ordered.append(group)
+                # 命中后整词跳过，避免「花枝鼠」被继续拆出「鼠」而重复计入。
                 pos += len(token)
                 break
         else:
@@ -100,15 +128,37 @@ def _species_order(text: str) -> List[str]:
 
 
 def _species_of(text: str) -> Set[str]:
-    """文本涉及哪些养宠人群分组"""
+    """抽取文本涉及的物种组集合。
+
+    Args:
+        text: 待分析文本。
+
+    Returns:
+        物种组集合；无命中时为空集。
+
+    Raises:
+        无。
+    """
     return set(_species_order(text))
 
 
 def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
-    """从画像提炼 (召回关键词, 所属人群分组, 物种展示词)
+    """从用户画像推导召回关键词与「自家物种」。
 
-    以宠物档案为准；没登记宠物时退化为消费/互动行为（购物车、订单、评价、自己发的动态）
-    里体现出的物种，避免新用户一上来就被全库新品灌满猫狗内容。
+    主路径看宠物档案的 species / breed；没有宠物档案时退而求其次，
+    从购物车、评价、订单、自己发的动态里推断用户在意的物种（新用户常见情况）。
+
+    Args:
+        profile: ``gather_profile`` 产出的画像。
+
+    Returns:
+        ``(keywords, own_groups, own_words)``：
+            - keywords：用于搜索的关键词（含物种组及其同义词），已截断；
+            - own_groups：用户饲养的物种组（用于过滤）；
+            - own_words：用户自己填写的物种原词（用于生成推荐理由的措辞）。
+
+    Raises:
+        无。
     """
     keywords: List[str] = []
     own_words: List[str] = []
@@ -122,10 +172,13 @@ def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[s
             groups |= _species_of(value)
             if value not in keywords:
                 keywords.append(value)
+            # 只用 species 生成措辞：breed（如「英短」）不适合说成「养英短的铲屎官」。
             if field == "species" and value not in own_words:
                 own_words.append(value)
 
     if not groups:
+        # 无宠物档案：从行为数据里拼一段文本推断物种。只需判断「买了/看了什么」，
+        # 因此把商品名与动态标题拼起来统一做一次抽取即可。
         touched: List[str] = []
         for item in (profile.get("cart") or []) + (profile.get("reviews") or []):
             if item.get("productName"):
@@ -139,9 +192,8 @@ def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[s
                 touched.append(post["title"])
         groups = _species_of(" ".join(touched))
 
-    # 分组名本身也是电商常用搜词（如「小宠」），连同组内代表词补进关键词，
-    # 兜住标题里不直接写宠物物种名的商品
     for group in sorted(groups):
+        # 排序后拼接：保证同一画像每次生成的词序一致，缓存与结果才可复现。
         for term in [group] + _GROUP_SEARCH_LEADS.get(group, []):
             if term not in keywords:
                 keywords.append(term)
@@ -149,11 +201,21 @@ def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[s
 
 
 def _is_off_species(cand: Dict[str, Any], own_groups: Set[str]) -> bool:
-    """物种门槛：这条内容是别家物种专属
+    """判断候选是否为「别的物种的专属内容」。
 
-    两种出局情形——标题只写了别家物种（猫爬架之于养鼠用户），或标题里最先出现的物种词
-    是别家物种（「猫抓老鼠玩具」是给猫玩的，不是给鼠玩的）。后者必须靠语序判，
-    因为商品没有物种字段，只看"沾没沾上自家物种"会把猫玩具放进小宠用户的推荐里。
+    判定规则：标题里出现了用户不养的物种，且要么完全没有用户养的物种，要么该外来物种
+    出现在标题最前面（说明它是主推对象）。这样「猫狗通用」的标题不会被误杀，
+    而「猫爬架」对养鼠用户会被正确排除。
+
+    Args:
+        cand: 候选（需含 ``title``）。
+        own_groups: 用户饲养的物种组；为空时不做过滤（新用户没有依据）。
+
+    Returns:
+        True 表示应当排除。
+
+    Raises:
+        无。
     """
     if not own_groups:
         return False
@@ -166,7 +228,17 @@ def _is_off_species(cand: Dict[str, Any], own_groups: Set[str]) -> bool:
 
 
 def _as_number(value: Any) -> int:
-    """把 Java 可能序列化成字符串的数值字段安全转成 int，异常值按 0 处理"""
+    """把接口返回的「可能是字符串的数字」安全转成整数。
+
+    Args:
+        value: 任意值（后端有时把数值序列化成字符串）。
+
+    Returns:
+        整数值；无法转换时返回 0。
+
+    Raises:
+        无。
+    """
     try:
         return int(float(value or 0))
     except (TypeError, ValueError):
@@ -174,11 +246,16 @@ def _as_number(value: Any) -> int:
 
 
 def _first_image_url(media_list: Any) -> str:
-    """取动态的第一张图片作为封面
+    """取动态的第一张图片地址。
 
-    SpaceVO.mediaList 按排序字段升序返回，mediaType 0-图片 1-视频：
-    逐条取第一个图片类媒体，跳过视频（视频封面拿不到，交给前端默认封面兜底）。
-    字段缺省时按图片处理，兼容早期没有 mediaType 的数据。
+    Args:
+        media_list: 动态的 ``mediaList`` 字段。
+
+    Returns:
+        图片 URL；没有图片时返回空串。
+
+    Raises:
+        无。
     """
     if not isinstance(media_list, list):
         return ""
@@ -186,6 +263,7 @@ def _first_image_url(media_list: Any) -> str:
         if not isinstance(media, dict):
             continue
         media_type = media.get("mediaType")
+        # mediaType 约定 0 = 图片；其它类型（视频等）跳过，避免把视频封面当图片用。
         if media_type is not None and _as_number(media_type) != 0:
             continue
         url = media.get("url")
@@ -195,39 +273,80 @@ def _first_image_url(media_list: Any) -> str:
 
 
 def _relevance(cand: Dict[str, Any], own_groups: Set[str]) -> float:
-    """相关度打分：命中自家物种加分（标题命中更高于详情命中），标题写明别家物种减分，
-    画像召回优于热门兜底，动态再按点赞微调。"""
+    """启发式相关度打分（用于候选排序与 LLM 失败时的兜底）。
+
+    分数语义（非概率）：出现在标题中的自家物种 +3，仅出现在描述中 +1.5，
+    标题出现外来物种 -2 且每多一个再 -1；定向召回 +1；动态按点赞量最多 +0.5。
+
+    Args:
+        cand: 候选（含 ``title`` / ``_desc`` / ``_targeted`` / ``type`` / ``likeCount``）。
+        own_groups: 用户饲养的物种组。
+
+    Returns:
+        相关度分数（可为负）。
+
+    Raises:
+        无。
+    """
     in_title = _species_of(cand.get("title") or "")
     in_text = in_title | _species_of(cand.get("_desc") or "")
     score = 0.0
     if own_groups:
+        # 标题命中权重远高于描述：标题是内容的主旨，描述里往往只是顺带提及。
         if in_title & own_groups:
             score += 3.0
         elif in_text & own_groups:
             score += 1.5
         foreign = in_title - own_groups
         if foreign:
-            # 「猫抓老鼠玩具」这类同时沾了自家物种的标题不判死，只降权：
-            # 商品没有物种字段可依据，硬删会把真好物一起删掉
             score -= 2.0 + len(foreign)
+    # 定向召回（按用户关键词搜到的）比兜底召回更可能有相关性。
     if cand.get("_targeted"):
         score += 1.0
     if cand.get("type") == "space":
+        # 动态额外给一点人气加成，上限 0.5，避免热门内容压过物种相关性。
         score += min(0.5, (cand.get("likeCount") or 0) / 100.0)
     return score
 
 
 def _item_reason(cand: Dict[str, Any], own_groups: Set[str], own_words: List[str]) -> str:
-    """降级推荐理由：命中用户物种时点出具体物种，否则退回通用话术"""
+    """生成规则版推荐理由（LLM 不可用或补充候选时使用）。
+
+    Args:
+        cand: 候选。
+        own_groups: 用户饲养的物种组。
+        own_words: 用户填写的物种原词（用于措辞，比物种组更贴近用户表述）。
+
+    Returns:
+        不超过一句话的推荐理由。
+
+    Raises:
+        无。
+    """
     touched = _species_of(cand.get("title") or "") | _species_of(cand.get("_desc") or "")
     if own_groups and (touched & own_groups):
+        # 优先挑一个「其物种组与候选有交集」的原词，避免说成「养猫的用户」而用户填的是「英短」。
         word = next((w for w in own_words if _species_of(w) & touched), "") or own_words[0]
         return f"适合你家{word}的实用好物" if cand["type"] == "product" else f"养{word}的铲屎官都在看"
     return "在售好物，值得看看" if cand["type"] == "product" else "社区热门动态"
 
 
 def _to_item(cand: Dict[str, Any], reason: str, score: float) -> Dict[str, Any]:
-    """输出项裁剪：下划线开头的是内部标记，不下发给前端"""
+    """把内部候选转成对外结构。
+
+    Args:
+        cand: 内部候选（含 ``_`` 前缀的内部字段）。
+        reason: 推荐理由。
+        score: 对外相关度（0~1）。
+
+    Returns:
+        去掉内部字段、补上 reason / score 的字典。
+
+    Raises:
+        无。
+    """
+    # 剔除 `_targeted` / `_desc` / `_score` 等内部字段：它们只服务于排序，
+    # 暴露出去既增大响应体，也会让人误以为是接口契约的一部分。
     item = {k: v for k, v in cand.items() if not k.startswith("_")}
     item["reason"] = reason
     item["score"] = score
@@ -235,7 +354,17 @@ def _to_item(cand: Dict[str, Any], reason: str, score: float) -> Dict[str, Any]:
 
 
 async def gather_profile(state: RecommendState) -> Dict[str, Any]:
-    """并发拉取用户画像（任一失败均为空，不影响其余）"""
+    """画像聚合节点：并行拉取用户的宠物、订单、购物车、评价、动态。
+
+    Args:
+        state: 图状态（读 ``user_id``）。
+
+    Returns:
+        ``{"profile": {...}}``：五项数据均为列表（失败项退化为空列表）。
+
+    Raises:
+        无——``return_exceptions=True`` 保证单项失败不影响整体。
+    """
     user_id = state.get("user_id", 0)
     pets, orders, cart, reviews, my_posts = await asyncio.gather(
         biz.get_my_pets(user_id),
@@ -247,6 +376,7 @@ async def gather_profile(state: RecommendState) -> Dict[str, Any]:
     )
 
     def _safe(v):
+        """把异常对象 / 非列表值统一成空列表。"""
         return v if isinstance(v, (list, dict)) else []
 
     profile = {
@@ -260,16 +390,26 @@ async def gather_profile(state: RecommendState) -> Dict[str, Any]:
 
 
 async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
-    """召回候选：按画像物种检索商品与动态，无画像时用热门兜底，再做物种门槛与排序"""
+    """候选召回节点：按关键词并发搜索商品 / 动态，过滤后按相关度截断。
+
+    Args:
+        state: 图状态（读 ``user_id`` / ``scene`` / ``profile``）。
+
+    Returns:
+        ``{"keywords", "own_groups", "own_words", "candidates"}``，
+        ``candidates`` 已按相关度降序且不超过 ``_CANDIDATE_POOL`` 条。
+
+    Raises:
+        无——单次搜索异常由 ``return_exceptions`` 隔离。
+    """
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
     profile = state.get("profile") or {}
     keywords, own_groups_list, own_words = _build_intent(profile)
     own_groups = set(own_groups_list)
 
-    # 商品：逐物种关键词召回 + 一路泛化兜底。兜底不会被猫狗内容污染——泛化取到的是全库
-    # 新品，其中别家物种专属的会在后面被物种门槛挡掉，留下的正是标题没写物种名的同物种
-    # 商品与通用品；无画像（新用户）时才放大兜底额度当作热门推荐。
+    # 每个关键词一个请求，另加一个「兜底请求」（不带头关键词）保证候选池不会因为
+    # 关键词过窄而空掉。
     product_coros: List[Any] = []
     product_targeted: List[bool] = []
     for kw in keywords:
@@ -279,9 +419,9 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
                                              else _PRODUCT_BACKUP_LIMIT, user_id=user_id))
     product_targeted.append(False)
 
-    # 动态：同物种检索 + 一路热门兜底；商城页「猜你喜欢」只要商品，不占动态额度
     post_coros: List[Any] = []
     post_targeted: List[bool] = []
+    # 商城场景只需要商品，省掉动态请求（少一半外部调用）。
     if scene != "shop":
         for kw in keywords[:_MAX_POST_KEYWORDS]:
             post_coros.append(biz.search_posts(kw, limit=_POST_PER_KEYWORD, user_id=user_id))
@@ -289,6 +429,7 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
         post_coros.append(biz.get_hot_posts(limit=_HOT_POST_LIMIT, user_id=user_id))
         post_targeted.append(False)
 
+    # 商品与动态一起并发；返回顺序与传入顺序一致，据此切分结果。
     results = await asyncio.gather(*product_coros, *post_coros, return_exceptions=True)
     product_results = results[:len(product_coros)]
     post_results = results[len(product_coros):]
@@ -297,7 +438,9 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
     seen: Set[Tuple[str, Any]] = set()
 
     def _add(kind: str, raw: dict, targeted: bool) -> None:
+        """去重后把原始数据裁成统一候选结构。"""
         rid = raw.get("id")
+        # 同一商品会被多个关键词搜到，用 (类型, id) 去重；id 缺失的直接丢弃（无法引用）。
         if rid is None or (kind, rid) in seen:
             return
         seen.add((kind, rid))
@@ -311,15 +454,14 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
         else:
             cand = {
                 "id": rid, "type": "space",
+                # 动态可能没有标题，退化为正文前 30 字。
                 "title": raw.get("title") or (raw.get("content") or "")[:30],
-                # 封面取动态的第一张图片；没有图片时留空，由前端统一兜底为默认封面
                 "image": _first_image_url(raw.get("mediaList")),
-                # Java 侧 Long 统一序列化为字符串，相关度计算要用数值，先归一化
                 "likeCount": _as_number(raw.get("likeCount")),
                 "category": raw.get("category") or "",
             }
+        # 内部字段：参与打分但不对外输出（见 _to_item）。
         cand["_targeted"] = targeted
-        # 详情文本只参与相关度判定，不展示：商品没有物种字段，标题没写到的物种只能从详情认
         cand["_desc"] = (raw.get("description") or "") if kind == "product" else (raw.get("content") or "")
         candidates.append(cand)
 
@@ -332,7 +474,7 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
             for raw in res:
                 _add("space", raw, targeted)
 
-    # 别家物种专属的候选直接出局，再按相关度降序截断送进重排层
+    # 先做硬过滤再打分：被排除的候选不必参与排序，也避免它们占满候选池名额。
     candidates = [c for c in candidates if not _is_off_species(c, own_groups)]
     for cand in candidates:
         cand["_score"] = _relevance(cand, own_groups)
@@ -346,7 +488,17 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
 
 
 async def rerank(state: RecommendState) -> Dict[str, Any]:
-    """LLM 重排 + 推荐理由；mock / 失败时按相关度启发式排序"""
+    """重排节点：LLM 精选并写推荐理由，失败则启发式排序。
+
+    Args:
+        state: 图状态。
+
+    Returns:
+        ``{"items": [...], "summary": str}``。
+
+    Raises:
+        无——模型异常已内部降级。
+    """
     candidates = state.get("candidates") or []
     if not candidates:
         return {"items": [], "summary": "暂时没有可推荐的内容，先去逛逛圈子和商城吧～"}
@@ -357,6 +509,7 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
     profile = state.get("profile") or {}
     own_words = state.get("own_words") or []
     profile_text = _profile_digest(profile)
+    # 只给模型 id / 标题 / 分类：给全量字段既浪费上下文，也容易诱导模型复述商品详情。
     cand_text = "\n".join(
         f"- [{c['type']}] id={c['id']} 标题：{c['title']} 分类：{c.get('category','')}"
         for c in candidates)
@@ -385,12 +538,36 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
 
 
 def _cache_key(user_id: int, scene: str) -> str:
-    """推荐缓存键：带版本命名空间，逻辑升级后自动切换到新键空间"""
+    """拼缓存键。
+
+    Args:
+        user_id: 用户 ID。
+        scene: 场景（home / shop）。
+
+    Returns:
+        形如 ``ai:recommend:v3:home:42`` 的键。
+
+    Raises:
+        无。
+    """
     return f"ai:recommend:{_CACHE_VERSION}:{scene}:{user_id}"
 
 
 async def persist_cache(state: RecommendState) -> Dict[str, Any]:
-    """写入推荐 Redis 缓存（按用户 + 场景；不写 PostgreSQL 温层）"""
+    """缓存落盘节点：只缓存非空结果。
+
+    空结果不缓存是刻意的：业务数据短暂故障导致的空推荐若被缓存 5 分钟，
+    用户刷新也看不到内容，体感上就是「推荐坏了」。
+
+    Args:
+        state: 图状态。
+
+    Returns:
+        空字典（该节点不修改状态）。
+
+    Raises:
+        无。
+    """
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
     if state.get("items"):
@@ -402,10 +579,21 @@ async def persist_cache(state: RecommendState) -> Dict[str, Any]:
 
 
 def _profile_digest(profile: Dict[str, Any]) -> str:
-    """把画像压缩为 LLM 可读的简短文本"""
+    """把画像压缩成给模型看的简短摘要。
+
+    Args:
+        profile: 画像字典。
+
+    Returns:
+        多行摘要文本；数据不足时返回一句兜底说明（提示模型只能按热门推荐）。
+
+    Raises:
+        无。
+    """
     lines = []
     pets = profile.get("pets") or []
     if pets:
+        # 物种去重后单独一行：这是判断「该不该推某类内容」的核心依据。
         species = list(dict.fromkeys((p.get("species") or "").strip() for p in pets if p.get("species")))
         if species:
             lines.append("饲养物种：" + "、".join(species))
@@ -431,21 +619,47 @@ def _profile_digest(profile: Dict[str, Any]) -> str:
     posts = profile.get("my_posts") or []
     if posts:
         lines.append("发布动态：" + "、".join((p.get("title") or "")[:15] for p in posts[:3] if p.get("title")))
+    # 每段都做了条数截断与字数裁剪：画像要的是「信号」，不是完整数据。
     return "\n".join(lines) or "（暂无足够画像数据，请推荐热门内容）"
 
 
 def _identity(cand_type: str, raw_id: Any) -> Tuple[str, str]:
-    """推荐项去重键：Java 侧雪花 ID 序列化为字符串，LLM 回传的 id 是数字，
-    统一归一化成字符串再比较，否则同一项会被当成两条重复下发"""
+    """生成候选的唯一标识。
+
+    统一转字符串是必要的：模型返回的 id 可能被写成 ``"42"``，而候选里是 ``42``，
+    不归一化会导致匹配失败、模型挑中的内容被整体丢弃。
+
+    Args:
+        cand_type: ``product`` / ``space``。
+        raw_id: 原始 id。
+
+    Returns:
+        ``(类型, id 字符串)``。
+
+    Raises:
+        无。
+    """
     return cand_type, str(raw_id)
 
 
 def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[str],
                  own_words: List[str]) -> List[Dict[str, Any]]:
-    """把 LLM 输出与候选详情合并（过滤不存在的 id 与越出门槛的物种），保序
+    """把模型选择与候选池合并成最终列表。
 
-    模型为「宁缺毋滥」少选时，用同样过了物种门槛、按相关度排好的剩余候选补齐，
-    避免首页出现没必要的空位。
+    两段式：先采纳模型的选择（校验 id 存在、不重复、物种合规），再用启发式顺序补足到
+    ``_TOP_N``——模型经常只给出 3~5 条，补齐能保证首页不会显得空。
+
+    Args:
+        model_items: 模型输出的 ``RecommendItem`` 列表。
+        candidates: 候选池（已按相关度降序）。
+        own_groups: 用户饲养的物种组。
+        own_words: 用户填写的物种原词。
+
+    Returns:
+        最多 ``_TOP_N`` 条的对外结构列表。
+
+    Raises:
+        无。
     """
     index = {_identity(c["type"], c["id"]): c for c in candidates if c.get("id") is not None}
     merged = []
@@ -453,6 +667,7 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
     for mi in model_items:
         key = _identity(mi.type, mi.id)
         cand = index.get(key)
+        # 三种情况一律丢弃：id 不存在（模型编造）、重复、物种不合规（模型没遵守硬约束）。
         if cand is None or key in picked or _is_off_species(cand, own_groups):
             continue
         picked.add(key)
@@ -464,13 +679,24 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
         if key in picked or _is_off_species(cand, own_groups):
             continue
         picked.add(key)
+        # 用启发式分数换算成 0.1~1.0 的对外 score（除以 6 是把 ±分数压到合理区间）。
         merged.append(_to_item(cand, _item_reason(cand, own_groups, own_words),
                                round(max(0.1, min(1.0, 0.5 + cand.get("_score", 0) / 6)), 2)))
     return merged[:_TOP_N]
 
 
 def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
-    """启发式排序（mock / 降级）：按召回阶段的相关度次序取数，理由点出命中的物种"""
+    """纯规则排序（mock 模式与模型失败时的兜底）。
+
+    Args:
+        state: 图状态。
+
+    Returns:
+        ``{"items": [...], "summary": str}``。
+
+    Raises:
+        无。
+    """
     scene = state.get("scene", "home")
     own_groups = set(state.get("own_groups") or [])
     own_words = state.get("own_words") or []
@@ -481,6 +707,7 @@ def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
     if scene == "shop":
         chosen = products[:_TOP_N]
     else:
+        # 首页先给动态留固定名额，再补商品；动态太少时用剩余商品填满。
         picked_spaces = spaces[:_HOME_SPACE_MAX]
         chosen = products[:_TOP_N - len(picked_spaces)] + picked_spaces
         if len(chosen) < _TOP_N:
@@ -501,7 +728,14 @@ _graph = None
 
 
 def get_recommend_graph():
-    """构建并缓存推荐图"""
+    """取得（首次调用时编译）推荐图。
+
+    Returns:
+        已编译的图（无 checkpointer / store：推荐是单轮无状态流程）。
+
+    Raises:
+        无。
+    """
     global _graph
     if _graph is not None:
         return _graph
@@ -520,20 +754,29 @@ def get_recommend_graph():
 
 
 async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -> Dict[str, Any]:
-    """生成个性化推荐（优先读 Redis，未命中直接重新查询业务数据）
+    """生成个性化推荐流。
 
-    Redis 只保留五分钟热缓存，不回落 PostgreSQL 温层；缓存未命中时进入单飞：
-    同一用户同一场景的并发请求只放行一次真实计算（五路画像拉取 + 召回 + LLM 重排），
-    其余请求等锁后直接取结果。
+    Args:
+        user_id: 用户 ID。
+        scene: 场景，``home`` 或 ``shop``。
+        use_cache: 是否使用缓存；False 表示强制重算（但仍会回填缓存）。
+
+    Returns:
+        ``{"items": [...], "summary": str}``。
+
+    Raises:
+        Exception: 图执行异常向上抛，由路由层转成统一错误报文。
     """
     cache_key = _cache_key(user_id, scene)
     if use_cache:
         cached = await cache.get_hot(cache_key)
         if cached is not None:
             return cached
+    # 单飞：并发未命中时只让一个请求真正回源，其余等锁后直接读缓存，
+    # 避免同一用户连点刷新把下游业务服务和 LLM 打满。
     async with cache.single_flight(cache_key):
-        # 等锁期间可能已由其他请求计算并写入缓存
         if use_cache:
+            # 拿到锁后必须复查：等锁期间前一个请求可能已经把结果写进缓存。
             cached = await cache.get_hot(cache_key)
             if cached is not None:
                 return cached

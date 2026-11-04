@@ -1,10 +1,20 @@
-"""商城 AI 能力路由（APIRouter prefix="/ai"）
+"""商品评论摘要接口。
 
-接口：
-  1. POST /ai/shop/review/summary   商品评论 AI 摘要（结果缓存）
+职责：暴露 ``POST /ai/shop/review/summary``，把「按商品 ID 生成口碑摘要」的能力提供给
+商城页面。业务逻辑（拉评论、LLM 摘要、缓存）在 ``app.graph.review_graph``，本文件只做协议。
 
-鉴权：依赖网关注入的 X-User-Id；评论摘要本身是公开数据，但仍要求登录调用。
+主要导出：
+    - ``router``            FastAPI 路由（前缀 ``/ai``）
+    - ``ReviewSummaryRequest`` 请求体模型
+
+外部依赖：``app.graph.review_graph.summarize_product``、``app.schemas``。
+
+使用示例：
+    POST /ai/shop/review/summary
+    Body: {"productId": 128}
+    → {"code":200,"data":{"sentiment":"positive","one_line":"...","count":32,...}}
 """
+
 import logging
 from typing import Optional
 
@@ -21,7 +31,7 @@ router = APIRouter(prefix="/ai")
 
 
 class ReviewSummaryRequest(BaseModel):
-    """评论摘要请求体"""
+    """评论摘要请求体。"""
 
     productId: int = Field(..., description="商品 ID")
 
@@ -31,10 +41,19 @@ async def review_summary(
     req: ReviewSummaryRequest,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """生成商品评论 AI 摘要
+    """生成指定商品的口碑摘要。
 
-    返回 data：{sentiment, one_line, pros, cons, keywords, count}。
-    无评论时返回中性空态；结果按商品缓存（TTL 可配，默认 6 小时）。
+    评论本身是公开数据，但仍要求登录：摘要调用会产生 LLM 成本，需要可追溯的调用者。
+
+    Args:
+        req: 请求体（含 ``productId``）。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(ReviewSummary)``；未登录返回 401，内部异常返回 500 通用提示。
+
+    Raises:
+        无——异常统一转成业务报文，前端不会收到裸 5xx。
     """
     if not x_user_id:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))

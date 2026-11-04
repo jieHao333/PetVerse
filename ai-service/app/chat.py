@@ -1,27 +1,28 @@
-"""对话路由（APIRouter prefix="/ai"）
+"""对话路由层：SSE 流式对话与会话管理。
 
-网关 StripPrefix=1：前端请求 /api/ai/chat/stream，本服务实际收到 /ai/chat/stream。
+职责：承载 ``/ai/chat/**`` 接口——流式对话（SSE）、附件上传、历史 / 会话 / 长期记忆的查询与删除。
+本层只做「协议 + 并发 + 落库」，业务决策（意图、检索、生成）全部交给 ``app.graph.chat_graph``。
 
-会话模型：对话按「用户 + 宠物 + 会话」三级隔离——
-一只宠物可拥有多个会话；切换宠物 / 新建对话均进入待创建态，会话在用户发出首条消息时才落库
-（避免频繁切换堆积空会话），历史会话可手动选择恢复；会话支持删除。
-前端侧栏直接展示该用户与所有宠物的全部历史会话（每条带归属宠物 petId），无需先选宠物。
+主要导出：
+    - ``router``  FastAPI 路由（前缀 ``/ai``）
 
-接口一览：
-  1. POST   /ai/chat/stream             SSE 流式对话（sessionId 缺省时自动建会话，首帧 meta 回传；
-                                        支持多模态附件：图片走视觉模型、音频可转写、视频文字占位）
-  2. GET    /ai/chat/history            查询指定会话的对话历史（时间正序：旧 → 新）
-  3. GET    /ai/chat/sessions           查询用户的全部会话（跨宠物统一展示，最近活跃在前）
-  4. DELETE /ai/chat/sessions/{sid}     删除会话（连带消息与 checkpoint 记忆）
-  5. POST   /ai/chat/upload             上传多模态附件（图片/音频/视频）直传 OSS，返回附件信息
+外部依赖：``app.graph.chat_graph``（编排图）、``app.persistence``（历史）、
+``app.checkpoint``（对话记忆）、``app.limits``（并发闸）、``app.media`` / ``app.oss``（附件）、
+``app.longterm`` / ``app.memstore``（长期记忆）。
 
-存储分层（PostgreSQL 库 petverse_ai，业务数据同库）：
-  - LangGraph checkpoint（checkpoint.py）：LLM 上下文记忆——图状态 messages 按
-    thread（用户 + 会话）自动持久化，跨轮恢复；用户中止生成时把用户问题与
-    已产出的部分回复补写回图状态，被暂停的轮次同样进入后续对话的记忆；
-  - chat_session / chat_message（persistence.py）：会话与消息持久层，前端历史
-    展示 / 会话管理从这里读，与 checkpoint 同库不同表。
+SSE 事件协议（前端按序消费）：
+    meta  → 首帧，回传 sessionId（前端据此把「新会话」变为可回访会话）
+    refs  → 有知识命中时，在答案首字之前推送引用来源
+    delta → 增量文本，可出现多次
+    done  → 正常结束
+    error → 异常结束，msg 为可直接展示的中文提示
+
+使用示例：
+    POST /ai/chat/stream
+    Header: X-User-Id: 42
+    Body: {"message": "猫咪打疫苗要注意什么", "pet": {"id": 7, "species": "猫"}}
 """
+
 import asyncio
 import json
 import logging
@@ -49,39 +50,56 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ai")
 
-# 全局并发闸：同一时刻最多 20 路流式对话
+# 全局并发闸：LLM 调用是长耗时外部依赖，不设上限时一次流量高峰会把连接池与内存打满。
 _semaphore = asyncio.Semaphore(20)
-# 获取并发闸的超时（秒）：超时视为过载，向前端发 error 事件
+# 等全局闸的最长时间：宁可快速告诉用户「稍后再试」，也不要让请求挂在队列里等到超时。
 _SEMAPHORE_TIMEOUT = 3.0
-# 单用户并发上限：防止个别用户刷脚本占满全局 20 路并发，挤占其他用户；
-# 额度计数由 app/limits.py 维护，多实例部署时经 Redis 共享
+# 单用户并发上限：防止单账号（或脚本）把全局名额占满。
 _USER_MAX_CONCURRENT = 2
-# SSE 心跳间隔（秒）：超过该时间没有 token 产出就发一行注释 ping，防止代理断连
+# SSE 心跳间隔：网关 / 代理的 idle 超时通常在 30~60s，15s 一次 ping 可稳定保活。
 _HEARTBEAT_INTERVAL = 15.0
-# 单条用户消息长度上限（字符）：超长消息会稀释上下文、烧 token，直接拒绝
 _MAX_MESSAGE_LEN = 2000
-# 归还并发额度的最长等待（秒）：超过即放弃等待，额度由计数 TTL 回收
+# 归还并发名额的最长等待：收尾阶段不能被 Redis 抖动拖住，失败就靠 TTL 自动回收。
 _SLOT_RELEASE_TIMEOUT = 2.0
-# 流式生成的最大尝试次数：首帧前失败（LLM 网络抖动 / 服务端瞬时故障）自动静默重试一轮
+# 流式生成的最大尝试次数：仅首帧前失败才重试，避免已输出内容后重复。
 _STREAM_ATTEMPTS = 2
-# 对外统一兑底话术
 _ERROR_MSG = "AI 服务暂时开小差了，请稍后再试"
 _USER_BUSY_MSG = "您有正在生成的咨询回复，请等它结束后再发送"
 
-# 后台长期记忆抽取任务集合（持引用防 GC；done 回调自动移除）
+# 持有后台记忆抽取任务的强引用：asyncio 只保留弱引用，不留引用可能在任务完成前被 GC 回收。
 _bg_memory_tasks: set = set()
 
 
 def _sse(data: dict) -> str:
-    """构造一条 SSE 事件（data: JSON + 空行结尾）"""
+    """把字典编码为一帧 SSE 数据。
+
+    Args:
+        data: 事件体（须含 ``type``）。
+
+    Returns:
+        形如 ``data: {...}\\n\\n`` 的帧文本；``ensure_ascii=False`` 保证中文不被转义成
+        ``\\uXXXX``（体积约为 1/3，且便于抓包排查）。
+
+    Raises:
+        无。
+    """
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _ref_items(knowledge: list) -> list:
-    """把检索结果转成前端「参考来源」载荷
+    """把检索结果转成前端引用面板所需的结构。
 
-    只去掉 content（完整片段用于注入 Prompt，可达数百字）换成 snippet 摘要，
-    其余字段（文档名、类型、小节、分类、相关度、命中方式）都是展示所需。
+    同时做两件事：snake_case → camelCase（前端约定）与字段裁剪（只给展示需要的字段）。
+
+    Args:
+        knowledge: ``chat_graph.retrieve_knowledge`` 产出的片段列表。
+
+    Returns:
+        引用项列表，每项含 rank / docId / source / docTitle / kind / section / category /
+        score / matchedBy / snippet。
+
+    Raises:
+        无。
     """
     items = []
     for item in knowledge or []:
@@ -89,8 +107,10 @@ def _ref_items(knowledge: list) -> list:
             "rank": item.get("rank"),
             "docId": item.get("doc_id"),
             "source": item.get("source"),
+            # 文档名缺失时依次回落到来源文件名与「知识库」，避免前端出现空标题。
             "docTitle": item.get("doc_title") or item.get("source") or "知识库",
             "kind": item.get("kind") or "md",
+            # 小节路径形如「文档 > 章 > 节」，面板只展示最末一级。
             "section": (item.get("section") or "").split(" > ")[-1],
             "category": item.get("category") or "",
             "score": item.get("score") or 0,
@@ -102,19 +122,40 @@ def _ref_items(knowledge: list) -> list:
 
 def _spawn_memory_extraction(user_id: int, pet_id: int, pet_name: str,
                              user_msg: str, reply: str) -> None:
-    """每轮正常结束后后台抽取长期记忆（不阻塞 SSE done / 不拖慢响应）
+    """以「发射后不管」的方式触发长期记忆抽取。
 
-    条件由调用方保证（真实模式 + reply 非空 + 长期记忆可用）；任务持引用防 GC，
-    done 回调从集合移除避免无限膨胀；任务内部已全部静默降级，此处无需接异常。
+    Args:
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        pet_name: 宠物名。
+        user_msg: 本轮用户消息。
+        reply: 本轮助手回复。
+
+    Returns:
+        None。
+
+    Raises:
+        无（任务内部自行吞异常）。
     """
     task = asyncio.create_task(
         longterm.extract_and_apply(user_id, pet_id, pet_name, user_msg, reply))
     _bg_memory_tasks.add(task)
+    # 完成后自动从集合移除，否则集合会随对话量无限增长。
     task.add_done_callback(_bg_memory_tasks.discard)
 
 
 def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
-    """解析网关注入的 X-User-Id 请求头；缺失或非法时返回 None"""
+    """解析网关注入的用户标识。
+
+    Args:
+        x_user_id: 请求头 ``X-User-Id`` 的原始值。
+
+    Returns:
+        正整数用户 ID；缺失、非法或非正数时返回 None（调用方统一返回「未登录」）。
+
+    Raises:
+        无。
+    """
     if not x_user_id:
         return None
     try:
@@ -125,11 +166,20 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
 
 
 async def _prepare_attachments(attachments: list, user_id: int) -> list:
-    """附件预处理：真实模式下转写音频（转写文本回填 transcript 字段）
+    """补全附件信息（当前只做音频转写）。
 
-    音频字节按对象 key 从 OSS 读取（仅本人命名空间，见 media.read_attachment_bytes）；
-    转写失败 / 未配置 ASR 时静默降级（transcript 保持 None，后续以文字占位提示模型），
-    绝不阻断对话主流程；mock 模式跳过转写（无外部服务可调）。
+    必须在进入编排图之前完成：音频对纯文本模型完全不可见，只有先转成文字，
+    用户「发语音提问」才能被正常回答。
+
+    Args:
+        attachments: 附件字典列表（原地修改）。
+        user_id: 用户 ID，用于越权校验。
+
+    Returns:
+        同一个列表（已回填 ``transcript``）。
+
+    Raises:
+        无——转写失败时保持无 transcript，由提示词引导用户补充文字。
     """
     if settings.is_mock or not attachments:
         return attachments
@@ -143,14 +193,21 @@ async def _prepare_attachments(attachments: list, user_id: int) -> list:
 
 
 def _attachment_enriched_text(text: str, attachments: list) -> str:
-    """构造进入 LLM / checkpoint 记忆的用户消息文本
+    """把用户文字与附件说明拼成「给模型看的输入」。
 
-    原文字 + 附件摘要（含音频转写）+ 给模型的降级提示（无法看图 / 无法看视频 /
-    音频未转写时引导用户文字补充）。持久化的 content 只存原文字（前端单独渲染
-    附件），两者刻意分离：历史回放气泡不会出现与渲染的附件重复的占位文本。
+    Args:
+        text: 用户原始文字（可为空）。
+        attachments: 附件列表。
+
+    Returns:
+        拼接后的文本；无附件时原样返回用户文字。
+
+    Raises:
+        无。
     """
     parts = [text] if text else []
     if attachments:
+        # 先给「发了几样东西」的概况，再给「哪些内容你看不到」的补充说明。
         summary = media.attachment_summary(attachments)
         if summary:
             parts.append(f"（{summary}）")
@@ -162,17 +219,24 @@ def _attachment_enriched_text(text: str, attachments: list) -> str:
 
 
 async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int], Optional[JSONResponse]]:
-    """解析本轮对话使用的会话 ID
+    """确定本轮使用的会话 ID（已有则校验归属，没有则新建）。
 
-    返回 (session_id, None) 表示解析成功；(None, response) 表示失败，直接返回业务错误：
-    - 请求带 sessionId：校验会话存在且属于当前用户（防止跨用户 / 跨宠物串会话）；
-    - 请求不带 sessionId：按 pet.id 自动新建会话（切换宠物后首次发消息即落入新会话）；
-    - 会话创建 / 校验依赖 PostgreSQL，故障时返回「稍后再试」错误。
+    Args:
+        user_id: 用户 ID。
+        req: 对话请求（``sessionId`` 可缺省）。
+
+    Returns:
+        ``(session_id, error_response)``：成功时第二项为 None；失败时第一项为 None，
+        第二项是可直接返回给客户端的报文。
+
+    Raises:
+        无——数据库异常被捕获并转成 500 报文。
     """
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
     pet_id = pet.id if pet.id is not None else 0
     try:
         if req.sessionId is not None:
+            # 用 user_id 一起查：既拿到会话，又顺手完成归属校验（他人会话查不到）。
             session = await persistence.get_session(user_id, req.sessionId)
             if session is None:
                 return None, JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
@@ -185,71 +249,87 @@ async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int
 
 
 async def _pump(stream, queue: asyncio.Queue) -> None:
-    """生产者协程：把流里的内容搬进队列，统一补上结束与异常信号
+    """把异步流「泵」进队列，并统一成 ``(kind, payload)`` 二元组。
 
-    流元素允许两种形态：纯字符串（mock 打字机流，视为助手片段）或
-    (kind, payload) 元组（图流，含 delta 与 refs）。这样让队列消费端只处理一种协议。
+    引入队列是为了让消费端可以用 ``wait_for`` 加超时——直接在 ``async for`` 上等待无法
+    插入心跳，也无法在超时后继续等待同一路流。
 
-    这样做是为了让消费端（SSE 生成器）能对"等待下一个片段"做超时心跳，
-    而不必直接对 async generator 使用 wait_for（超时取消会破坏生成器状态）。
+    Args:
+        stream: 异步迭代器，产出字符串（增量文本）或 ``(kind, payload)`` 元组。
+        queue: 目标队列。
+
+    Returns:
+        None。
+
+    Raises:
+        无——异常被包装成 ``("error", exc)`` 放入队列，由消费端决定是否重试。
     """
     try:
         async for event in stream:
+            # 字符串统一视为增量文本；元组（如 refs）原样透传。
             await queue.put(("delta", event) if isinstance(event, str) else event)
         await queue.put(("end", None))
-    except Exception as exc:  # 生产过程中的任何异常都转成队列信号，统一兜底
+    except Exception as exc:
         await queue.put(("error", exc))
 
 
 async def _graph_stream(state: dict, config: dict):
-    """把 LangGraph 的消息流归一化为「检索来源 + 助手文本片段」事件流
+    """执行编排图并产出「对前端有意义的事件」。
 
-    以 stream_mode=["updates", "messages"] 同时拿到两类信息：
-      - updates：各节点的产出，这里只取 retrieve_knowledge 的 knowledge（RAG 引用来源），
-        在答案首字之前就能推给前端，用户不必等整段回答结束才知道依据是什么；
-      - messages：各节点的 LLM 调用消息流（意图识别、工具 Agent、最终生成），
-        这里只取 generate 节点的助手文本增量（按 metadata.langgraph_node 过滤），
-        避免把中间产物透传给前端。
-    config 携带 thread_id：图状态在每个超级步后由 checkpoint 自动持久化。
+    Args:
+        state: 初始图状态。
+        config: LangGraph 运行配置（含 thread_id）。
+
+    Yields:
+        ``("refs", [...])`` 或 ``("delta", str)``。
+
+    Raises:
+        Exception: 图执行失败时透传，由 ``_pump`` 转成 error 事件。
     """
     graph = get_chat_graph()
+    # 同时订阅两种流：updates 用于拿节点产出（引用来源），messages 用于拿 token 增量。
     async for mode, payload in graph.astream(
             state, config=config, stream_mode=["updates", "messages"]):
         if mode == "updates":
-            if not isinstance(payload, dict):        # 非节点产出（如 checkpoints 等保留键）跳过
+            if not isinstance(payload, dict):
                 continue
+            # 只为检索节点产出 refs：其它节点的更新与前端无关。
             update = payload.get("retrieve_knowledge")
             if isinstance(update, dict):
                 yield "refs", update.get("knowledge") or []
             continue
 
-        # messages 模式：payload 是 (消息分片, 元数据)
         chunk, chunk_meta = payload
+        # messages 流会带出图里所有 LLM 调用的 token（意图分类、查询改写、工具代理），
+        # 只有 generate 节点的输出才是给用户看的答案。
         if chunk_meta and chunk_meta.get("langgraph_node") != "generate":
             continue
-        # 只取流式分片：messages 模式在 LLM 结束时还会补投一条聚合完整消息，
-        # 不过滤掉会让整段回答被重复输出一次（前端表现为回复内容成双倍长度）
         if not isinstance(chunk, AIMessageChunk):
             continue
-        # .text 为 LangChain 内置的文本提取：字符串内容原样返回，多模态分块只取 text 分片
         text = chunk.text
         if text:
             yield "delta", text
 
 
 def _history_messages(history: list) -> List[AnyMessage]:
-    """把历史消息（role/content）转成 LangChain 消息（存量会话首次接入 checkpoint 时回填用）
+    """把数据库历史转成 LangChain 消息，用于「无 checkpoint 时」回填上下文。
 
-    历史记录来自 chat_message 表的 role/content 列（对外 HTTP 报文结构，保持不变），
-    进入图状态前统一转成 HumanMessage / AIMessage。
-    id 取「回填-序号-时间戳」的确定性值：若同一轮重复触发回填，
-    add_messages 按 id 覆盖而非追加，不会产生重复消息。
+    Args:
+        history: ``persistence.read_history`` 的结果（时间正序）。
+
+    Returns:
+        HumanMessage / AIMessage 列表；空内容的消息会被跳过。
+
+    Raises:
+        无。
     """
     messages: List[AnyMessage] = []
     for idx, item in enumerate(history):
         content = item.get("content")
         if not content:
             continue
+        # 显式给每条消息一个稳定 id：LangGraph 的 add_messages 依据 id 去重，
+        # 没有 id 时同内容消息可能被误判为重复而丢弃。
         msg_id = f"bf-{idx}-{item.get('ts', 0)}"
         if item.get("role") == "user":
             messages.append(HumanMessage(content=content, id=msg_id))
@@ -263,18 +343,36 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
                                human_msg: HumanMessage, partial: str,
                                attachments: Optional[list] = None,
                                refs: Optional[list] = None) -> None:
-    """用户中止生成后的记忆补写（在 asyncio.shield 保护下调用）
+    """收尾保存「被中止的一轮」。
 
-    1) checkpoint：把用户问题（与输入同 id，去重）与已产出的部分回复补写回图状态，
-       部分回复标记 interrupted；as_node="generate" 表示这些更新来自最终生成节点，
-       图状态就此收尾（next 为空），下一轮对话从 START 重新展开，不会重放未完成节点；
-    2) PostgreSQL：兜底保存本轮（供前端历史回放，含多模态附件），会话已删除时原子跳过。
+    两处都要写：checkpoint 让被中止的轮次进入后续对话的长期记忆（否则「暂停即失忆」），
+    PostgreSQL 让前端历史能回放出半截回复。
+
+    Args:
+        graph: 对话图实例（``aupdate_state`` 需要）。
+        config: 该会话的运行配置。
+        user_id: 用户 ID。
+        pet_id: 宠物 ID。
+        session_id: 会话 ID。
+        user_msg: 落库用的用户消息文本（附件消息会退化为摘要文案）。
+        human_msg: 送入图的消息对象（含 id 与附件描述）。
+        partial: 已产出的部分回复（可能为空串）。
+        attachments: 用户消息附件。
+        refs: 已推送的引用来源。
+
+    Returns:
+        None。
+
+    Raises:
+        无——两处写入各自独立降级，任一失败都不影响另一处。
     """
     messages: List[AnyMessage] = [human_msg]
     if partial:
         messages.append(AIMessage(content=partial, additional_kwargs={"interrupted": True}))
     if checkpoint.available():
         try:
+            # as_node="generate"：声明这批消息是 generate 节点的产出，
+            # 图状态里的 messages 才会被正确归位（否则会被当作未知来源的更新）。
             await graph.aupdate_state(config, {"messages": messages}, as_node="generate")
         except Exception:
             logger.warning("中断记忆补写 checkpoint 失败(忽略): user_id=%s session_id=%s",
@@ -284,7 +382,22 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
 
 
 async def _append_mock_reply(graph, config: dict, reply: str) -> None:
-    """mock 模式的回复由路由层打字机流产出（不在图内），补写进图状态保持跨轮记忆一致"""
+    """把 mock 回复补写进图状态。
+
+    mock 模式下 ``generate`` 节点直接返回空串（不调用模型），若不补写，
+    checkpoint 里就只有用户消息、没有助手消息，多轮「对话」会看起来像自问自答。
+
+    Args:
+        graph: 对话图实例。
+        config: 运行配置。
+        reply: 已输出的模拟回复。
+
+    Returns:
+        None。
+
+    Raises:
+        无。
+    """
     if not checkpoint.available():
         return
     try:
@@ -296,83 +409,90 @@ async def _append_mock_reply(graph, config: dict, reply: str) -> None:
 
 
 async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet_id: int):
-    """SSE 流式对话生成器（核心逻辑，由 LangGraph 编排驱动）
+    """SSE 流式对话的核心生成器。
 
-    对话记忆由 LangGraph 官方 checkpoint（PostgreSQL）承载：
-    - 正常结束：generate 节点把助手回复写回图状态 messages，随 checkpoint 自动持久化；
-    - 用户中止：取消路径把用户问题与已产出的部分回复补写回图状态（_persist_interrupted），
-      下一轮对话从 checkpoint 恢复时即可看到这段记忆，不再出现「暂停后失忆」。
+    整体结构：抢全局闸 → 抢用户闸 → 组装输入 → 执行图 / 模拟流 → 落库 → 释放名额。
+    所有退出路径（正常、异常、客户端断开）都必须走到 ``finally`` 归还名额，
+    否则并发闸会被逐步耗尽。
+
+    Args:
+        req: 对话请求。
+        user_id: 用户 ID。
+        session_id: 会话 ID（已解析）。
+        pet_id: 宠物 ID。
+
+    Yields:
+        str: 编码好的 SSE 帧。
+
+    Raises:
+        asyncio.CancelledError: 客户端断开 / 任务被取消时向上抛出，属正常收尾路径。
+        GeneratorExit: 生成器被关闭时向上抛出，同样走补写落库的收尾分支。
     """
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
 
-    # 1. 并发闸：超时拿不到信号量说明服务过载
     try:
         await asyncio.wait_for(_semaphore.acquire(), timeout=_SEMAPHORE_TIMEOUT)
     except asyncio.TimeoutError:
+        # 没拿到信号量就直接返回，不进入下方那个带 finally 的 try 块——
+        # 否则会 release 一个从未 acquire 的名额，把并发上限越放越宽。
         yield _sse({"type": "error", "msg": _ERROR_MSG})
         return
 
-    collected = []          # 已累计的回复片段
-    last_refs = []          # 本轮 RAG 检索到的引用来源（落库供历史回放）
-    appended = False        # 本轮是否已收尾写入（防止取消分支重复补写）
+    collected = []
+    last_refs = []
+    appended = False
     producer: Optional[asyncio.Task] = None
-    user_slot: Optional[bool] = None  # 已占用的并发额度是否走 Redis 计数；None 表示未占用
-    graph = None            # 在首个 await 前完成赋值，保证取消分支可安全引用
+    user_slot: Optional[bool] = None
+    graph = None
     config: Optional[dict] = None
     human_msg: Optional[HumanMessage] = None
     try:
-        # 1.5 单用户并发登记：额度计数走 Redis（多实例共享），拿不到则拒绝本轮
         acquired, via_redis = await limits.try_acquire(user_id, _USER_MAX_CONCURRENT)
         if not acquired:
             yield _sse({"type": "error", "msg": _USER_BUSY_MSG})
-            return   # finally 负责释放信号量与用户额度
+            return
         user_slot = via_redis
     
-        # 2. 构造本轮对话的图引用 / 线程配置 / 输入消息（全部同步，先于任何 await 完成）：
-        #    首帧 meta 一旦发出，用户随时可能点停止，
-        #    取消分支必须能安全引用这三个对象来补写记忆。
         graph = get_chat_graph()
         config = checkpoint.thread_config(user_id, session_id)
         text = (req.message or "").strip()
         attachments = [a.model_dump() for a in (req.attachments or [])]
-        # 进入 LLM / checkpoint 的用户文本（含附件摘要与降级提示；音频转写后再增强）
         enriched = _attachment_enriched_text(text, attachments)
+        # 纯附件消息也要有内容，否则空 HumanMessage 会让模型无从下手。
         human_msg = HumanMessage(content=enriched or "（附件咨询）", id=uuid4().hex)
-        # 持久化的用户消息文本：只存原文字（纯附件时用摘要做会话标题兜底）
+        # 落库文本与模型输入分开：历史里展示「图片×2」比展示整段附件说明更清爽。
         persist_msg = text or (media.attachment_summary(attachments) or "附件咨询")
 
-        # 3. 首帧回传会话元信息：前端据此绑定 sessionId（自动新建会话场景）并刷新会话列表
         yield _sse({"type": "meta", "sessionId": session_id})
 
-        # 3.5 多模态附件预处理（音频转写，耗时网络调用）：完成后重算增强文本。
-        #    此处被取消时取消分支用转写前的 human_msg / persist_msg 兜底补写，不丢本轮提问
         if attachments:
+            # 转写要等 OSS 下载 + ASR 调用，放在 meta 帧之后：让前端先拿到 sessionId，
+            # 体感上「已经开始响应」而不是干等。
             attachments = await _prepare_attachments(attachments, user_id)
             enriched = _attachment_enriched_text(text, attachments)
             if enriched:
+                # 沿用原消息 id，保证同一条消息在状态里不被视作两条。
                 human_msg = HumanMessage(content=enriched, id=human_msg.id)
 
-        # 4. 构造本轮输入：历史记忆由 checkpoint 按 thread（用户 + 会话）恢复；
-        #    中断过的轮次也已补写进图状态，因此「用户暂停后 AI 没记忆」不再发生。
-        #    兼容升级：存量会话在 checkpoint 中还没有记录（此前记忆在 Redis），
-        #    首次对话时用 PostgreSQL 最近 N 条历史回填一次（回填消息 id 确定性，重复触发不叠加）。
         input_messages: List[AnyMessage] = [human_msg]
         if checkpoint.available():
             try:
                 snapshot = await graph.aget_state(config)
                 has_memory = bool(snapshot and snapshot.values.get("messages"))
             except Exception:
+                # 读不到状态时保守假设「有记忆」：宁可少回填一次历史，
+                # 也不要重复回填导致上下文里出现两份相同历史。
                 logger.warning("读取对话 checkpoint 失败(本轮不回填历史): user_id=%s session_id=%s",
                                user_id, session_id, exc_info=True)
-                has_memory = True   # 读取失败时跳过回填，避免与已有 checkpoint 产生重复
+                has_memory = True
             if not has_memory:
+                # 仅首次（checkpoint 为空，如历史会话迁库后）才从业务表回填，
+                # 否则会与 checkpoint 里已有的消息重复。
                 history = await persistence.read_history(
                     user_id, session_id, limit=settings.HISTORY_MAX_MESSAGES)
                 input_messages = _history_messages(history) + input_messages
 
-        # 5. 由 LangGraph 编排本轮对话：意图识别 → (RAG 检索 / 工具调用) → Prompt 组装 → 生成
-        #    query 为意图识别 / RAG 检索用的文本：优先原文字；纯附件时用音频转写
-        #    （转写内容是最有检索价值的文本信号；纯图片 / 视频则交由意图兜底逻辑处理）
+        # 检索查询优先用文字；纯语音提问则用转写结果拼成查询。
         query = text
         if not query:
             query = "；".join(a.get("transcript") or "" for a in attachments).strip("；")
@@ -385,8 +505,7 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         )
 
         if settings.is_mock:
-            # mock 模式：先跑一遍编排（意图/检索/工具/组装逻辑一致），再用打字机流输出内置回复；
-            # 检索结果从整图输出里取（mock 流本身不产生节点事件），照常推 refs 帧
+            # mock 模式下 generate 节点不产出内容，但要先跑一遍图以取得检索结果（refs）。
             try:
                 values = await graph.ainvoke(state, config=config)
                 mock_refs = (values or {}).get("knowledge") or []
@@ -397,17 +516,12 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                 last_refs = _ref_items(mock_refs)
                 yield _sse({"type": "refs", "items": last_refs})
 
-        # 6. 生产者-消费者消费流：消费端带 15 秒心跳超时
-        # 首帧韧性：若在产出任何内容之前流就失败（LLM 服务商网络抖动、瞬时 429 等），
-        # 自动重建流静默重试一轮，用户无感知；已产出内容后失败不重试，
-        # 避免向用户重复输出（collected 非空时直接走 error 分支）。
-        # 重试重建的 astream 携带同一 thread config：本轮 HumanMessage 以固定 id 合并进
-        # 图状态，重复投递只会按 id 覆盖，不会产生重复消息。
         queue: asyncio.Queue = asyncio.Queue()
         for attempt in range(_STREAM_ATTEMPTS):
             if settings.is_mock:
                 stream = llm.mock_stream(human_msg.content, pet.name or "")
             else:
+                # 重试时重新调用 _graph_stream（而非复用旧生成器）：旧生成器多半已处于异常状态。
                 stream = _graph_stream(state, config)
             producer = asyncio.create_task(_pump(stream, queue))
             retryable = False
@@ -415,14 +529,14 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                 try:
                     kind, payload = await asyncio.wait_for(queue.get(), timeout=_HEARTBEAT_INTERVAL)
                 except asyncio.TimeoutError:
-                    # 心跳注释行：以冒号开头，SSE 客户端会自动忽略
+                    # SSE 注释行（以冒号开头）不会被 EventSource 当作事件，纯心跳。
                     yield ": ping\n\n"
                     continue
                 if kind == "end":
                     break
                 if kind == "error":
+                    # 只在「还没输出过任何内容」时重试：已经吐字后重试会让用户看到重复答案。
                     if not collected and attempt < _STREAM_ATTEMPTS - 1:
-                        # 首帧前失败：静默重建流重试（producer 已随 error 信号自行结束）
                         logger.warning("LLM 流首帧前失败，自动重试（第 %s 次）: %r",
                                        attempt + 1, payload)
                         retryable = True
@@ -430,65 +544,52 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                     logger.warning("LLM 流生成失败: %r", payload)
                     yield _sse({"type": "error", "msg": _ERROR_MSG})
                     return
-                # 检索来源帧：在答案首字之前到达，前端据此渲染「参考来源」
                 if kind == "refs":
                     last_refs = _ref_items(payload or [])
                     yield _sse({"type": "refs", "items": last_refs})
                     continue
-                # kind == "delta"
                 collected.append(payload)
                 yield _sse({"type": "delta", "content": payload})
             if not retryable:
-                break   # 流正常结束，退出尝试循环进入收尾写入
+                break
 
-        # 7. 流正常结束：PostgreSQL 持久化（前端历史，含多模态附件）+ mock 模式补写图状态，随后发出 done
-        # checkpoint 侧：真实模式由 generate 节点写回 messages，图任务收尾时自动落库；
-        # mock 模式回复不在图内，由 _append_mock_reply 手动补写，保持两模式记忆一致。
         reply = "".join(collected)
         if settings.is_mock and reply.strip():
             await _append_mock_reply(graph, config, reply)
         await persistence.save_turn(user_id, pet_id, session_id, persist_msg, reply,
                                     attachments=attachments, refs=last_refs)
-        appended = True   # 已收尾写入：后续若被取消，取消分支不再重复补写
-        # 8. 后台抽取长期记忆：正常轮 + 完整回复才抽取（中断轮 partial 易误导），
-        #    异步执行不阻塞 done 事件，失败在任务内部静默降级
+        # 落库成功后才置位：中断路径据此判断「是否还需要补写」。
+        appended = True
         if (not settings.is_mock and reply.strip()
                 and settings.MEMORY_ENABLED and memstore.available()):
+            # 记忆抽取要再调一次 LLM，放后台避免用户等 done 帧。
             _spawn_memory_extraction(user_id, pet_id, pet.name or "",
                                      human_msg.content, reply)
         yield _sse({"type": "done"})
     except (asyncio.CancelledError, GeneratorExit):
-        # 客户端中途断开 / 用户点击「停止生成」：补写本轮记忆后安静退出。
-        #
-        # 为什么必须补写：中断发生在图任务走到 generate 落盘之前，若不补写，
-        # 这轮「用户问了什么 + 已答了多少」在后续对话中完全缺失（即此前的失忆问题）。
-        #
-        # 竞态与安全说明：
-        # 1) 取消路径中裸 await 可能被再次取消导致写入夭折，用 shield 包住保证写入落地；
-        # 2) human_msg 与输入共用同一固定 id，add_messages 按 id 覆盖去重——
-        #    即使输入轮已进过 checkpoint，也不会产生重复消息；
-        # 3) PostgreSQL 侧用 save_turn_if_exists：用户此刻已删除会话则原子跳过，不复活历史；
-        # 4) 正常路径已收尾写入（appended=True）时不再补写，避免双写。
+        # 客户端断开 / 用户点「停止生成」：先把已有的半截内容补写两处存储，再向上抛。
         try:
             if not appended and graph is not None and human_msg is not None:
                 partial = "".join(collected)
+                # shield：此时当前任务正在被取消，不 shield 的话 await 会立刻再次被中断，
+                # 收尾写入就白做了。
                 await asyncio.shield(_persist_interrupted(
                     graph, config, user_id, pet_id, session_id, persist_msg,
                     human_msg, partial, attachments=attachments, refs=last_refs))
         except BaseException:
+            # 收尾失败不能再抛，否则会盖掉原始的取消语义。
             pass
         raise
     except Exception:
-        # 其余未预期异常：发 error 事件后正常结束流，HTTP 层不 5xx
         logger.exception("对话流生成出现未预期异常")
         yield _sse({"type": "error", "msg": _ERROR_MSG})
     finally:
         if producer is not None:
-            producer.cancel()   # 生产者可能仍在跑（如消费端已退出），主动取消防泄漏
+            # 生产者可能仍在拉取 LLM 流，必须取消，否则连接会被泄漏到流自然结束。
+            producer.cancel()
         if user_slot is not None:
-            # 取消路径下用 shield 保护归还操作并限制等待时间，避免 Redis 无响应时拖住流的收尾；
-            # 归还失败或超时由额度计数的 TTL 自动回收
             try:
+                # 归还失败不该影响响应收尾，超时后由 Redis 键 TTL 兜底回收。
                 await asyncio.wait_for(
                     asyncio.shield(limits.release(user_id, user_slot)), timeout=_SLOT_RELEASE_TIMEOUT)
             except BaseException:
@@ -501,19 +602,25 @@ async def chat_stream(
     req: ChatRequest,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """SSE 流式对话（支持多模态附件）
+    """流式对话（SSE）。
 
-    - 网关注入的 X-User-Id 缺失 / 非法：HTTP 200 + {"code":401,"msg":"未登录"}
-    - 消息为空且无附件：HTTP 200 + {"code":400,"msg":"参数错误"}
-    - sessionId 非法 / 不属于当前用户：HTTP 200 + {"code":404,"msg":"会话不存在或已删除"}
-    - 正常：text/event-stream 流，meta → delta * n → done（异常时发 error 后结束）
+    参数校验在进入流之前完成：一旦返回 ``StreamingResponse``，就无法再改状态码 / 报文，
+    因此「未登录 / 空消息 / 超长 / 超附件数 / 用户忙」都必须提前拦掉。
+
+    Args:
+        req: 对话请求体。
+        x_user_id: 网关注入的用户 ID 请求头。
+
+    Returns:
+        正常情况返回 ``text/event-stream`` 流；参数或鉴权问题返回统一业务报文。
+
+    Raises:
+        无。
     """
-    # 1. 登录校验（网关统一鉴权后注入 X-User-Id）
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
 
-    # 2. 消息内容校验：文字与附件至少其一；超长文字 / 超量附件拒绝（保护上下文窗口与 token 成本）
     if not (req.message or "").strip() and not req.attachments:
         return JSONResponse(status_code=200, content=fail(400, "参数错误"))
     if len(req.message or "") > _MAX_MESSAGE_LEN:
@@ -522,26 +629,24 @@ async def chat_stream(
         return JSONResponse(status_code=200, content=fail(
             400, f"单条消息最多携带 {settings.CHAT_MAX_ATTACHMENTS} 个附件"))
     
-    # 2.5 单用户并发闸预检查：只读判断当前额度是否已满（不占用额度），
-    # 放在会话创建之前，避免超限请求白建空会话；正式占用在流生成器内完成
+    # 提前判断「忙」：省掉一次会话创建与流对象构造，也避免用户看到 meta 帧后才被拒绝。
     if await limits.is_busy(user_id, _USER_MAX_CONCURRENT):
         return JSONResponse(status_code=200, content=fail(429, _USER_BUSY_MSG))
 
-    # 3. 会话解析：校验已有会话归属，或按宠物自动新建会话
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
     pet_id = pet.id if pet.id is not None else 0
     session_id, err = await _resolve_session(user_id, req)
     if err is not None:
         return err
 
-    # 4. 返回 SSE 流式响应
     return StreamingResponse(
         _stream_generator(req, user_id, session_id, pet_id),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",        # 禁止各级缓存
-            "X-Accel-Buffering": "no",         # 禁止 Nginx 反代缓冲
-            "Connection": "keep-alive",         # 保持长连接
+            "Cache-Control": "no-cache",
+            # 关掉 Nginx 的响应缓冲：否则 SSE 会被攒够一个 buffer 才下发，流式效果消失。
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
     )
 
@@ -551,11 +656,17 @@ async def upload_chat_attachment(
     file: UploadFile = File(..., description="附件文件（图片/音频/视频）"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """上传多模态附件（直传 OSS），返回附件信息（前端原样放入 ChatRequest.attachments）
+    """上传对话附件，返回可随消息回传的附件描述。
 
-    url 为 OSS 公网地址，浏览器回放与视觉模型回源拉取共用。
-    类型与大小校验在 app/media.save_upload 内完成（MIME 主类型判定 + 扩展名兜底；
-    图片 10MB / 音频 20MB / 视频 50MB，上限可经 .env 调整）。
+    Args:
+        file: 上传文件（图片 / 音频 / 视频）。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok({type, url, key, mime, name, size})``；失败时返回对应业务错误码。
+
+    Raises:
+        无。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -563,6 +674,7 @@ async def upload_chat_attachment(
     try:
         attachment = await media.save_upload(file.filename, file.content_type, file.read, user_id)
     except media.UploadError as exc:
+        # 用户输入问题（类型 / 大小），原因可原样展示。
         return JSONResponse(status_code=200, content=fail(400, str(exc)))
     except oss.OssError as exc:
         logger.warning("附件上传失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
@@ -578,11 +690,17 @@ async def get_history(
     sessionId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询指定会话的对话历史（时间正序：旧 → 新）
+    """查询会话历史（时间正序，助手消息带引用来源）。
 
-    从 PostgreSQL 读取持久化的完整历史（服务重启也不丢）；
-    查询前校验会话归属，防止越权读取他人会话；
-    PostgreSQL 读取异常时内部已降级为 []，前端看到空历史不会报错。
+    Args:
+        sessionId: 会话 ID（必填）。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(HistoryData)``；会话不存在或不属于当前用户时返回 404 报文。
+
+    Raises:
+        无。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -606,7 +724,17 @@ async def get_history(
 async def list_sessions(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询用户的全部会话（跨宠物统一展示，最近活跃在前），每条带归属宠物 petId"""
+    """列出用户的全部会话（跨宠物，最近活跃在前）。
+
+    Args:
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(SessionListData)``。
+
+    Raises:
+        无。
+    """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -623,10 +751,16 @@ async def list_sessions(
 async def list_memories(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询当前用户的全部长期记忆（用户级 + 所有宠物级，最近更新在前）
+    """列出用户的长期记忆（用户级 + 宠物级，最近更新在前）。
 
-    长期记忆存于 LangGraph 官方 runtime store（PostgreSQL，见 app/memstore.py），
-    跨会话生效、与删除会话解耦；读取异常已内部降级为空列表，前端不会报错。
+    Args:
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(MemoryListData)``。
+
+    Raises:
+        无。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -647,11 +781,19 @@ async def delete_memory(
     petId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """删除单条长期记忆
+    """删除一条长期记忆。
 
-    命名空间由「用户 ID + scope + petId」定位，天然隔离越权：他人无法通过
-    猜 key 删掉别人的记忆；store 侧删除异常已内部降级，返回成功但记忆可能
-    仍在（前端刷新列表可见），不影响主流程。
+    Args:
+        key: 记忆键。
+        scope: ``user`` 或 ``pet``；决定在哪个命名空间下删除。
+        petId: 宠物 ID，``scope=pet`` 时必填。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(None)``；参数不合法或存储不可用时返回对应错误码。
+
+    Raises:
+        无。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -664,6 +806,7 @@ async def delete_memory(
     store = memstore.get_store()
     if store is None:
         return JSONResponse(status_code=200, content=fail(500, _ERROR_MSG))
+    # 命名空间由服务端按 user_id 拼出，客户端只能指定 scope 与 petId，无法越权删他人记忆。
     ns = (memstore.user_ns(user_id) if scope == "user"
           else memstore.pet_ns(user_id, petId))
     try:
@@ -679,11 +822,21 @@ async def delete_session(
     session_id: int = Path(...),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """删除会话：连带删除会话下全部消息（PostgreSQL）与 checkpoint 记忆"""
+    """删除会话：同时清理消息与对话记忆。
+
+    Args:
+        session_id: 会话 ID。
+        x_user_id: 网关注入的用户 ID。
+
+    Returns:
+        ``ok(None)``；会话不存在时返回 404 报文。
+
+    Raises:
+        无。
+    """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
-    # 归属校验：仅允许删除本人会话
     try:
         session = await persistence.get_session(user_id, session_id)
     except Exception:
@@ -692,12 +845,9 @@ async def delete_session(
     if session is None:
         return JSONResponse(status_code=200, content=fail(404, "会话不存在或已删除"))
 
-    # 并行删除：会话与消息（PostgreSQL，事务化）+ checkpoint 记忆（同库）。
-    # checkpoint 侧异常已内部降级仅记日志；会话消息侧是事务化删除
-    # （消息 + 会话要么都删要么都不删）且失败会向上抛，此处必须接住转业务错误：
-    # 否则 FastAPI 会返回裸 500，前端拿不到统一的 {"code","msg","data"} 报文。
-    # checkpoint 已删而消息事务回滚的情况无害：会话仍在，下轮对话会触发历史回填。
     try:
+        # 两处并行删除：只删其一会留下「看得见但已经空掉」的会话，
+        # 或者留下无法通过接口访问、却仍占用存储的记忆。
         await asyncio.gather(
             checkpoint.adelete_thread(user_id, session_id),
             persistence.delete_session(user_id, session_id),
