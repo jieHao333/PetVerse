@@ -80,11 +80,11 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
     /** 元与分的换算倍数（promotion-service 优惠金额以分为单位） */
     private static final BigDecimal CENT_RATE = BigDecimal.valueOf(100);
 
-    /** 支付超时时长（分钟），默认 10 分钟；超出开源版延迟档位支持范围时向上取最近档位 */
+    /** 支付超时时长（分钟），默认 10 分钟；超出延迟档位支持范围时向上取最近档位 */
     @Value("${petverse.order.pay-timeout-minutes:10}")
     private int payTimeoutMinutes;
 
-    /** 开源版 RocketMQ 延迟档位 → 分钟数映射（档位 5~18 为固定档位） */
+    /** 延迟消息档位 → 分钟数映射（档位 5~18 为固定档位，与 RabbitMQ 延迟队列的 TTL 一一对应） */
     private static final int[][] DELAY_LEVEL_MINUTES = {
             {5, 1}, {6, 2}, {7, 3}, {8, 4}, {9, 5}, {10, 6}, {11, 7},
             {12, 8}, {13, 9}, {14, 10}, {15, 20}, {16, 30}, {17, 60}, {18, 120}
@@ -92,7 +92,7 @@ public class OrderServiceImpl extends ServiceImpl<ShopOrderMapper, ShopOrder> im
 
     /**
      * 将配置的支付超时分钟数解析为延迟档位与实际分钟数：
-     * 取分钟数 ≥ 配置值的第一个档位（开源版仅支持固定档位）；
+     * 取分钟数 ≥ 配置值的第一个档位（保持与原实现一致的档位取整行为）；
      * 前端倒计时与实际自动取消均以档位真实分钟数为准，保证两者一致
      */
     private int[] resolvePayTimeoutDelay() {

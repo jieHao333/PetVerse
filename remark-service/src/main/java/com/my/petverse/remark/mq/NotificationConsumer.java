@@ -2,30 +2,34 @@ package com.my.petverse.remark.mq;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.my.petverse.common.mq.MqDeduplicator;
+import com.my.petverse.common.mq.MqMessages;
+import com.my.petverse.common.mq.MqQueues;
 import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.RabbitMqConfig;
 import com.my.petverse.common.mq.message.NotifyMessage;
 import com.my.petverse.remark.service.NotificationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
-import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.amqp.core.ExchangeTypes;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.Argument;
+import org.springframework.amqp.rabbit.annotation.Exchange;
+import org.springframework.amqp.rabbit.annotation.Queue;
+import org.springframework.amqp.rabbit.annotation.QueueBinding;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
-
-import java.nio.charset.StandardCharsets;
 
 /**
  * 站内通知事件消费者：统一接收评论回复/评价回复/点赞三类通知事件并落库，
- * RocketMQ 至少投递一次，按消息 key（源实体ID）幂等去重，落库失败释放键交由重试
+ * 至少投递一次语义下按消息 key（源实体ID）幂等去重，落库失败释放键交由容器重试；
+ * 重试次数与原 maxReconsumeTimes = 5 保持一致，耗尽后转入死信队列
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@RocketMQMessageListener(topic = MqTopics.NOTIFY,
-        selectorExpression = MqTopics.TAG_NOTIFY_CREATED,
-        consumerGroup = "remark-notification-consumer",
-        consumeThreadMax = 32, maxReconsumeTimes = 5)
-public class NotificationConsumer implements RocketMQListener<MessageExt> {
+@ConditionalOnProperty(prefix = "petverse.mq", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class NotificationConsumer {
 
     private final NotificationService notificationService;
 
@@ -33,28 +37,38 @@ public class NotificationConsumer implements RocketMQListener<MessageExt> {
 
     private final ObjectMapper objectMapper;
 
-    @Override
-    public void onMessage(MessageExt messageExt) {
-        NotifyMessage message;
+    @RabbitListener(
+            bindings = @QueueBinding(
+                    value = @Queue(value = MqQueues.REMARK_NOTIFICATION, durable = "true",
+                            arguments = {
+                                    @Argument(name = MqQueues.ARG_DEAD_LETTER_EXCHANGE,
+                                            value = MqQueues.DEAD_LETTER_EXCHANGE),
+                                    @Argument(name = MqQueues.ARG_DEAD_LETTER_ROUTING_KEY,
+                                            value = MqQueues.REMARK_NOTIFICATION)}),
+                    exchange = @Exchange(value = MqTopics.NOTIFY,
+                            type = ExchangeTypes.TOPIC, durable = "true"),
+                    key = MqTopics.TAG_NOTIFY_CREATED),
+            containerFactory = RabbitMqConfig.SHORT_RETRY_LISTENER_FACTORY)
+    public void onMessage(Message message) {
+        NotifyMessage msg;
         try {
-            message = objectMapper.readValue(new String(messageExt.getBody(), StandardCharsets.UTF_8),
-                    NotifyMessage.class);
+            msg = objectMapper.readValue(MqMessages.body(message), NotifyMessage.class);
         } catch (Exception e) {
-            log.error("解析通知事件消息失败，msgId={}", messageExt.getMsgId(), e);
+            log.error("解析通知事件消息失败，msgId={}", MqMessages.messageId(message), e);
             return;
         }
-        if (message.getRecipientUserId() == null) {
+        if (msg.getRecipientUserId() == null) {
             return;
         }
-        String key = messageExt.getKeys();
+        String key = MqMessages.key(message);
         // 首次出现才落库，重复投递直接跳过
         if (!mqDeduplicator.firstTime(key)) {
             return;
         }
         try {
-            notificationService.saveFromMessage(message);
+            notificationService.saveFromMessage(msg);
         } catch (Exception e) {
-            // 落库失败释放去重键，依赖 RocketMQ 重试重新消费
+            // 落库失败释放去重键，依赖容器重试重新消费
             mqDeduplicator.release(key);
             log.error("通知落库失败，key={}", key, e);
             throw e;

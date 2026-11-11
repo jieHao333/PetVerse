@@ -30,12 +30,23 @@ spring:
           max-active: 16
           max-idle: 8
           min-idle: 2
+  # RabbitMQ：领券/兑换消息异步落库；连接异常时发送自动降级为记日志，领券主流程不受影响
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    # 发布确认：发送侧据此判定消息是否真正落到队列（未确认即视为本轮落库失败）
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
-# RocketMQ：领券/兑换消息异步落库；未启动 Broker 时发送自动降级为记日志（仅失去异步落库，领券主流程不受影响）
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: promotion-producer
+# 业务开关：MQ 总开关关闭后不启动任何消费者、消息发送直接走本地降级逻辑
+petverse:
+  mq:
+    enabled: ${MQ_ENABLED:true}
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml

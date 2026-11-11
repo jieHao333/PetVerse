@@ -27,7 +27,7 @@
 
 PetVerse（宠域）是一个面向宠物爱好者的社区平台后端，覆盖 **虚拟宠物养成、真实宠物档案、宠域空间（社区动态）、好友与聊天、点赞评论通知、宠物周边商城、AI 养宠问询** 七大业务域。
 
-项目采用 **Java + Python 混合微服务**：Spring Cloud Gateway 统一入口，JWT 鉴权后向 Java / Python 两侧透传用户身份；6 个 Java 业务服务各自独立数据库，通过 Nacos 完成注册发现与配置下发，RocketMQ 驱动异步链路。AI 能力由独立的 Python 服务（FastAPI + LangGraph）承载，经网关 `/api/ai/**` 统一对外，是项目的核心投入方向。
+项目采用 **Java + Python 混合微服务**：Spring Cloud Gateway 统一入口，JWT 鉴权后向 Java / Python 两侧透传用户身份；6 个 Java 业务服务各自独立数据库，通过 Nacos 完成注册发现与配置下发，RabbitMQ 驱动异步链路。AI 能力由独立的 Python 服务（FastAPI + LangGraph）承载，经网关 `/api/ai/**` 统一对外，是项目的核心投入方向。
 
 > 本仓库为后端（含 `ai-service`）。前端位于独立仓库 [PetVerse-web](https://github.com/374426703/PetVerse-web)，使用 Vue 3 + Vite + Element Plus。
 
@@ -71,7 +71,7 @@ flowchart TB
         PG[("PostgreSQL + pgvector<br/>petverse_ai")]
         REDIS[("Redis<br/>db1 签到 · db2 点赞 · db3 AI")]
         ES[("Elasticsearch<br/>动态 / 商品搜索")]
-        MQ[["RocketMQ<br/>异步事件"]]
+        MQ[["RabbitMQ<br/>异步事件 · 延迟消息"]]
         NACOS["Nacos 2.x<br/>注册 + 配置"]
         OSS[("阿里云 OSS<br/>头像 / 媒体 / 附件")]
     end
@@ -117,7 +117,7 @@ flowchart TB
 | 后端主体 | Java 21 · Spring Boot 3.4.13 · Spring Cloud 2024.0.3 · Spring Cloud Alibaba 2023.0.3.4 · Spring Cloud Gateway · OpenFeign |
 | 数据访问 | MyBatis-Plus 3.5.9 · MySQL 8 |
 | 认证与安全 | JJWT 0.12.7 · BCrypt · 网关统一鉴权与角色校验 |
-| 中间件 | Nacos 2.x · Redis · RocketMQ · Elasticsearch 8.15.5 |
+| 中间件 | Nacos 2.x · Redis · RabbitMQ 3.x · Elasticsearch 8.15.5 |
 | AI 服务 | Python 3.12 · FastAPI · LangGraph 1.x · LangChain 1.x · OpenAI 兼容 LLM / Embedding |
 | 向量与缓存 | PostgreSQL + pgvector · Redis 热缓存 + PostgreSQL 温缓存 |
 | 对象存储 | 阿里云 OSS |
@@ -140,7 +140,7 @@ flowchart TB
 | PostgreSQL + pgvector | 已安装 `vector` 扩展 | `localhost:5432`，库 `petverse_ai` | AI 功能必须 |
 | Python | 3.12 | — | AI 服务必须 |
 | Node.js | `^18` 或 `>=20` | — | 前端必须 |
-| RocketMQ | — | `localhost:9876` | 可选，异步链路需要 |
+| RabbitMQ | 3.x | `localhost:5672`（管理台 `15672`） | 可选，异步链路需要 |
 | Elasticsearch | 8.15.5 | `localhost:9200` | 可选，搜索降级 MySQL |
 | 阿里云 OSS | — | 桶 `petverse-me` | 可选，上传功能需要 |
 
@@ -190,7 +190,7 @@ psql -U postgres -d petverse_ai -f ai-service/db/schema_pgvector.sql
 
 ### 4. 导入 Nacos 配置
 
-所有 Java 服务的端口、数据源、Redis、OSS、JWT、RocketMQ、网关路由等配置均由 Nacos 下发，**启动前必须先导入**。配置模板位于 `nacos-config/`（共 7 份）：
+所有 Java 服务的端口、数据源、Redis、OSS、JWT、RabbitMQ、网关路由等配置均由 Nacos 下发，**启动前必须先导入**。配置模板位于 `nacos-config/`（共 7 份）：
 
 - dataId = 文件名去掉 `.yml`（如 `gateway-service`、`user-service`）
 - group = `DEFAULT_GROUP`
@@ -385,12 +385,14 @@ Java 服务的业务配置集中在 Nacos；本地 `application.yml` 仅声明�
 | `NACOS_SERVER_ADDR` | 全部 Java 服务 | Nacos 地址，默认 `localhost:8848` |
 | `MYSQL_URL` / `MYSQL_USERNAME` / `MYSQL_PASSWORD` | 各业务服务 | 各服务默认连接各自的 `petverse_*` 库 |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | pet / remark | pet 使用 db1，remark 使用 db2 |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` / `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` / `RABBITMQ_VHOST` | 全部 Java 服务 | 默认 `localhost:5672`，`guest/guest`；队列与绑定由消费者启动时自动声明 |
+| `MQ_ENABLED`（对应 `petverse.mq.enabled`） | 全部 Java 服务 | MQ 总开关，`false` 时不创建消费者、发送直接走本地兜底 |
 | `JWT_SECRET` | 网关 + 全部服务 | 必须一致，至少 32 字节；默认值仅为脱敏占位 |
 | `JWT_EXPIRE_SECONDS` | user-service | 令牌有效期，默认 86400 秒 |
 | `OSS_ENDPOINT` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_BUCKET_NAME` | 需要上传的服务 | 共用同一个 OSS 桶 |
 | `OSS_DOMAIN` | user / space | 自定义或 CDN 域名，为空时使用桶默认域名 |
 | `petverse.search.enabled` | space / shop | 搜索总开关，`false` 时全部走 MySQL 模糊查询 |
-| `petverse.order.pay-timeout-minutes` | shop-service | 支付超时分钟数，映射到 RocketMQ 延迟档位 |
+| `petverse.order.pay-timeout-minutes` | shop-service | 支付超时分钟数，映射到 RabbitMQ 延迟队列档位 |
 | `petverse.gateway.rate-limit.*` | gateway-service | 令牌桶参数，AI 流式接口使用独立小桶 |
 | `auth.whitelist-paths` / `auth.public-get-paths` | gateway-service | 免鉴权白名单、游客可读 GET 接口 |
 
@@ -439,12 +441,36 @@ AI 对话流的事件顺序为 `meta → refs（有知识命中时）→ delta �
 
 ---
 
+## 异步消息（RabbitMQ）
+
+所有异步链路统一走 `petverse-common` 的 MQ 基础设施：**topic exchange + routingKey** 承载原「topic + tag」语义，**一个队列 = 一个原消费组**，同一事件可被多个服务各自消费一份。
+
+| Exchange | RoutingKey | 队列（消费方） | 用途 |
+|---|---|---|---|
+| `space-event-topic` | `created` | `pet-exp-consumer`（pet） | 发布动态后异步发放宠物经验 |
+| `space-event-topic` | `index-upsert` / `index-remove` | `space-index-consumer`（space） | 动态检索索引维护 |
+| `product-index-topic` | `upsert` / `remove` / `shop-renamed` / `shop-changed` | `product-index-consumer`（shop） | 商品检索索引维护 |
+| `order-timeout-topic` | `timeout` | `order-timeout-consumer`（shop） | 订单超时自动取消（延迟消息） |
+| `merchant-event-topic` | `approved` / `withdrawn` | `user-role-consumer` / `user-role-withdraw-consumer`（user） | 商家角色升降级 |
+| `like-changed-topic` | `changed` | `space-like-count-consumer` / `space-like-notify-consumer`（space） | 点赞数冗余列同步、点赞转通知 |
+| `notify-topic` | `created` | `remark-notification-consumer`（remark） | 站内通知统一落库 |
+| `promotion-event-topic` | `receive` | `coupon-receive-consumer`（promotion） | 领券 / 兑换异步落库 |
+
+- **延迟消息**：`TTL 队列 + 死信交换机` 实现，无需安装插件。消息先进入 `petverse.delay.<exchange>.<routingKey>.l<档位>` 滞留，到期后由死信流程按目标 RoutingKey 回到目标 Exchange；档位沿用 RocketMQ 开源版的 18 个固定档位（1s / 5s / 10s / 30s / 1m…2h），业务侧的 `delayLevel` 语义不变。
+- **投递可靠性**：消息持久化 + 生产者发布确认（`publisher-confirm-type: correlated`）+ `mandatory` 退回校验，只有真正落到队列才认为发送成功。
+- **消费重试**：消费方法抛异常即触发容器重试（1s 起、2 倍退避、上限 10s），默认 16 次（通知 / 点赞类 5 次）；耗尽后拒绝并不重回队列，经 `petverse.dlx` 转入 `petverse.dlq` 保留现场，对应原 `%DLQ%<consumerGroup>`。
+- **幂等**：`MqDeduplicator` 按业务键（写入 messageId）在消费端去重；消费失败先 `release(key)` 再抛出，保证重试不被去重器拦截。
+- 队列与绑定由各消费者通过 `@QueueBinding` 自行声明，服务只创建自己消费的队列；管理台 `http://localhost:15672` 可直接查看积压与死信。
+- `petverse.mq.enabled=false`（或 `MQ_ENABLED=false`）时消费者不创建、发送直接返回失败并执行本地兜底，便于没有 Broker 的环境启动服务。
+
+---
+
 ## 工程亮点
 
 - **网关安全闭环**：剥离伪造身份头 → 校验 JWT → 重新注入身份；游客只读接口按 Ant 精确匹配且仅 GET 放行；内部接口与角色路径统一拦截。
 - **点赞最终一致**：点赞读写全走 Redis `Set`，变更打脏标记，定时任务增量 diff 后批量落库（批量插入 / 批量删除 / 计数快照），失败对象下轮重试。
 - **订单一致性**：条件 SQL 原子扣库存防超卖，按商品 ID 升序扣减防死锁；延迟消息 + 支付 / 查询出口惰性取消双保险，仅抢占成功的一方回补库存。
-- **事务后消息**：`MqEventPublisher` 通过事务同步器在 `afterCommit` 发送，避免「消息已发、事务回滚」的脏事件；消费端按业务键幂等去重。
+- **事务后消息**：`MqEventPublisher` 通过事务同步器在 `afterCommit` 发送，避免「消息已发、事务回滚」的脏事件；发送侧等 Broker 发布确认并校验 mandatory 退回，未确认即触发本地兜底；消费端按业务键幂等去重。
 - **ES 检索降级**：事务提交后发 MQ 异步刷索引，ES 只返回 ID 再回 MySQL 取权威数据；ES 异常进入 60s 熔断窗口并降级为 `LIKE` 查询。
 - **AI 生产韧性**：RAG 检索不可用时明确报错而不降级编造；SSE 链路具备并发闸、心跳、首帧重试与存储层自愈；结果缓存采用「Redis 热 + PostgreSQL 温」两级兜底。
 - **工程一致性**：DO / DTO / VO 集中在 `petverse-common`，Controller 只收 DTO、只返 `Result<VO>`；分页、主键、逻辑删除、异常处理与 ID 序列化规则统一。
@@ -458,12 +484,12 @@ AI 对话流的事件顺序为 `meta → refs（有知识命中时）→ delta �
 | Nacos / MySQL | 服务无法启动或注册失败，必须先启动 |
 | Redis | 点赞不可用或降级；签到由档案最近签到日期兜底；AI 缓存退化、单用户并发额度退化为进程内计数 |
 | PostgreSQL | AI 会话持久化与记忆降级；知识库相关能力明确报错 |
-| RocketMQ | 宠物经验、ES 索引同步、订单超时取消、商家角色升级等异步链路失效；发送侧自动降级为日志 |
+| RabbitMQ | 宠物经验、ES 索引同步、订单超时取消、商家角色升级等异步链路失效；发送侧自动降级为日志，消费容器后台重连 |
 | Elasticsearch | 动态 / 商品搜索降级为 MySQL 模糊查询，可设置 `petverse.search.enabled=false` 全局关闭 |
 | 阿里云 OSS | 头像、动态媒体、商品图、聊天附件、AI 附件等上传功能不可用 |
 | LLM / Embedding | 未配置 LLM 时可用 `MOCK_CHAT=true`；未配置 Embedding 时知识类提问明确报错 |
 
-> RocketMQ 的消费端在 Broker 不可达时可能阻断对应服务启动；本地开发建议一并启动，或按需排除 RocketMQ 自动装配。
+> RabbitMQ 不可达时服务仍可启动：消费容器在后台按间隔重连并打印告警，发送侧直接降级为日志；如需彻底关闭 MQ（不建立任何连接），设置 `petverse.mq.enabled=false` 或环境变量 `MQ_ENABLED=false`。
 
 ---
 
@@ -487,7 +513,7 @@ AI 对话流的事件顺序为 `meta → refs（有知识命中时）→ delta �
 
 **搜索没有结果或行为异常**
 
-确认 Elasticsearch 已启动且 `petverse.search.enabled=true`；索引依赖 RocketMQ 异步同步，Broker 不可用时新数据可能未进入索引。
+确认 Elasticsearch 已启动且 `petverse.search.enabled=true`；索引依赖 MQ 异步同步，Broker 不可用时新数据可能未进入索引。
 
 **前端请求 404 / 502**
 

@@ -60,7 +60,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 新增商品默认下架，商家确认信息后手动上架
         product.setStatus(0);
         save(product);
-        // 事务提交后发事件，由索引消费者异步双写检索索引，失败由 RocketMQ 重试兼容，不影响商品保存
+        // 事务提交后发事件，由索引消费者异步双写检索索引，失败由 MQ 消费重试兼容，不影响商品保存
         mqEventPublisher.publishAfterCommit(MqTopics.PRODUCT_INDEX, MqTopics.TAG_PRODUCT_UPSERT,
                 new ProductIndexMessage(product.getId(), merchant.getId()),
                 "product-index:" + product.getId());

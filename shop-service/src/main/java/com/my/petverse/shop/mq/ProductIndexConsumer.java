@@ -3,33 +3,36 @@ package com.my.petverse.shop.mq;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.my.petverse.common.entity.shop.Merchant;
 import com.my.petverse.common.entity.shop.Product;
+import com.my.petverse.common.mq.MqMessages;
+import com.my.petverse.common.mq.MqQueues;
 import com.my.petverse.common.mq.MqTopics;
+import com.my.petverse.common.mq.RabbitMqConfig;
 import com.my.petverse.common.mq.message.ProductIndexMessage;
 import com.my.petverse.shop.mapper.MerchantMapper;
 import com.my.petverse.shop.mapper.ProductMapper;
 import com.my.petverse.shop.search.ProductSearchService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
-import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.amqp.core.ExchangeTypes;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.Argument;
+import org.springframework.amqp.rabbit.annotation.Exchange;
+import org.springframework.amqp.rabbit.annotation.Queue;
+import org.springframework.amqp.rabbit.annotation.QueueBinding;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
-
-import java.nio.charset.StandardCharsets;
 
 /**
  * 商品检索索引消费者：异步维护 Elasticsearch 商品索引，
  * 替代商品增删改与店铺改名路径上的同步双写；
- * 索引操作按ID回表读取最新数据，天然幂等，失败由 RocketMQ 重试
+ * 索引操作按ID回表读取最新数据，天然幂等，失败由监听容器重试
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
-@RocketMQMessageListener(topic = MqTopics.PRODUCT_INDEX,
-        selectorExpression = MqTopics.TAG_PRODUCT_UPSERT + " || " + MqTopics.TAG_PRODUCT_REMOVE
-                + " || " + MqTopics.TAG_PRODUCT_SHOP_RENAMED + " || " + MqTopics.TAG_PRODUCT_SHOP_CHANGED,
-        consumerGroup = "product-index-consumer")
-public class ProductIndexConsumer implements RocketMQListener<MessageExt> {
+@ConditionalOnProperty(prefix = "petverse.mq", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class ProductIndexConsumer {
 
     private final ProductMapper productMapper;
 
@@ -39,17 +42,29 @@ public class ProductIndexConsumer implements RocketMQListener<MessageExt> {
 
     private final ObjectMapper objectMapper;
 
-    @Override
-    public void onMessage(MessageExt messageExt) {
+    @RabbitListener(
+            bindings = @QueueBinding(
+                    value = @Queue(value = MqQueues.PRODUCT_INDEX, durable = "true",
+                            arguments = {
+                                    @Argument(name = MqQueues.ARG_DEAD_LETTER_EXCHANGE,
+                                            value = MqQueues.DEAD_LETTER_EXCHANGE),
+                                    @Argument(name = MqQueues.ARG_DEAD_LETTER_ROUTING_KEY,
+                                            value = MqQueues.PRODUCT_INDEX)}),
+                    exchange = @Exchange(value = MqTopics.PRODUCT_INDEX,
+                            type = ExchangeTypes.TOPIC, durable = "true"),
+                    // 等价于原 selectorExpression 的四个 tag 并联
+                    key = {MqTopics.TAG_PRODUCT_UPSERT, MqTopics.TAG_PRODUCT_REMOVE,
+                            MqTopics.TAG_PRODUCT_SHOP_RENAMED, MqTopics.TAG_PRODUCT_SHOP_CHANGED}),
+            containerFactory = RabbitMqConfig.LISTENER_FACTORY)
+    public void onMessage(Message message) {
         ProductIndexMessage msg;
         try {
-            msg = objectMapper.readValue(new String(messageExt.getBody(), StandardCharsets.UTF_8),
-                    ProductIndexMessage.class);
+            msg = objectMapper.readValue(MqMessages.body(message), ProductIndexMessage.class);
         } catch (Exception e) {
-            log.error("解析商品索引事件消息失败，msgId={}", messageExt.getMsgId(), e);
+            log.error("解析商品索引事件消息失败，msgId={}", MqMessages.messageId(message), e);
             return;
         }
-        String tag = messageExt.getTags();
+        String tag = MqMessages.tag(message);
         try {
             if (MqTopics.TAG_PRODUCT_REMOVE.equals(tag)) {
                 // 重复删除幂等，无需额外去重

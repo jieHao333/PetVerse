@@ -7,8 +7,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 消费端内存幂等去重器：RocketMQ 至少投递一次，消费端按业务键去重。
- * 适用于单实例消费、重复投递窗口较短的场景（如经验发放、角色升级）；
+ * 消费端内存幂等去重器：RabbitMQ 为至少投递一次语义（重试、网络抖动、Broker 重投均可能重复），
+ * 消费端按业务键去重。适用于单实例消费、重复投递窗口较短的场景（如经验发放、角色升级）；
  * 条目超过容量上限或存活超过 12 小时后自动淘汰
  */
 @Component
@@ -42,7 +42,7 @@ public class MqDeduplicator {
     }
 
     /**
-     * 释放业务键：消费处理失败需要依赖 RocketMQ 重试时调用，
+     * 释放业务键：消费处理失败需要依赖容器重试时调用，
      * 避免重试消息被去重器拦截导致业务永久丢失
      */
     public void release(String key) {

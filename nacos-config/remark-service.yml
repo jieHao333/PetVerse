@@ -33,6 +33,18 @@ spring:
           max-idle: 16
           min-idle: 4
           max-wait: 2000ms
+  # RabbitMQ：点赞/取消点赞时发布变更事件、评论回复时发布通知事件，
+  # 业务侧据此近实时刷新热度与落库通知；连接异常时发送自动降级为记日志，点赞/评论功能本身不受影响
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
@@ -49,9 +61,7 @@ jwt:
   # 生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值（需与 user-service 一致）
   secret: ${JWT_SECRET:***********************}
 
-# RocketMQ：点赞/取消点赞时发布变更事件，业务侧据此近实时刷新热度；
-# 未启动 Broker 时发送自动降级为记日志，点赞功能本身不受影响（定时任务仍会同步计数）
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: remark-producer
+# 业务开关：MQ 总开关关闭后不启动任何消费者、消息发送直接走本地降级逻辑
+petverse:
+  mq:
+    enabled: ${MQ_ENABLED:true}

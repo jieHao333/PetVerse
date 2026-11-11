@@ -377,7 +377,7 @@ public class SpaceServiceImpl extends ServiceImpl<SpaceMapper, Space> implements
         save(space);
         saveMediaList(space.getId(), dto.getMediaList());
         // 事务提交后发布事件：pet-service 消费发放宠物经验，索引消费者维护 ES 检索索引，
-        // 下游失败由 RocketMQ 重试兼容，不阻断发布主流程（经验奖励改为异步，不再同步返回）
+        // 下游失败由 MQ 消费重试兼容，不阻断发布主流程（经验奖励改为异步，不再同步返回）
         mqEventPublisher.publishAfterCommit(MqTopics.SPACE_EVENT, MqTopics.TAG_SPACE_CREATED,
                 new SpaceCreatedMessage(space.getId(), dto.getUserId()),
                 "space-created:" + space.getId());

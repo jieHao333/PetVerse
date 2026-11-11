@@ -155,7 +155,7 @@ public class MerchantApplyServiceImpl extends ServiceImpl<MerchantApplyMapper, M
             merchant.setWithdrawStatus(0);
             merchantMapper.insert(merchant);
             // 跨服务升级用户角色改为事件驱动：事务提交后发消息，user-service 消费升级角色，
-            // 失败由 RocketMQ 重试直至成功，避免同步 Feign 失败导致审批整体回滚（最终一致）
+            // 失败由 MQ 消费重试直至成功，避免同步 Feign 失败导致审批整体回滚（最终一致）
             mqEventPublisher.publishAfterCommit(MqTopics.MERCHANT_EVENT, MqTopics.TAG_MERCHANT_APPROVED,
                     new MerchantApprovedMessage(apply.getId(), apply.getUserId()),
                     "merchant-approved:" + apply.getId());

@@ -20,6 +20,17 @@ spring:
       # 小于 MySQL wait_timeout，避免使用到已被服务端关闭的连接
       max-lifetime: 1800000
       pool-name: user-pool
+  # RabbitMQ：消费商户入驻审批通过/撤销事件，异步升级或降级用户角色
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
@@ -37,11 +48,10 @@ jwt:
   secret: ${JWT_SECRET:***********************}
   expire-seconds: ${JWT_EXPIRE_SECONDS:86400}
 
-# RocketMQ：消费商户入驻审批通过事件，异步升级用户角色；未启动 Broker 时消费不可用，不影响其他功能
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: user-producer
+# 业务开关：MQ 总开关关闭后不启动任何消费者、消息发送直接走本地降级逻辑
+petverse:
+  mq:
+    enabled: ${MQ_ENABLED:true}
 
 # 阿里云 OSS 存储配置
 aliyun:

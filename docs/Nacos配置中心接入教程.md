@@ -1,6 +1,6 @@
 # Nacos 配置中心接入教程
 
-本项目所有 Java 微服务的业务配置（端口、数据库、Redis、OSS、JWT、RocketMQ、网关路由等）已统一迁移到 **Nacos 配置中心**，服务本地不再保存业务配置。本文介绍如何从零把配置导入 Nacos 并让服务正常启动。
+本项目所有 Java 微服务的业务配置（端口、数据库、Redis、OSS、JWT、RabbitMQ、网关路由等）已统一迁移到 **Nacos 配置中心**，服务本地不再保存业务配置。本文介绍如何从零把配置导入 Nacos 并让服务正常启动。
 
 > 适用版本：Spring Boot 3.4 / Spring Cloud 2024 / Spring Cloud Alibaba 2023.0.3.4 / Nacos 2.x。
 

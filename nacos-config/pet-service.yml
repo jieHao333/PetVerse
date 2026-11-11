@@ -34,6 +34,19 @@ spring:
           max-idle: 16
           min-idle: 4
           max-wait: 2000ms
+  # RabbitMQ：消费动态发布事件，异步为宠物发放经验奖励；连接异常时消费自动重连，不影响其他功能
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    # 发布确认：发送侧据此判定消息是否真正落到队列（未确认即触发本地兜底）
+    publisher-confirm-type: correlated
+    # 无法路由的消息退回给生产者，避免"发送成功但无人消费"
+    publisher-returns: true
+    template:
+      mandatory: true
   servlet:
     multipart:
       # 单个头像文件上限（2MB + 冗余）
@@ -55,11 +68,10 @@ jwt:
   # 生产环境请通过环境变量 JWT_SECRET 覆盖此开发默认值（需与 user-service 一致）
   secret: ${JWT_SECRET:***********************}
 
-# RocketMQ：消费动态发布事件，异步为宠物发放经验奖励；未启动 Broker 时消费不可用，不影响其他功能
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: pet-producer
+# 业务开关：MQ 总开关关闭后不启动任何消费者、消息发送直接走本地降级逻辑
+petverse:
+  mq:
+    enabled: ${MQ_ENABLED:true}
 
 # 阿里云 OSS 存储配置（与其他服务共用同一个桶），宠物头像上传用
 aliyun:

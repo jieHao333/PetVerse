@@ -31,18 +31,26 @@ spring:
     uris: http://localhost:9200
     connection-timeout: 2s
     socket-timeout: 5s
+  # RabbitMQ：发布动态事件（宠物经验/索引）与点赞变更事件的消费；
+  # 连接异常时发送自动降级为记日志，不影响主流程
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
 # 搜索开关，置为 false 则全部走数据库模糊查询
 petverse:
+  # MQ 总开关：关闭后不启动任何消费者、消息发送直接走本地降级逻辑
+  mq:
+    enabled: ${MQ_ENABLED:true}
   search:
     enabled: true
-
-# RocketMQ：发布动态事件（宠物经验/索引）与点赞变更事件的生产与消费；
-# 未启动 Broker 时发送自动降级为记日志，不影响主流程
-rocketmq:
-  name-server: localhost:9876
-  producer:
-    group: space-producer
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
