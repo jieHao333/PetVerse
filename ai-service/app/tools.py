@@ -142,5 +142,14 @@ def build_tools(user_id: int) -> List[StructuredTool]:
         """
         return _dumps(await biz.search_products(keyword, limit=_PRODUCT_SEARCH_LIMIT, user_id=user_id))
 
+    @tool(parse_docstring=True)
+    async def get_my_profile() -> str:
+        """查询当前登录用户的养护画像与偏好：饲养物种、物种亲和度、活跃度、消费力、兴趣标签、推荐点击率。
+
+        用户询问「我的偏好」「我适合养什么」「结合我的情况给建议」时调用；
+        数据来自数据中台沉淀的行为画像，返回空对象表示暂无足够行为数据。
+        """
+        return _dumps(await biz.get_data_profile(user_id) or {})
+
     # 顺序即工具在提示词中的出现顺序，把最常用的档案 / 订单类放在前面。
-    return [get_my_pets, get_my_orders, get_my_cart, get_product_reviews, get_hot_posts, search_products]
+    return [get_my_pets, get_my_orders, get_my_cart, get_product_reviews, get_hot_posts, search_products, get_my_profile]

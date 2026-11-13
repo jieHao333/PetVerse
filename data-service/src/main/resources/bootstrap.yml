@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: data-service
+  cloud:
+    nacos:
+      server-addr: ${NACOS_SERVER_ADDR:localhost:8848}
+      discovery:
+        enabled: true
+      config:
+        enabled: true
+        file-extension: yml
+        group: DEFAULT_GROUP
+        refresh-enabled: true

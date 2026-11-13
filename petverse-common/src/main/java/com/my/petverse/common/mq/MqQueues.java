@@ -44,6 +44,9 @@ public final class MqQueues {
     /** 领券/兑换落库，消费 promotion-event-topic 的 receive */
     public static final String COUPON_RECEIVE = "coupon-receive-consumer";
 
+    /** 数据中台采集，消费 data-event-topic 的 behavior，并复用各业务 Exchange 的事件落地 ODS */
+    public static final String DATA_EVENT = "data-event-consumer";
+
     // ---------- 死信（重试耗尽后的兜底，对应原 RocketMQ 的 %DLQ%<consumerGroup>） ----------
 
     /** 死信交换机：fanout，所有重试耗尽的消息统一转入，避免消息静默丢失 */

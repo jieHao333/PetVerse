@@ -63,4 +63,10 @@ public final class MqTopics {
 
     /** 领券/兑换：消费方为 promotion-service 自身，完成发放数自增与 user_coupon 落库 */
     public static final String TAG_COUPON_RECEIVE = "receive";
+
+    /** 数据中台事件 Exchange（前端埋点行为事件统一入口） */
+    public static final String DATA_EVENT = "data-event-topic";
+
+    /** 行为埋点：曝光/点击/搜索/AI反馈/页面浏览，消费方为 data-service */
+    public static final String TAG_DATA_BEHAVIOR = "behavior";
 }

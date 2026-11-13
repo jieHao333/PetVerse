@@ -348,6 +348,17 @@ PetVerse/
 | `shop-service` | 8087 | MySQL `petverse_shop` + ES | 商家入驻审核、店铺 / 商品、购物车、订单、评价回复、商品搜索 |
 | `petverse-common` | — | — | 所有 DO / DTO / VO、统一返回与异常、JWT 上下文、Feign 身份透传、MQ 发布与去重、OSS 封装、MyBatis-Plus 与 Jackson 通用配置 |
 | `ai-service` | 8086 | PostgreSQL `petverse_ai` + Redis(db3) | AI 对话、RAG、双层记忆、健康评估、评论摘要、个性化推荐、知识库管理 |
+| `data-service` | 8089 | MySQL `petverse_data` | AI 数据中台：行为埋点 + 业务事件采集、ODS/DWD/DWS/ADS 分层、用户画像 / 商品统计 / 指标 / 反馈样本微批聚合、统一数据服务（Data API）、管理端 BI |
+
+### 数据中台（data-service）
+
+把分散在各业务服务的数据沉淀为统一、受治理、可复用的数据资产，让 AI 从「逐接口现拉」升级为「消费治理好的画像/特征」，并补上行为反馈闭环与经营分析。轻量落地，复用现有 RabbitMQ / MySQL，不引入重型大数据栈。
+
+- **采集**：前端埋点 SDK（曝光/点击/搜索/AI反馈/页面浏览）经 `/api/data/track` 汇入 `data-event-topic`；采集消费者同时绑定现有业务 Exchange（动态/点赞/订单超时/商户/领券），无需改动生产者即可把业务事件落地 ODS。按 `eventId` 幂等，MQ 关闭时本地兜底直写。
+- **分层**：`data_event_raw`(ODS) → `data_behavior`(DWD) → `data_user_profile`/`data_product_stats`(DWS) → `data_metric_daily`(ADS)，另有 `data_sample` 反馈样本（曝光⋈点击）。
+- **聚合**：`DataAggregateTask` 微批（默认 120s）构建画像（物种亲和度/活跃度/消费力）、商品统计（CTR/热度）、按日指标（DAU/推荐CTR/AI采纳率）与样本，按唯一键 upsert，可重复执行。
+- **服务**：内部 Data API `/data/internal/profile/{userId}`、`/data/internal/product-stats` 供 ai-service 一次取数（推荐图已接入，BizClient 兜底）；管理端 `/data/admin/**` 仅管理员，前端「数据看板」页消费。
+- **部署**：建库执行 `data-service/src/main/resources/db/schema.sql`；Nacos 导入 `nacos-config/data-service.yml`；网关已加 `/api/data/**` 路由。单体版（PetVerseSingle）含等价 `data` 包，表并入 `petverse` 单库（`db/upgrade_data.sql`）。ai-service 单体部署时设 `DATA_SERVICE_URL=http://127.0.0.1:8080`。
 
 ---
 

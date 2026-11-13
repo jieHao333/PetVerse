@@ -275,6 +275,29 @@ class BizClient:
                               params={"pageNum": 1, "pageSize": limit}, user_id=user_id)
         return _records(data)
 
+    async def get_data_profile(self, user_id: int) -> Optional[dict]:
+        """从数据中台读取用户画像/特征（统一数据服务，一次取数替代逐接口现拉）。
+
+        失败降级为 None，调用方据此回退到本地推断，不影响推荐主流程。
+        """
+        data = await self.get(settings.DATA_SERVICE_URL, f"/data/internal/profile/{user_id}",
+                              user_id=user_id)
+        return data if isinstance(data, dict) else None
+
+    async def get_product_stats(self, product_ids: List[int], user_id: int = 0) -> List[dict]:
+        """从数据中台批量读取商品统计（CTR/热度），供推荐重排参考。失败降级为空列表。"""
+        if not product_ids:
+            return []
+        ids = ",".join(str(p) for p in product_ids if p is not None)
+        data = await self.get(settings.DATA_SERVICE_URL, "/data/internal/product-stats",
+                              params={"ids": ids}, user_id=user_id)
+        return data if isinstance(data, list) else []
+
+    async def get_rerank_model(self, user_id: int = 0) -> Optional[dict]:
+        """从数据中台读取当前激活的重排模型（特征/权重）。无模型或失败时返回 None。"""
+        data = await self.get(settings.DATA_SERVICE_URL, "/data/internal/model", user_id=user_id)
+        return data if isinstance(data, dict) else None
+
 
 def _records(data: Any) -> List[dict]:
     """从分页响应中取出记录数组。

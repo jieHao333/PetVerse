@@ -25,6 +25,7 @@
 
 import asyncio
 import logging
+import math
 from typing import Any, Dict, List, Set, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -38,7 +39,7 @@ from app.schemas import RecommendResult
 logger = logging.getLogger(__name__)
 
 # 缓存版本号：调整召回/排序逻辑后手动 +1，可让旧结构缓存立即失效（避免上线后仍吐旧数据）。
-_CACHE_VERSION = "v3"
+_CACHE_VERSION = "v5"
 
 # ── 召回规模参数 ──────────────────────────────────────────────────────────
 # 关键词数量直接决定并发请求数：商品每词 6 条、动态每词 4 条，5 个词 ≈ 50 条候选。
@@ -177,7 +178,19 @@ def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[s
                 own_words.append(value)
 
     if not groups:
-        # 无宠物档案：从行为数据里拼一段文本推断物种。只需判断「买了/看了什么」，
+        # 无宠物档案：优先用数据中台沉淀的画像（饲养物种/物种亲和度）做冷启动推断。
+        features = profile.get("features") or {}
+        for word in [w.strip() for w in (features.get("ownSpecies") or "").split(",") if w.strip()]:
+            groups |= _species_of(word)
+            if word not in keywords:
+                keywords.append(word)
+            if word not in own_words:
+                own_words.append(word)
+        for sp in (features.get("speciesAffinity") or {}):
+            groups |= _species_of(sp)
+
+    if not groups:
+        # 仍无物种：从行为数据里拼一段文本推断物种。只需判断「买了/看了什么」，
         # 因此把商品名与动态标题拼起来统一做一次抽取即可。
         touched: List[str] = []
         for item in (profile.get("cart") or []) + (profile.get("reviews") or []):
@@ -350,7 +363,23 @@ def _to_item(cand: Dict[str, Any], reason: str, score: float) -> Dict[str, Any]:
     item = {k: v for k, v in cand.items() if not k.startswith("_")}
     item["reason"] = reason
     item["score"] = score
+    # 附带标题首要物种，供前端曝光/点击埋点回传，沉淀为数据中台的物种亲和度特征
+    order = _species_order(cand.get("title") or "")
+    item["species"] = order[0] if order else ""
     return item
+
+
+def _model_prob(weights: List[float], ctr: float, hot: float, exposure: float) -> float:
+    """逻辑回归点击概率。特征口径与数据中台训练端严格一致：
+    x = [1(偏置), ctr, min(hot,100)/100, log1p(exposure)/10]，避免训练-服务偏斜。
+    """
+    x = [1.0, max(0.0, min(1.0, ctr)), max(0.0, min(100.0, hot)) / 100.0,
+         math.log1p(max(exposure, 0.0)) / 10.0]
+    z = sum(float(w) * xi for w, xi in zip(weights, x))
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
 
 
 async def gather_profile(state: RecommendState) -> Dict[str, Any]:
@@ -366,12 +395,13 @@ async def gather_profile(state: RecommendState) -> Dict[str, Any]:
         无——``return_exceptions=True`` 保证单项失败不影响整体。
     """
     user_id = state.get("user_id", 0)
-    pets, orders, cart, reviews, my_posts = await asyncio.gather(
+    pets, orders, cart, reviews, my_posts, data_profile = await asyncio.gather(
         biz.get_my_pets(user_id),
         biz.get_my_orders(user_id, limit=10),
         biz.get_my_cart(user_id),
         biz.get_my_reviews(user_id, limit=10),
         biz.get_my_posts(user_id, limit=5),
+        biz.get_data_profile(user_id),
         return_exceptions=True,
     )
 
@@ -385,6 +415,8 @@ async def gather_profile(state: RecommendState) -> Dict[str, Any]:
         "cart": _safe(cart),
         "reviews": _safe(reviews),
         "my_posts": _safe(my_posts),
+        # 数据中台治理好的画像/特征（物种亲和度、活跃度、消费力等），缺失时为空字典
+        "features": data_profile if isinstance(data_profile, dict) else {},
     }
     return {"profile": profile}
 
@@ -476,8 +508,29 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
 
     # 先做硬过滤再打分：被排除的候选不必参与排序，也避免它们占满候选池名额。
     candidates = [c for c in candidates if not _is_off_species(c, own_groups)]
+    # 数据中台商品统计（CTR/热度）作为排序信号；取不到时退化为纯启发式，不阻断主流程。
+    product_ids = [c["id"] for c in candidates if c["type"] == "product" and c.get("id") is not None]
+    stats_rows = await biz.get_product_stats(product_ids, user_id=user_id)
+    stats_map = {}
+    for s in stats_rows:
+        pid = _as_number(s.get("productId"))
+        if pid:
+            stats_map[pid] = s
+    # 数据中台激活的重排模型（逻辑回归权重）；无模型时退化为启发式
+    model = await biz.get_rerank_model(user_id)
+    weights = model.get("weights") if isinstance(model, dict) else None
+    use_model = isinstance(weights, list) and len(weights) == 4
     for cand in candidates:
         cand["_score"] = _relevance(cand, own_groups)
+        if cand["type"] == "product":
+            s = stats_map.get(_as_number(cand.get("id")))
+            if s:
+                ctr = float(s.get("ctr") or 0)
+                hot = float(s.get("hotScore") or 0)
+                exposure = float(s.get("exposureCnt") or 0)
+                cand["_score"] += min(1.0, ctr * 2.0 + hot * 0.01)
+                if use_model:
+                    cand["_score"] += _model_prob(weights, ctr, hot, exposure) * 1.5
     candidates.sort(key=lambda c: c["_score"], reverse=True)
     return {
         "keywords": keywords,
@@ -619,6 +672,15 @@ def _profile_digest(profile: Dict[str, Any]) -> str:
     posts = profile.get("my_posts") or []
     if posts:
         lines.append("发布动态：" + "、".join((p.get("title") or "")[:15] for p in posts[:3] if p.get("title")))
+    features = profile.get("features") or {}
+    if features.get("activityLevel"):
+        lines.append("活跃度：" + str(features["activityLevel"]))
+    if features.get("consumptionLevel"):
+        lines.append("消费力：" + str(features["consumptionLevel"]))
+    affinity = features.get("speciesAffinity") or {}
+    if affinity:
+        top = sorted(affinity.items(), key=lambda kv: -float(kv[1] or 0))[:3]
+        lines.append("偏好物种：" + "、".join(str(k) for k, _ in top))
     # 每段都做了条数截断与字数裁剪：画像要的是「信号」，不是完整数据。
     return "\n".join(lines) or "（暂无足够画像数据，请推荐热门内容）"
 

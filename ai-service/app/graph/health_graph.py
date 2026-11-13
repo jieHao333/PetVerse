@@ -26,6 +26,7 @@ from typing import Any, Dict, List, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app import pg_store
+from app.clients import biz
 from app.config import settings
 from app.llm import astructured_invoke
 from app.schemas import PetHealthReport
@@ -105,10 +106,10 @@ def _profile_lines(pet: Dict[str, Any]) -> tuple[List[str], List[str]]:
 
 
 async def load_profile(state: HealthState) -> Dict[str, Any]:
-    """档案整理节点。
+    """档案整理节点：宠物档案 + 数据中台用户养护画像，丰富评估上下文。
 
     Args:
-        state: 图状态（读 ``pet``）。
+        state: 图状态（读 ``pet`` / ``user_id``）。
 
     Returns:
         ``{"profile_text": str, "missing": [...]}``。
@@ -118,6 +119,20 @@ async def load_profile(state: HealthState) -> Dict[str, Any]:
     """
     pet = state.get("pet") or {}
     lines, missing = _profile_lines(pet)
+    # 数据中台沉淀的用户养护画像作为补充上下文（取不到时静默跳过，不影响评估）
+    profile = await biz.get_data_profile(state.get("user_id", 0))
+    if isinstance(profile, dict):
+        extra: List[str] = []
+        if profile.get("activityLevel"):
+            extra.append(f"养护活跃度：{profile['activityLevel']}")
+        if profile.get("ownSpecies"):
+            extra.append(f"饲养物种：{profile['ownSpecies']}")
+        affinity = profile.get("speciesAffinity") or {}
+        if affinity:
+            top = sorted(affinity.items(), key=lambda kv: -float(kv[1] or 0))[:3]
+            extra.append("偏好物种：" + "、".join(str(k) for k, _ in top))
+        if extra:
+            lines.append("用户养护画像：" + "；".join(extra))
     return {"profile_text": "\n".join(lines), "missing": missing}
 
 

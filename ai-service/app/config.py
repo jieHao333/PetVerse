@@ -141,6 +141,8 @@ class Settings(BaseSettings):
     SOCIAL_SERVICE_URL: str = "http://127.0.0.1:8084"
     REMARK_SERVICE_URL: str = "http://127.0.0.1:8085"
     SHOP_SERVICE_URL: str = "http://127.0.0.1:8087"
+    # 数据中台统一数据服务：微服务版直连 data-service:8089；单体版设为 http://127.0.0.1:8080
+    DATA_SERVICE_URL: str = "http://127.0.0.1:8089"
     HTTP_TIMEOUT: float = 8.0
 
     # ── 结果缓存 TTL（秒） ────────────────────────────────────────────────
