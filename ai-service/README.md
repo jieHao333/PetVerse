@@ -6,12 +6,41 @@
 
 | 能力 | 说明 | 编排图 |
 |---|---|---|
-| AI 养宠顾问对话 | 意图识别 → RAG 检索 / 工具调用 → 生成，SSE 流式，多会话管理 | `app/graph/chat_graph.py` |
+| AI 养宠顾问对话 | 自主 AgentLoop（模型自行决定检索 / 查数 / 作答），SSE 流式，多会话管理 | `app/agent/` |
 | AI 健康智能评估 | 基于宠物档案 + 健康信息生成评分、风险、养护计划、提醒 | `app/graph/health_graph.py` |
 | 商品评论摘要 | 汇总真实评论生成口碑概览（情感 / 优缺点 / 关键词） | `app/graph/review_graph.py` |
 | 个性化推荐 | 结合宠物画像、订单、购物车、评价、动态重排推荐 | `app/graph/recommend_graph.py` |
 
-**对话编排（chat_graph）**：`多意图识别 →（Send 并行扇出）知识检索 / 工具调用 → 汇合 → Prompt 组装 → 生成`，知识类与工具类可同时命中。命中医疗 / 急症意图时，最终 Prompt 会强制附加「及时咨询专业宠物医生」的就医护栏。工具让 AI 能查询用户真实数据（我的宠物 / 订单 / 购物车 / 商品评论 / 热门动态）。
+**对话架构（`app/agent`，自主 AgentLoop）**：对话链路不再是一张写死的意图图，而是一个
+`prepare → agent ⇄ act → finalize` 的最小循环——**调不调工具、调哪个、调几次、什么时候停，
+全部由模型在 `agent` 节点里自行决定**。`prepare` 只做确定性上下文工程（宠物档案、长期记忆、
+医疗护栏、系统提示）；`act` 用 LangGraph 官方 `ToolNode` 并行执行工具；工具描述按
+「能力 + 适用场景 + 空结果含义」三段式书写，模型据此选工具（知识检索 / 我的宠物 / 订单 /
+购物车 / 商品口碑 / 社区热门 / 养护画像）。命中医疗或急症关键词时，Prompt 仍强制附加
+「及时咨询专业宠物医生」的就医护栏。
+
+循环有两条确定性边界：`AGENT_MAX_STEPS`（默认 3 轮工具调用）到顶后走 `conclude` 节点、
+不绑工具地强制收敛；知识检索不可用时 `RagUnavailable` 直接上抛（不做「无依据也照答」的静默降级）。
+新增能力只需写一个 `@tool` 并在 `app/agent/tools/registry.py` 登记分组，不用改图、不用改路由。
+
+**写操作（用户能点的按钮）**：除只读查询外，模型还能执行加购 / 改数量 / 移出购物车、点赞、评论、
+发布动态、登记宠物与更新健康档案。`cart` / `interaction` / `pet_edit` 默认开启（可撤销）；
+`content`（公开发布）默认关闭，需显式配置。同一轮内相同工具 + 相同参数只真正执行一次
+（`app/agent/idempotency.py`），防止模型重复发调用或路由层首帧重试把加购做两遍。
+
+**能力边界**：AI 的电商能力**止于加入购物车**——下单、支付、取消订单一律不开放给模型，交易闭环
+由用户在 App 完成。用户说「帮我下单」时，模型会说明商品已在购物车并引导去结算，不会声称已下单。
+商品检索只返回**当前可购买**的商品（上架、有库存、店铺正常营业），并裁掉 `merchantId`、店铺状态、
+审核字段等用户看不到的信息；社区动态同样只投影作者昵称、点赞数等展示字段。删除动态 / 评论 / 宠物
+不开放给模型。
+
+**敏感操作人工审批（Human-in-the-loop）**：发布动态在工具内调用 `interrupt()`，**整张图会在写库前
+挂起**，SSE 下发 `approval` 帧（含可见性与内容摘要），本轮没有 `done`。前端弹审批卡片，用户点
+「同意 / 拒绝」后调用 `POST /api/ai/chat/approve`，服务端用 `Command(resume=...)` 从断点继续：
+同意才真正下发写请求，拒绝则把「用户未批准」写回 ToolMessage 让模型继续对话。审批现场存在
+checkpoint 里，**没有 checkpointer 时直接拒绝执行（失败关闭）**，不会退化成「自动放行」。
+中断恢复时被挂起的节点会从头重跑，因此挂起前只做只读查询，写请求全部在审批之后。
+设计说明见 `docs/AI自主Agent重构方案.md`。
 
 **对话记忆（LangGraph 官方 checkpoint）**：对话图编译时注入 `PostgresSaver`（`langgraph-checkpoint-postgres`），图状态 `messages` 按 `thread_id = 用户:会话` 在每个超级步自动持久化到 PostgreSQL，下一轮对话自动恢复上下文。用户点击「停止生成」时，路由层把「问题 + 已产出的部分回复（`interrupted` 标记）」经 `aupdate_state` 补写回图状态——被中止的轮次同样进入后续对话的记忆，不再「暂停即失忆」。
 
@@ -83,6 +112,8 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
+| `AGENT_MAX_STEPS` / `AGENT_TOOL_GROUPS` | 单轮最多几轮「模型 → 工具」循环（超限强制收敛）/ 启用的工具分组（默认 `knowledge,pet,shop,cart,community,interaction,pet_edit,profile`；`content` 评论·发动态默认关闭，关掉即让模型看不见该组工具） |
+| `AGENT_APPROVAL_TOOLS` | 需要人工审批的工具（默认 `publish_post`）；命中时图挂起等前端审批，依赖 checkpoint，无 checkpointer 时直接拒绝执行 |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
@@ -132,7 +163,8 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 
 | 方法 | 网关路径（前端调用） | 说明 |
 |---|---|---|
-| POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}`；首帧 `meta` 回传 sessionId，随后 `refs` 帧推送引用来源 |
+| POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}`；首帧 `meta` 回传 sessionId，随后 `refs` 帧推送引用来源；命中敏感操作时下发 `approval` 帧并挂起 |
+| POST | `/api/ai/chat/approve` | 人工审批敏感操作并从断点继续；体 `{"sessionId","approvalId","approved","reason"}`，返回 SSE 流 |
 | GET | `/api/ai/chat/history?sessionId=` | 查询会话历史（PostgreSQL，时间正序；助手消息带 `refs`） |
 | GET | `/api/ai/chat/sessions` | 用户全部会话（跨宠物，最近活跃在前） |
 | DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint 记忆） |
@@ -150,7 +182,7 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 说明：
 
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
-- SSE 事件：`meta` → `refs`（有知识命中时）→ `delta` * n → `done`；异常时 `error` 后结束流。`refs` 载荷为 `{"type":"refs","items":[{rank,docId,source,docTitle,kind,section,category,score,matchedBy,snippet}]}`，在答案首字之前到达。
+- SSE 事件：`meta` → `refs`（有知识命中时）→ `delta` * n → `done`；命中人工审批时，在 `delta` 之后下发 `approval` 并结束本次流（**没有 `done`**），前端调 `/api/ai/chat/approve` 继续；异常时 `error` 后结束流。`refs` 载荷为 `{"type":"refs","items":[{rank,docId,source,docTitle,kind,section,category,score,matchedBy,snippet}]}`，在答案首字之前到达；`approval` 载荷为 `{"type":"approval","approvalId","action","title","summary":[{label,value}],"resource"}`。
 - **知识库 `/api/ai/kb/*` 四个接口一律管理员限定**：凭网关注入的 `X-User-Role`（网关会先剥离客户端同名头，值取自 JWT 的角色声明）判定，非 `ADMIN` 返回 `{"code":403,"msg":"仅管理员可管理知识库"}`。`KB_ADMIN_TOKEN` / 请求头 `X-Kb-Admin` 是留给「不经网关直连本服务跑运维脚本」的**备选凭证**，与管理员角色二选一即可——没有这条通道时，任何能直接访问 8086 的进程伪造一个 `X-User-Role: ADMIN` 就能改写全用户共享的检索语料。前端路由 `meta.roles: ['ADMIN']` 与顶栏入口同样只对管理员可见。
 - 评论摘要结果缓存于 Redis + PostgreSQL `ai_cache` 两级；推荐结果只缓存于 Redis（5 分钟），Redis 未命中时直接重新查询业务数据，`refresh=true` 可跳过推荐缓存强制刷新。
 - Embedding 或向量库不可用时知识类提问直接报错（不降级）；知识库为空时报错提示先跑导入脚本。

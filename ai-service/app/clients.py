@@ -1,8 +1,8 @@
 """下游业务微服务 HTTP 客户端。
 
 职责：ai-service 需要宠物档案、订单、购物车、评价、社区动态等真实数据来做上下文注入与
-推荐重排，这些数据分散在 pet / space / shop 等 Java 微服务里。本模块提供**只读**的统一访问层：
-共享一个连接池、自动注入内部用户标识、把所有异常压成「空结果」。
+推荐重排，这些数据分散在 pet / space / shop 等 Java 微服务里。本模块提供统一访问层：
+共享一个连接池、自动注入内部用户标识，并把**读**与**写**的错误语义分开处理。
 
 主要导出：
     - ``BizClient``  业务接口客户端（含各业务语义方法）
@@ -15,11 +15,14 @@
     from app.clients import biz
 
     pets = await biz.get_my_pets(user_id=42)
-    posts = await biz.search_posts("猫砂", limit=8, user_id=42)
+    resp = await biz.request("POST", settings.SHOP_SERVICE_URL, "/shop/cart",
+                             json={"productId": 9, "quantity": 2}, user_id=42)
 
-设计取舍：所有方法**不抛业务异常**，失败一律返回空列表 / None。原因是这些数据只用于
-「给回答补充背景」，拉不到时应当退化为通用回答，而不是让用户看到 500。
-需要强一致性的写操作不要放到这里。
+读 / 写两种契约（刻意不统一）：
+    - ``get`` 系列：失败一律返回空列表 / None。这些数据只用于「给回答补充背景」，
+      拉不到时应退化为通用回答，而不是让用户看到 500。
+    - ``request``：返回 ``{ok, code, msg, data}``，**保留业务错误**。加购失败要告诉用户
+      「库存不足」，而不是静默当作成功——写操作不能降级。
 """
 
 import logging
@@ -108,6 +111,62 @@ class BizClient:
             logger.warning("业务接口调用失败（降级为空）: %s%s", base_url, path, exc_info=True)
             return None
 
+
+    async def request(self, method: str, base_url: str, path: str, *,
+                      json: Optional[dict] = None, params: Optional[dict] = None,
+                      user_id: int = 0) -> dict:
+        """发起一次写请求，并**保留**下游的业务错误。
+
+        与 ``get`` 的契约刻意不同：写操作不能「失败当成功」。加购失败要如实告诉用户
+        「库存不足 / 商品已下架」，否则模型会向用户宣布一个并未发生的操作。
+
+        Args:
+            method: HTTP 方法（``POST`` / ``PUT`` / ``DELETE``）。
+            base_url: 目标服务根地址。
+            path: 接口路径，如 ``/shop/cart``。
+            json: 请求体；None 表示无 body。
+            params: 查询参数；None 表示不带参数。
+            user_id: 大于 0 时注入 ``X-User-Id`` 头（下游据此确定操作者）。
+
+        Returns:
+            ``{"ok": bool, "code": int, "msg": str, "data": Any}``。
+            网络异常与超时也走同一结构（``code=500``、``msg`` 为可直接展示的中文）。
+
+        Raises:
+            无——所有异常都收敛成上面的结构，调用方只需判断 ``ok``。
+        """
+        headers = {}
+        if user_id and user_id > 0:
+            headers["X-User-Id"] = str(user_id)
+        try:
+            resp = await self._get_client().request(
+                method, base_url + path, json=json, params=params, headers=headers)
+        except Exception:
+            logger.warning("业务写接口调用失败: %s %s%s", method, base_url, path, exc_info=True)
+            return {"ok": False, "code": 500, "msg": "服务暂时不可用，请稍后再试", "data": None}
+
+        if resp.status_code != 200:
+            logger.warning("业务写接口返回非 200: %s %s%s -> %s", method, base_url, path, resp.status_code)
+            return {"ok": False, "code": resp.status_code,
+                    "msg": f"服务返回异常（{resp.status_code}），请稍后再试", "data": None}
+
+        try:
+            body = resp.json()
+        except Exception:
+            logger.warning("业务写接口响应无法解析: %s %s%s", method, base_url, path, exc_info=True)
+            return {"ok": False, "code": 500, "msg": "服务响应异常，请稍后再试", "data": None}
+
+        # 标准 {code,msg,data} 报文：业务码非 200 视为失败，但 msg 原样透出（如「库存不足」）。
+        if isinstance(body, dict) and "code" in body:
+            ok = body.get("code") == 200
+            return {
+                "ok": ok,
+                "code": int(body.get("code") or 500),
+                "msg": str(body.get("msg") or ("操作成功" if ok else "操作失败")),
+                "data": body.get("data"),
+            }
+        # 少数老接口直接返回裸数据，视为成功。
+        return {"ok": True, "code": 200, "msg": "操作成功", "data": body}
 
     async def get_my_pets(self, user_id: int) -> List[dict]:
         """查询用户名下的宠物档案列表。

@@ -5,9 +5,9 @@
 schema，也是接口返回体），分开维护必然漂移。
 
 主要导出：
-    - 接口层：``ChatRequest`` / ``AttachmentInfo`` / ``SessionListData`` / ``HistoryData``
+    - 接口层：``ChatRequest`` / ``ApprovalRequest`` / ``AttachmentInfo`` / ``SessionListData`` / ``HistoryData``
     - 通用报文：``ok`` / ``fail``（全站统一 HTTP 200 + ``{code,msg,data}``）
-    - 结构化输出：``IntentResult`` / ``SearchQuery`` / ``PetHealthReport`` / ``ReviewSummary``
+    - 结构化输出：``SearchQuery`` / ``PetHealthReport`` / ``ReviewSummary``
       / ``RecommendResult`` / ``MemoryUpdateResult``
     - 共享枚举：``IntentType`` / ``MemoryKind``
 
@@ -78,6 +78,19 @@ class ChatRequest(BaseModel):
     # 数量上限由 settings.CHAT_MAX_ATTACHMENTS 在路由层校验，这里不写死。
     attachments: List[AttachmentInfo] = Field(default_factory=list,
                                              description="本轮多模态附件（图片/音频/视频），先经 /ai/chat/upload 上传")
+
+
+class ApprovalRequest(BaseModel):
+    """敏感操作的人工审批请求体。
+
+    由前端在收到 SSE ``approval`` 帧后提交：批准则图从挂起点继续执行，拒绝则工具直接
+    返回「未批准」，两者都会继续跑完这一轮对话（后续仍由模型给出说明）。
+    """
+
+    sessionId: int = Field(description="会话 ID")
+    approvalId: str = Field(default="", description="审批单 ID，取自 SSE approval 帧；用于防止旧审批被重放")
+    approved: bool = Field(description="是否批准本次操作")
+    reason: str = Field(default="", description="拒绝原因（可选），会转述给用户与模型，最多 200 字")
 
 
 class SessionItem(BaseModel):
@@ -155,19 +168,6 @@ def fail(code: int, msg: str) -> dict:
         无。
     """
     return {"code": code, "msg": msg, "data": None}
-
-
-# 意图枚举与 chat_graph 的提示词、路由判断共用一套取值，新增取值需同步
-# _KB_INTENTS / _route_after_classify，否则新增意图不会触发任何分支。
-IntentType = Literal["chitchat", "knowledge", "health", "medical_urgent", "tool_query"]
-
-
-class IntentResult(BaseModel):
-    """多意图识别结果（可为多选）。"""
-
-    intents: List[IntentType] = Field(
-        description="用户本轮问题命中的全部意图，可多选；命中多个时全部返回，至少返回一个")
-    reason: str = Field(default="", description="简要说明分类依据")
 
 
 class SearchQuery(BaseModel):

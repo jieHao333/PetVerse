@@ -157,6 +157,22 @@ class Settings(BaseSettings):
     # 单轮注入 Prompt 的记忆条数上限，同时也是召回条数上限。
     MEMORY_MAX_ITEMS: int = 20
 
+    # ── 自主 Agent（AgentLoop） ────────────────────────────────────────────
+    # 单轮对话内最多允许「模型 → 工具」循环几次。超限后强制收敛为一次无工具作答，
+    # 防止模型反复查同一件事把成本与延迟拉爆；3 轮足够覆盖「先查档案再查订单」这类组合问题。
+    AGENT_MAX_STEPS: int = 3
+    # 启用的工具分组（逗号分隔），未知分组会被忽略。关掉某组等价于让模型「看不见」这些工具，
+    # 比在提示词里劝它别调用更可靠。
+    # 只读：knowledge / pet / shop / community / profile
+    # 写操作：cart 购物车 · interaction 点赞 · pet_edit 档案维护（默认开启，可撤销）
+    #         content 评论/发动态（默认关闭，公开发布）
+    # 注意：下单与支付**不是可配置分组**——交易闭环不开放给模型，AI 的电商能力止于加购。
+    AGENT_TOOL_GROUPS: str = "knowledge,pet,shop,cart,community,interaction,pet_edit,profile"
+    # 需要人工审批（Human-in-the-loop）的工具，逗号分隔。命中时图会在工具执行前挂起，
+    # 由前端弹审批卡片、用户确认后才继续；依赖 checkpoint 保存现场，无 checkpointer 时直接拒绝执行。
+    # 默认只保护公开发布；交易类工具已整体下线，不在候选列表里。
+    AGENT_APPROVAL_TOOLS: str = "publish_post"
+
     # ── 生成参数 ──────────────────────────────────────────────────────────
     LLM_MAX_TOKENS: int = 512
     LLM_TEMPERATURE: float = 0.8

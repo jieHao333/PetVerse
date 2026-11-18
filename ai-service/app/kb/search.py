@@ -46,7 +46,8 @@ class RagUnavailable(Exception):
     """知识检索不可用。
 
     刻意不做静默降级：知识类提问若拿不到依据却照常作答，会产出「听起来很确定但无出处」的
-    内容，比明确报错更有害。调用方（chat_graph）让它向上抛，由路由层转成 error 帧。
+    内容，比明确报错更有害。调用方（``app.agent.tools.knowledge``）让它向上抛，由路由层
+    转成 error 帧。
     """
 
 async def retrieve(query: str, k: Optional[int] = None,

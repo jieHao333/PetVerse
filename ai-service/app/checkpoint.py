@@ -18,7 +18,7 @@ psycopg 异步连接，而本服务运行在 Windows 默认的 ProactorEventLoop
     from app import checkpoint
 
     config = checkpoint.thread_config(user_id=42, session_id=7)
-    graph = get_chat_graph()                      # 编译时已注入 checkpoint.get_saver()
+    graph = get_chat_agent()                      # 编译时已注入 checkpoint.get_saver()
     state = await graph.aget_state(config)        # 取回上一轮上下文
 
 设计取舍：所有读失败一律降级为「无历史」、写失败仅记日志。记忆是增强项，

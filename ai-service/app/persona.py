@@ -22,6 +22,8 @@
 改动前请确认与前端「引用来源」面板的解析逻辑一致。
 """
 
+from typing import List
+
 from app.schemas import PetInfo
 
 # 模板占位符必须与 build_system_prompt 的 format 参数一一对应；
@@ -71,25 +73,22 @@ _HEALTH_LABELS = {
 }
 
 
-def build_system_prompt(pet: PetInfo, memory_context: str = "",
-                        knowledge_context: str = "", tool_context: str = "",
-                        medical: bool = False) -> str:
-    """组装本轮对话的 System Prompt。
+def render_profile_lines(pet: PetInfo) -> List[str]:
+    """把宠物档案渲染成「- 标签：值」的行列表。
+
+    抽成公共函数是因为两条 Prompt 组装链路（固定编排图 / 自主 Agent）都要用同一份
+    字段口径——档案字段的中文标签只维护一处，避免两边漂移。
 
     Args:
-        pet: 当前咨询的宠物档案；字段全空时整段「宠物档案」都会省略。
-        memory_context: 长期记忆文本（每行一条，已带 ``- [归属]`` 前缀）。
-        knowledge_context: 知识库检索结果（已格式化，每条以 ``[n]`` 开头）。
-        tool_context: 工具查询到的真实业务数据（宠物 / 订单 / 购物车 / 评论等）。
-        medical: 是否命中医疗 / 急症意图；True 时追加就医护栏。
+        pet: 宠物档案；字段为空时对应行直接省略。
 
     Returns:
-        完整的 System Prompt 字符串。
+        形如 ``["- 名字：豆豆", "- 物种：猫"]`` 的列表；全空时返回空列表。
 
     Raises:
-        无（所有输入都做了空值与类型兜底）。
+        无。
     """
-    profile_lines = []
+    profile_lines: List[str] = []
     name = (pet.name or "").strip()
     if name:
         profile_lines.append(f"- 名字：{name}")
@@ -111,6 +110,28 @@ def build_system_prompt(pet: PetInfo, memory_context: str = "",
         value = (health.get(key) or "").strip()
         if value:
             profile_lines.append(f"- {label}：{value}")
+    return profile_lines
+
+
+def build_system_prompt(pet: PetInfo, memory_context: str = "",
+                        knowledge_context: str = "", tool_context: str = "",
+                        medical: bool = False) -> str:
+    """组装本轮对话的 System Prompt。
+
+    Args:
+        pet: 当前咨询的宠物档案；字段全空时整段「宠物档案」都会省略。
+        memory_context: 长期记忆文本（每行一条，已带 ``- [归属]`` 前缀）。
+        knowledge_context: 知识库检索结果（已格式化，每条以 ``[n]`` 开头）。
+        tool_context: 工具查询到的真实业务数据（宠物 / 订单 / 购物车 / 评论等）。
+        medical: 是否命中医疗 / 急症意图；True 时追加就医护栏。
+
+    Returns:
+        完整的 System Prompt 字符串。
+
+    Raises:
+        无（所有输入都做了空值与类型兜底）。
+    """
+    profile_lines = render_profile_lines(pet)
 
     # 四段上下文都是「有内容才插入」：空标题会让模型以为该段信息缺失并主动追问，
     # 反而制造出「请问您的宠物叫什么」这类无意义反问。
