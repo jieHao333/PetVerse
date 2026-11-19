@@ -1,11 +1,6 @@
 # =============================================================
-# 将本目录下的 *.yml 配置导入 Nacos 配置中心
-# dataId = 文件名去掉 .yml 后缀（如 shop-service.yml -> dataId=shop-service），group=DEFAULT_GROUP，格式=yaml
-# 用法：在 nacos-config 目录执行  powershell -ExecutionPolicy Bypass -File .\push-to-nacos.ps1
-# 可通过环境变量覆盖：
-#   NACOS_ADDR      Nacos 地址（默认 localhost:8848）
-#   NACOS_GROUP     分组（默认 DEFAULT_GROUP）
-#   NACOS_NAMESPACE 命名空间 id（public 留空；自定义命名空间填其 id）
+# 本文件是微服务版本的Java配置导入nacos脚本
+# 使用poweshell在当前目录下执行该脚本即可
 # =============================================================
 $ErrorActionPreference = "Stop"
 $addr   = if ($env:NACOS_ADDR)      { $env:NACOS_ADDR }      else { "localhost:8848" }
