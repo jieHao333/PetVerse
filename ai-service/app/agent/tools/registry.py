@@ -51,13 +51,16 @@ logger = logging.getLogger(__name__)
 # 全部分组，顺序即工具在提示词与模型候选列表中的顺序：知识检索最常用，放最前；
 # 写操作靠后，减少模型在「只读场景」里被写工具分散注意力的概率。
 ALL_GROUPS: tuple[str, ...] = (
-    "knowledge", "pet", "shop", "cart", "community", "interaction", "pet_edit", "content", "profile",
+    "knowledge", "pet", "shop", "cart", "community", "interaction", "pet_edit",
+    "publish", "content", "profile",
 )
 
 # 有副作用的分组：用于提示词里追加「操作类规则」，也用于默认关闭高风险能力。
 # 注意 ``order``（下单/支付）不在此列——交易类动作不开放给模型，见 actions.py 的能力边界说明。
-WRITE_GROUPS = frozenset({"cart", "interaction", "pet_edit", "content"})
+WRITE_GROUPS = frozenset({"cart", "interaction", "pet_edit", "publish", "content"})
 # 默认不开启的分组：公开发布需要显式配置后才交给模型。
+# ``publish`` 不在此列：发布动态虽属公开发布，但每一次都由人工审批把关（见 AGENT_APPROVAL_TOOLS），
+# 默认交给模型才能让「帮我发条动态」这件事办得成。``content``（评论）尚无审批，保持默认关闭。
 DEFAULT_OFF_GROUPS = frozenset({"content"})
 
 # 不需要用户身份的分组：未登录也该能查知识库（虽然当前路由层已拦截未登录）。
@@ -91,7 +94,9 @@ _BUILDERS: Dict[str, Callable[[ToolContext], List[BaseTool]]] = {
     "community": lambda ctx: build_community_tools(ctx.user_id),
     "interaction": lambda ctx: [like_post, unlike_post],
     "pet_edit": lambda ctx: [register_pet, update_pet_health],
-    "content": lambda ctx: [comment_post, publish_post],
+    # 发布与评论分开：发布走人工审批、默认开启；评论没有审批、默认关闭。
+    "publish": lambda ctx: [publish_post],
+    "content": lambda ctx: [comment_post],
     "profile": lambda ctx: build_profile_tools(ctx.user_id),
 }
 
@@ -114,7 +119,8 @@ def enabled_groups() -> List[str]:
 
     Returns:
         合法且启用中的分组名列表（保持 ``ALL_GROUPS`` 的顺序）；配置为空时退回默认分组
-        （不含 ``content``）。非法分组名只记日志、不抛异常——配错一个词
+        （不含 ``content``）。显式配置 ``content`` 时会连带启用 ``publish``（兼容旧语义）。
+        非法分组名只记日志、不抛异常——配错一个词
         不该让整个对话服务起不来。
 
     Raises:
@@ -127,6 +133,10 @@ def enabled_groups() -> List[str]:
     unknown = wanted - set(ALL_GROUPS)
     if unknown:
         logger.warning("AGENT_TOOL_GROUPS 含未知分组，已忽略: %s", sorted(unknown))
+    # 兼容旧配置：``content`` 历史上同时包含评论与发布，现在发布单独成组（便于单独审批）；
+    # 显式写了 ``content`` 的部署继续同时得到两者，避免升级后「发动态」突然消失。
+    if "content" in wanted:
+        wanted.add("publish")
     groups = [g for g in ALL_GROUPS if g in wanted]
     if not groups:
         logger.warning("AGENT_TOOL_GROUPS 未匹配到任何合法分组，回退为默认分组: %r", raw)

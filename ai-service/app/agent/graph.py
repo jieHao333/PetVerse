@@ -46,7 +46,7 @@ from app import checkpoint, memstore
 from app.agent.policy import classify_hints, repair_dangling_tool_calls, trim_history
 from app.agent.prompt import build_agent_prompt
 from app.agent.state import AgentState, initial_state
-from app.agent.tools import ToolContext, build_tools, has_write_tools
+from app.agent.tools import ToolContext, build_tools, enabled_groups, has_write_tools
 from app.config import settings
 from app.kb import search as kb_search
 from app.llm import get_client, get_vision_client
@@ -211,6 +211,9 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         knowledge = hits or []
         knowledge_text = kb_search.format_context(knowledge)
 
+    # 提示词里的能力描述必须与本次实际绑定的工具一致：多写一段「发布会审批」，
+    # 模型就会去调一个不存在的工具，然后回复「我没有这个权限」。
+    groups = enabled_groups()
     system_prompt = build_agent_prompt(
         pet,
         memory_context=memory_text,
@@ -218,7 +221,8 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         medical=medical,
         needs_evidence=needs_evidence,
         tools_enabled=not vision,
-        write_actions=has_write_tools() and not vision,
+        write_actions=has_write_tools(groups) and not vision,
+        publish_action="publish" in groups and not vision,
         max_steps=settings.AGENT_MAX_STEPS,
     )
     logger.info(

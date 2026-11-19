@@ -16,6 +16,12 @@
 
 import logging
 
+# 第三方日志降噪名单：``httpx`` 对**每个**出站请求都会打一条 INFO，而 Nacos 心跳
+# 每 5 秒一次、对话时的 LLM 调用与内部服务调用同样走 httpx，若不压制会持续刷屏。
+# 这里只收紧「每个请求一行 INFO」这一档噪音，WARNING/ERROR（真正的连接失败、
+# 超时、非 2xx 响应）仍然照常输出，不影响排查。
+_THIRD_PARTY_LOGGERS = ("httpx", "httpcore")
+
 
 def setup_logging(level: int = logging.INFO) -> None:
     """配置根 logger 的输出级别与格式。
@@ -25,6 +31,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 
     Args:
         level: 根 logger 级别，默认 ``logging.INFO``；传入 ``DEBUG`` 可看到检索/工具链路的细节。
+            传入 ``DEBUG`` 时第三方 HTTP 日志不再降噪，可看到每条出站请求。
 
     Returns:
         None。配置直接作用于全局 logging 状态。
@@ -36,3 +43,7 @@ def setup_logging(level: int = logging.INFO) -> None:
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    # 业务日志由根级别控制，第三方 HTTP 客户端单独收紧：默认只保留 WARNING 及以上。
+    third_party_level = level if level <= logging.DEBUG else logging.WARNING
+    for name in _THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(third_party_level)

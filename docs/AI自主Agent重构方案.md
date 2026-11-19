@@ -341,7 +341,8 @@ AI 该替代用户做「表达与选择」，不该替代用户做「授权与�
 | `cart` | `add_to_cart` / `update_cart_quantity` / `remove_from_cart` | `POST`·`PUT /shop/cart`、`DELETE /shop/cart/{id}` | **开** | 可撤销（重新加购即可） |
 | `interaction` | `like_post` / `unlike_post` | `POST`·`DELETE /remark/like/0/{id}` | **开** | 幂等、可撤销 |
 | `pet_edit` | `register_pet` / `update_pet_health` | `POST /pet/register`、`PUT /pet/health` | **开** | 仅影响本人档案 |
-| `content` | `comment_post` / `publish_post` | `POST /remark/comment`、`POST /space` | 关 | 公开发布，影响他人可见内容 |
+| `publish` | `publish_post` | `POST /space` | **开**（逐次审批） | 公开发布，写库前 `interrupt()` 挂起等用户确认 |
+| `content` | `comment_post` | `POST /remark/comment` | 关 | 公开发布，当前未接审批，保持默认关闭 |
 
 **刻意不在清单里的**：下单、支付、取消订单。理由见 7.3。
 
@@ -375,7 +376,8 @@ AI 该替代用户做「表达与选择」，不该替代用户做「授权与�
 
 公开发布（`publish_post`）属于「必须由 AI 发起、但要人把关」的动作，用 Human-in-the-loop：
 
-1. **可见性（配置层）**：`content` 分组默认关闭，模型看不见这些工具。
+1. **可见性（配置层）**：`publish` 单独成组、默认开启——它能开启的前提是第 2 条的审批兜底；
+   评论（`content`）没有审批，仍默认关闭。关掉分组等价于让模型看不见工具。
 2. **人工审批（工具层）**：写库前 `interrupt()` 挂起整图，前端弹卡片，用户批准后才继续。
    **批准动作发生在一次独立的 HTTP 请求里，由用户触发，模型无法自己「点同意」。**
 3. **幂等（运行时层）**：`run_id` + 工具名 + 参数指纹，同轮同参数只执行一次。加购是累加语义，
@@ -405,6 +407,10 @@ SSE: meta → delta* → done      （批准：先发动态，再由模型给出
 - **待审批期间发新消息**：LangGraph 会丢弃挂起任务按新输入继续，历史里留下「有 tool_calls
   无结果」的半截调用——由 `policy.repair_dangling_tool_calls` 在下次构造模型输入时补齐。
 - **一次只审批一个**：提示词要求需要审批的操作单独调用，不要与其他工具并发。
+- **前端实现**：`chatStream` 把 `approval` 当作本轮终止帧（不触发 `onDone`、保持「生成中」），
+  在气泡下方渲染审批卡片；用户决定后 `approveChat` 走 `POST /ai/chat/approve` 续流，
+  后续 `delta` 追加到同一个气泡。挂起期间输入区只显示「待确认」，既不能发送也不能停止，
+  避免同一 thread 上叠加新的运行把 checkpoint 现场冲掉。
 
 ### 7.6 刻意不做的
 

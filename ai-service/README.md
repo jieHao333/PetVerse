@@ -112,7 +112,7 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
-| `AGENT_MAX_STEPS` / `AGENT_TOOL_GROUPS` | 单轮最多几轮「模型 → 工具」循环（超限强制收敛）/ 启用的工具分组（默认 `knowledge,pet,shop,cart,community,interaction,pet_edit,profile`；`content` 评论·发动态默认关闭，关掉即让模型看不见该组工具） |
+| `AGENT_MAX_STEPS` / `AGENT_TOOL_GROUPS` | 单轮最多几轮「模型 → 工具」循环（超限强制收敛）/ 启用的工具分组（默认 `knowledge,pet,shop,cart,community,interaction,pet_edit,publish,profile`；`publish` 发布动态默认开启但每次都会挂起等审批，`content` 评论默认关闭，关掉即让模型看不见该组工具） |
 | `AGENT_APPROVAL_TOOLS` | 需要人工审批的工具（默认 `publish_post`）；命中时图挂起等前端审批，依赖 checkpoint，无 checkpointer 时直接拒绝执行 |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |

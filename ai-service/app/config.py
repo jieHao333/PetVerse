@@ -164,10 +164,11 @@ class Settings(BaseSettings):
     # 启用的工具分组（逗号分隔），未知分组会被忽略。关掉某组等价于让模型「看不见」这些工具，
     # 比在提示词里劝它别调用更可靠。
     # 只读：knowledge / pet / shop / community / profile
-    # 写操作：cart 购物车 · interaction 点赞 · pet_edit 档案维护（默认开启，可撤销）
-    #         content 评论/发动态（默认关闭，公开发布）
+    # 写操作：cart 购物车 · interaction 点赞 · pet_edit 档案维护（可撤销）
+    #         publish 发布动态（默认开启；每一次都走人工审批，见下方 AGENT_APPROVAL_TOOLS）
+    #         content 评论（默认关闭，公开发布且暂无审批）
     # 注意：下单与支付**不是可配置分组**——交易闭环不开放给模型，AI 的电商能力止于加购。
-    AGENT_TOOL_GROUPS: str = "knowledge,pet,shop,cart,community,interaction,pet_edit,profile"
+    AGENT_TOOL_GROUPS: str = "knowledge,pet,shop,cart,community,interaction,pet_edit,publish,profile"
     # 需要人工审批（Human-in-the-loop）的工具，逗号分隔。命中时图会在工具执行前挂起，
     # 由前端弹审批卡片、用户确认后才继续；依赖 checkpoint 保存现场，无 checkpointer 时直接拒绝执行。
     # 默认只保护公开发布；交易类工具已整体下线，不在候选列表里。
