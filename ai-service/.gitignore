@@ -7,3 +7,5 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+skills/*
+mcp_servers/*
