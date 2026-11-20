@@ -130,6 +130,10 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
         if (path.startsWith("/api/data/admin") && !ROLE_ADMIN.equals(role)) {
             return forbidden(exchange, "无管理员权限，若刚变更角色请退出后重新登录");
         }
+        // AI 扩展管理端接口（MCP / Skill 配置）仅限管理员访问
+        if (path.startsWith("/api/ai/admin") && !ROLE_ADMIN.equals(role)) {
+            return forbidden(exchange, "无管理员权限，若刚变更角色请退出后重新登录");
+        }
         // 商家端接口仅限商家/管理员访问
         if (path.startsWith("/api/shop/merchant") && !ROLE_MERCHANT.equals(role) && !ROLE_ADMIN.equals(role)) {
             return forbidden(exchange, "无商家权限，若刚通过入驻审批请退出后重新登录");

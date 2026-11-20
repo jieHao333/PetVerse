@@ -5,7 +5,8 @@
 
 主要导出：
     - ``ToolContext``    构造工具所需的运行时上下文
-    - ``build_tools``    按分组装配工具列表
+    - ``build_tools``    按分组装配内置工具列表
+    - ``build_tools_async`` 内置工具 + 管理员配置的 MCP 远程工具（对话链路用这个）
     - ``enabled_groups`` 解析配置里启用的分组
 
 外部依赖：``app.agent.tools.knowledge``、``app.agent.tools.business``、``app.config``。
@@ -44,6 +45,7 @@ from app.agent.tools.business import (
     build_shop_tools,
 )
 from app.agent.tools.knowledge import search_pet_knowledge
+from app.agent.tools.skills import load_skill
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -51,7 +53,7 @@ logger = logging.getLogger(__name__)
 # 全部分组，顺序即工具在提示词与模型候选列表中的顺序：知识检索最常用，放最前；
 # 写操作靠后，减少模型在「只读场景」里被写工具分散注意力的概率。
 ALL_GROUPS: tuple[str, ...] = (
-    "knowledge", "pet", "shop", "cart", "community", "interaction", "pet_edit",
+    "knowledge", "skill", "pet", "shop", "cart", "community", "interaction", "pet_edit",
     "publish", "content", "profile",
 )
 
@@ -64,7 +66,8 @@ WRITE_GROUPS = frozenset({"cart", "interaction", "pet_edit", "publish", "content
 DEFAULT_OFF_GROUPS = frozenset({"content"})
 
 # 不需要用户身份的分组：未登录也该能查知识库（虽然当前路由层已拦截未登录）。
-_ANONYMOUS_GROUPS = frozenset({"knowledge"})
+# skill 加载的是全局技能包，与用户身份无关，同样匿名可用。
+_ANONYMOUS_GROUPS = frozenset({"knowledge", "skill"})
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ def _build_knowledge(_: ToolContext) -> List[BaseTool]:
 # 用户身份与 run_id 通过 InjectedState 在调用时注入（见 actions.py）。
 _BUILDERS: Dict[str, Callable[[ToolContext], List[BaseTool]]] = {
     "knowledge": _build_knowledge,
+    "skill": lambda ctx: [load_skill],
     "pet": lambda ctx: build_pet_tools(ctx.user_id),
     "shop": lambda ctx: build_shop_tools(ctx.user_id),
     "cart": lambda ctx: [add_to_cart, update_cart_quantity, remove_from_cart],
@@ -137,6 +141,9 @@ def enabled_groups() -> List[str]:
     # 显式写了 ``content`` 的部署继续同时得到两者，避免升级后「发动态」突然消失。
     if "content" in wanted:
         wanted.add("publish")
+    # skill 是技能渐进式披露的基础能力（load_skill 工具），始终启用——
+    # 否则旧的 AGENT_TOOL_GROUPS 配置漏写 skill 会让整个技能机制静默失效。
+    wanted.add("skill")
     groups = [g for g in ALL_GROUPS if g in wanted]
     if not groups:
         logger.warning("AGENT_TOOL_GROUPS 未匹配到任何合法分组，回退为默认分组: %r", raw)
@@ -186,4 +193,34 @@ def build_tools(ctx: ToolContext, groups: Optional[Sequence[str]] = None) -> Lis
             tools.extend(builder(ctx))
         except Exception:
             logger.warning("装配工具分组失败，已跳过: group=%s", group, exc_info=True)
+    return tools
+
+
+async def build_tools_async(ctx: ToolContext, groups: Optional[Sequence[str]] = None) -> List[BaseTool]:
+    """内置工具 + 管理员配置的 MCP 远程工具（对话 Agent 的完整工具列表）。
+
+    MCP 工具与内置工具同名时保留内置工具：内置工具的身份隔离与审批语义经过审计，
+    不允许外部服务用一个同名工具把它顶掉。MCP 装配失败只损失远程工具，不影响内置能力。
+
+    Args:
+        ctx: 运行时上下文（用户身份）。
+        groups: 指定分组；None 时读配置 ``AGENT_TOOL_GROUPS``。
+
+    Returns:
+        工具列表（内置在前，MCP 在后）。
+
+    Raises:
+        无——MCP 侧异常已在 extensions 内降级。
+    """
+    from app.agent.extensions import get_mcp_tools
+
+    tools = build_tools(ctx, groups)
+    mcp_tools = await get_mcp_tools()
+    if mcp_tools:
+        builtin_names = {t.name for t in tools}
+        for tool in mcp_tools:
+            if tool.name in builtin_names:
+                logger.warning("MCP 工具与内置工具重名，保留内置工具: tool=%s", tool.name)
+                continue
+            tools.append(tool)
     return tools

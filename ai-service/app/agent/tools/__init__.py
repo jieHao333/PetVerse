@@ -4,7 +4,8 @@
 
 主要导出：
     - ``ToolContext``   构造工具所需的运行时上下文
-    - ``build_tools``   按分组装配工具列表
+    - ``build_tools``   按分组装配内置工具列表
+    - ``build_tools_async`` 内置工具 + MCP 远程工具（对话链路用这个）
     - ``enabled_groups`` 解析配置里启用的分组
     - ``has_write_tools`` 本次是否启用了有副作用的能力
 
@@ -29,6 +30,7 @@ from app.agent.tools.registry import (
     WRITE_GROUPS,
     ToolContext,
     build_tools,
+    build_tools_async,
     enabled_groups,
     has_write_tools,
 )
@@ -38,6 +40,7 @@ __all__ = [
     "WRITE_GROUPS",
     "ToolContext",
     "build_tools",
+    "build_tools_async",
     "enabled_groups",
     "has_write_tools",
     "search_pet_knowledge",

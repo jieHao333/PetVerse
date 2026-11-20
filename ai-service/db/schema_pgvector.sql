@@ -161,3 +161,33 @@ CREATE TABLE IF NOT EXISTS kb_meta
 );
 COMMENT ON TABLE kb_meta IS '知识库元信息（version：BM25 索引版本戳，写入即自增）';
 INSERT INTO kb_meta (key, value) VALUES ('version', 0) ON CONFLICT (key) DO NOTHING;
+
+-- ------------------------------------------------------------
+-- AI 扩展配置（管理员在「AI 扩展管理」页维护，服务启动时也会自动建表）
+--   ai_mcp_server：MCP 服务连接参数，启用中的服务其远程工具会并入对话 Agent。
+--   注：Skill 技能不落数据库，改为磁盘标准技能包 skills/<name>/SKILL.md（见 app/skill_store.py）。
+--       历史版本曾建 ai_skill 表，现已弃用（存量表可保留不动，服务不再读写）。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ai_mcp_server
+(
+    id          BIGSERIAL    PRIMARY KEY,
+    name        VARCHAR(64)  NOT NULL UNIQUE,
+    transport   VARCHAR(16)  NOT NULL DEFAULT 'streamable_http',
+    url         TEXT         NOT NULL DEFAULT '',
+    command     TEXT         NOT NULL DEFAULT '',
+    args        JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    env         JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    headers     JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    description VARCHAR(255) NOT NULL DEFAULT '',
+    enabled     BOOLEAN      NOT NULL DEFAULT TRUE,
+    create_time TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    update_time TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+COMMENT ON TABLE ai_mcp_server IS 'MCP 服务配置（管理员维护；启用中的服务其远程工具并入对话 Agent）';
+COMMENT ON COLUMN ai_mcp_server.transport IS '传输协议：streamable_http / sse / stdio';
+COMMENT ON COLUMN ai_mcp_server.url IS 'streamable_http / sse 的服务地址';
+COMMENT ON COLUMN ai_mcp_server.command IS 'stdio 模式的启动命令（如 npx / uvx / python）';
+COMMENT ON COLUMN ai_mcp_server.args IS 'stdio 模式的命令参数数组';
+COMMENT ON COLUMN ai_mcp_server.env IS 'stdio 模式注入子进程的环境变量';
+COMMENT ON COLUMN ai_mcp_server.headers IS 'HTTP 模式的自定义请求头（如 Authorization）';
+COMMENT ON COLUMN ai_mcp_server.enabled IS '是否启用（停用后模型看不见该服务的工具）';

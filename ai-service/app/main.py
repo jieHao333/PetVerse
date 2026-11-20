@@ -37,10 +37,11 @@ _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PACKAGE_ROOT not in sys.path:
     sys.path.insert(0, _PACKAGE_ROOT)
 
-from app import checkpoint, memory, memstore, nacos_client, persistence, pg_store
+from app import checkpoint, ext_store, memory, memstore, nacos_client, persistence, pg_store
 from app.chat import router as chat_router
 from app.clients import biz
 from app.config import settings
+from app.ext_api import router as ext_router
 from app.health import router as health_router
 from app.kb import store as kb_store
 from app.kb_api import router as kb_router
@@ -89,6 +90,7 @@ async def lifespan(app: FastAPI):
     await checkpoint.init()
     await memstore.init()
     await pg_store.init()
+    await ext_store.init()
     await kb_store.init()
     if settings.RAG_ENABLED and settings.embedding_enabled:
         logger.info("知识库规模: %s", await kb_store.stats())
@@ -104,6 +106,7 @@ async def lifespan(app: FastAPI):
     await checkpoint.close()
     await memstore.close()
     await kb_store.close()
+    await ext_store.close()
     await pg_store.close()
     await persistence.close()
     await memory.close()
@@ -114,6 +117,7 @@ app = FastAPI(title="PetVerse AI Service", lifespan=lifespan)
 
 app.include_router(chat_router)
 app.include_router(kb_router)
+app.include_router(ext_router)
 app.include_router(health_router)
 app.include_router(review_router)
 app.include_router(recommend_router)

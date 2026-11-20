@@ -10,6 +10,7 @@
 | AI 健康智能评估 | 基于宠物档案 + 健康信息生成评分、风险、养护计划、提醒 | `app/graph/health_graph.py` |
 | 商品评论摘要 | 汇总真实评论生成口碑概览（情感 / 优缺点 / 关键词） | `app/graph/review_graph.py` |
 | 个性化推荐 | 结合宠物画像、订单、购物车、评价、动态重排推荐 | `app/graph/recommend_graph.py` |
+| AI 扩展管理（MCP / Skill） | 管理员配置 MCP 远程工具与 Skill 技能指令，热装配进对话 Agent | `app/ext_api.py` / `app/agent/extensions.py` |
 
 **对话架构（`app/agent`，自主 AgentLoop）**：对话链路不再是一张写死的意图图，而是一个
 `prepare → agent ⇄ act → finalize` 的最小循环——**调不调工具、调哪个、调几次、什么时候停，
@@ -22,6 +23,31 @@
 循环有两条确定性边界：`AGENT_MAX_STEPS`（默认 3 轮工具调用）到顶后走 `conclude` 节点、
 不绑工具地强制收敛；知识检索不可用时 `RagUnavailable` 直接上抛（不做「无依据也照答」的静默降级）。
 新增能力只需写一个 `@tool` 并在 `app/agent/tools/registry.py` 登记分组，不用改图、不用改路由。
+
+**AI 扩展（MCP / Skill，管理员配置）**：除内置工具外，管理员可在前端「AI 扩展管理」页
+（`/admin/ai-extensions`，仅 ADMIN）动态接入两类能力：
+
+- **MCP 服务**（存 PostgreSQL `ai_mcp_server`）：经 `langchain-mcp-adapters` 把远程 MCP 服务的工具
+  转成 LangChain 工具并入工具列表，支持 `streamable_http` / `sse`（填 url，可带鉴权 headers）与
+  `stdio`（填 command + args + env）三种传输，配置字段与标准 `mcpServers` 一致。装配在
+  `app/agent/extensions.py`，进程内缓存 + TTL（`MCP_CACHE_TTL`），管理接口写入后立即失效；
+  单个服务不可达 / 超时只跳过该服务，依赖未安装或 PG 不可用时整体降级为空，**不阻断对话**。
+  MCP 工具与内置工具同名时保留内置工具（内置工具的身份隔离与审批语义经过审计）。
+- **Skill 技能**（标准 Agent Skills 范式，存磁盘 `app/skill_store.py`）：每个技能是一个
+  `skills/<name>/SKILL.md` 包——YAML frontmatter（`name` hyphen-case / `description` 单行≤1024，
+  可选 `enabled`）+ Markdown 正文（≤500 行），可附 `scripts/` `references/` `assets/` 资源目录。
+  采用**渐进式披露**：`prepare` 节点只把启用技能的**元数据目录**（name + description）常驻提示词，
+  模型判断相关时调用 `load_skill` 工具按需取回正文（`skill` 工具分组始终启用），资源再按需读取——
+  避免把全部技能正文每轮塞进上下文。技能根目录可用 `SKILLS_DIR` 配置（默认包内 `skills/`）。
+
+> 信任边界：MCP 工具是管理员显式接入的授信能力，**请只接入可信服务**——外部服务暴露的工具
+> 可能带副作用，且不走内置工具的人工审批链路。`AGENT_MCP_ENABLED=false` 可一键停用全部 MCP 装配。
+
+项目自带一对可直接接入的示例：MCP `mcp_servers/petcare_tools.py`（养宠实用计算：年龄换算 /
+喂食量 / 饮水量 / 有毒食物风险初筛，均为只读计算，见 `mcp_servers/README.md`）+ Skill
+`skills/petcare-calc/SKILL.md`（养护计算与中毒初筛的回答流程与安全口径）。MCP 提供「能算什么」，
+Skill 约定「什么时候算、怎么问清输入、怎么呈现、中毒如何安全优先」，二者一同启用既「算得出」又「用得对」。
+Skill 经管理页「新增技能」填写 name / description / 正文即落地为 SKILL.md 包，无需手工建文件。
 
 **写操作（用户能点的按钮）**：除只读查询外，模型还能执行加购 / 改数量 / 移出购物车、点赞、评论、
 发布动态、登记宠物与更新健康档案。`cart` / `interaction` / `pet_edit` 默认开启（可撤销）；
@@ -73,9 +99,10 @@ checkpoint 里，**没有 checkpointer 时直接拒绝执行（失败关闭）**
 
 ```powershell
 # 数据库 petverse_ai 需先存在：CREATE DATABASE petverse_ai;
-# 业务表（chat_session / chat_message）+ pgvector 扩展 + 健康报告 / 缓存表
+# 业务表（chat_session / chat_message）+ pgvector 扩展 + 健康报告 / 缓存表 + MCP 配置（ai_mcp_server）
 psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
-# 会话 / 消息表与 checkpoint 表都会在服务启动时自动创建（幂等），本脚本为手动入口与表结构文档
+# 会话 / 消息表、MCP 配置表与 checkpoint 表都会在服务启动时自动创建（幂等），本脚本为手动入口与表结构文档
+# Skill 技能不落库，是磁盘标准技能包 skills/<name>/SKILL.md（见 app/skill_store.py）
 ```
 
 存量数据迁移（原 MySQL 库 → PostgreSQL，一次性、幂等，保留原会话 ID）：
@@ -109,11 +136,13 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `RAG_QUERY_REWRITE` / `RAG_REWRITE_MIN_CHARS` | 多轮追问改写开关 / 短于此长度必定改写 |
 | `KNOWLEDGE_DIR` / `KB_CHUNK_*` / `EMBED_BATCH_SIZE` | 语料目录 / 切分长度（目标·合并下限·硬上限）/ 单批 Embedding 条数 |
 | `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
+| `SKILLS_DIR` | Skill 技能包根目录（标准 `skills/<name>/SKILL.md`），留空默认包内 `skills/` |
 | `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
 | `AGENT_MAX_STEPS` / `AGENT_TOOL_GROUPS` | 单轮最多几轮「模型 → 工具」循环（超限强制收敛）/ 启用的工具分组（默认 `knowledge,pet,shop,cart,community,interaction,pet_edit,publish,profile`；`publish` 发布动态默认开启但每次都会挂起等审批，`content` 评论默认关闭，关掉即让模型看不见该组工具） |
 | `AGENT_APPROVAL_TOOLS` | 需要人工审批的工具（默认 `publish_post`）；命中时图挂起等前端审批，依赖 checkpoint，无 checkpointer 时直接拒绝执行 |
+| `AGENT_MCP_ENABLED` / `MCP_LOAD_TIMEOUT` / `MCP_CACHE_TTL` | MCP 扩展总开关（默认 true）/ 单服务连接与列工具超时秒数（默认 10）/ 扩展配置进程内缓存 TTL 秒数（默认 60，管理接口写入会立即失效，TTL 兜底多 worker 跨进程刷新） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
 
@@ -174,6 +203,15 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 | POST | `/api/ai/kb/documents` | 上传知识文档（multipart：`file` + 可选 `title`/`category`/`species`）→ 解析切分入库（管理员限定） |
 | DELETE | `/api/ai/kb/documents/{docId}` | 删除文档（管理员限定；`kb_chunk` 外键级联删除含向量的片段，BM25 版本戳 +1 触发索引重建；上传文档的留存原文一并清理，**仓库语料源文件不动**——重新全量重建会把它带回来） |
 | POST | `/api/ai/kb/reindex` | 用仓库语料目录全量重建知识库（管理员限定；同一时刻仅允许一个） |
+| GET | `/api/ai/admin/mcp/servers` | MCP 服务列表（管理员限定；含停用项） |
+| POST | `/api/ai/admin/mcp/servers` | 新增 MCP 服务（管理员限定；体为 name/transport/url/command/args/env/headers/description/enabled） |
+| PUT | `/api/ai/admin/mcp/servers/{id}` | 整体更新 MCP 服务（管理员限定；启停开关也走这里，提交完整配置） |
+| DELETE | `/api/ai/admin/mcp/servers/{id}` | 删除 MCP 服务（管理员限定） |
+| POST | `/api/ai/admin/mcp/servers/{id}/test` | 测试 MCP 连通性并列出其工具（管理员限定；停用中的服务也可测试） |
+| GET | `/api/ai/admin/skills` | Skill 技能包列表（管理员限定；含停用项与正文） |
+| POST | `/api/ai/admin/skills` | 新增 Skill（管理员限定；体为 name(hyphen-case)/description(单行)/content/enabled，落地 SKILL.md 包） |
+| PUT | `/api/ai/admin/skills/{name}` | 整体更新 Skill（管理员限定；按技能名，启停也走这里，改名迁移目录） |
+| DELETE | `/api/ai/admin/skills/{name}` | 删除 Skill 技能包（管理员限定；整目录删除） |
 | POST | `/api/ai/health/assess` | 宠物健康评估；体为宠物档案（含 `health`），返回结构化报告 |
 | GET | `/api/ai/health/history?petId=` | 宠物历史健康评估 |
 | POST | `/api/ai/shop/review/summary` | 商品评论摘要；体 `{"productId"}` |
@@ -183,7 +221,7 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 
 - 网关统一 JWT 鉴权后注入 `X-User-Id`；缺失 / 非法返回 `{"code":401,"msg":"未登录"}`。所有业务响应为 HTTP 200 + `{code,msg,data}`。
 - SSE 事件：`meta` → `refs`（有知识命中时）→ `delta` * n → `done`；命中人工审批时，在 `delta` 之后下发 `approval` 并结束本次流（**没有 `done`**），前端调 `/api/ai/chat/approve` 继续；异常时 `error` 后结束流。`refs` 载荷为 `{"type":"refs","items":[{rank,docId,source,docTitle,kind,section,category,score,matchedBy,snippet}]}`，在答案首字之前到达；`approval` 载荷为 `{"type":"approval","approvalId","action","title","summary":[{label,value}],"resource"}`。
-- **知识库 `/api/ai/kb/*` 四个接口一律管理员限定**：凭网关注入的 `X-User-Role`（网关会先剥离客户端同名头，值取自 JWT 的角色声明）判定，非 `ADMIN` 返回 `{"code":403,"msg":"仅管理员可管理知识库"}`。`KB_ADMIN_TOKEN` / 请求头 `X-Kb-Admin` 是留给「不经网关直连本服务跑运维脚本」的**备选凭证**，与管理员角色二选一即可——没有这条通道时，任何能直接访问 8086 的进程伪造一个 `X-User-Role: ADMIN` 就能改写全用户共享的检索语料。前端路由 `meta.roles: ['ADMIN']` 与顶栏入口同样只对管理员可见。
+- **知识库 `/api/ai/kb/*` 与 AI 扩展管理 `/api/ai/admin/*` 接口一律管理员限定**：凭网关注入的 `X-User-Role`（网关会先剥离客户端同名头，值取自 JWT 的角色声明）判定，非 `ADMIN` 返回 `{"code":403,...}`；网关（含单体版 `GatewayAuthFilter`）对 `/api/ai/admin` 前缀也做 ADMIN 校验，与本服务内的校验构成纵深防御。`KB_ADMIN_TOKEN` / 请求头 `X-Kb-Admin` 是留给「不经网关直连本服务跑运维脚本」的**备选凭证**，与管理员角色二选一即可——没有这条通道时，任何能直接访问 8086 的进程伪造一个 `X-User-Role: ADMIN` 就能改写全用户共享的检索语料与扩展配置。前端路由 `meta.roles: ['ADMIN']` 与顶栏入口同样只对管理员可见。
 - 评论摘要结果缓存于 Redis + PostgreSQL `ai_cache` 两级；推荐结果只缓存于 Redis（5 分钟），Redis 未命中时直接重新查询业务数据，`refresh=true` 可跳过推荐缓存强制刷新。
 - Embedding 或向量库不可用时知识类提问直接报错（不降级）；知识库为空时报错提示先跑导入脚本。
 

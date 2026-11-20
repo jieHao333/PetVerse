@@ -43,10 +43,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from app import checkpoint, memstore
+from app.agent.extensions import get_skills_prompt
 from app.agent.policy import classify_hints, repair_dangling_tool_calls, trim_history
 from app.agent.prompt import build_agent_prompt
 from app.agent.state import AgentState, initial_state
-from app.agent.tools import ToolContext, build_tools, enabled_groups, has_write_tools
+from app.agent.tools import ToolContext, build_tools_async, enabled_groups, has_write_tools
 from app.config import settings
 from app.kb import search as kb_search
 from app.llm import get_client, get_vision_client
@@ -198,6 +199,8 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     query = (state.get("query") or "").strip()
     pet = _pet_info(state)
     memory_text = await _recall_memory(state, config)
+    # 管理员配置的技能指令（带进程内缓存，读失败降级为空串，不阻断对话）。
+    skills_text = await get_skills_prompt()
     medical, needs_evidence = classify_hints(query)
 
     attachments = state.get("attachments") or []
@@ -218,6 +221,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
         pet,
         memory_context=memory_text,
         knowledge_context=knowledge_text,
+        skills_context=skills_text,
         medical=medical,
         needs_evidence=needs_evidence,
         tools_enabled=not vision,
@@ -287,7 +291,7 @@ async def call_model(state: AgentState, config: RunnableConfig) -> Dict[str, Any
 
     model = _model_for(state)
     if not state.get("vision"):
-        tools = build_tools(ToolContext(user_id=state.get("user_id", 0)))
+        tools = await build_tools_async(ToolContext(user_id=state.get("user_id", 0)))
         if tools:
             model = model.bind_tools(tools)
 
@@ -321,7 +325,7 @@ async def run_tools(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         ``kb.search.RagUnavailable``：知识库不可用时向上抛（工具执行期异常不被 ToolNode 吞掉）。
     """
     step = int(state.get("step") or 0) + 1
-    tools = build_tools(ToolContext(user_id=state.get("user_id", 0)))
+    tools = await build_tools_async(ToolContext(user_id=state.get("user_id", 0)))
     if not tools:
         # 理论上不会发生（没有工具时模型不会返回 tool_calls），防御性收口，避免死循环。
         logger.warning("收到工具调用但无可用工具，跳过执行")

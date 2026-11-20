@@ -278,3 +278,37 @@ class MemoryUpdateResult(BaseModel):
     """
 
     ops: List[MemoryOp] = Field(default_factory=list, description="本轮需要执行的记忆维护操作；无长期有效信息时为空列表或仅一条 none")
+
+
+class McpServerUpsert(BaseModel):
+    """MCP 服务配置的新增 / 更新请求体（管理员限定接口）。
+
+    传输协议三选一：``streamable_http`` / ``sse`` 填 ``url``（可带 ``headers`` 鉴权头），
+    ``stdio`` 填 ``command`` + ``args``（可带 ``env`` 环境变量）。
+    字段间的组合约束（如 http 必须有 url）在路由层校验，以便返回业务错误码。
+    """
+
+    name: str = Field(min_length=1, max_length=64, description="服务名称（唯一，管理页与日志展示用）")
+    transport: Literal["streamable_http", "sse", "stdio"] = Field(
+        default="streamable_http", description="MCP 传输协议")
+    url: str = Field(default="", max_length=500, description="streamable_http / sse 的服务地址")
+    command: str = Field(default="", max_length=500, description="stdio 模式的启动命令（如 npx / uvx / python）")
+    args: List[str] = Field(default_factory=list, description="stdio 模式的命令参数列表")
+    env: Dict[str, str] = Field(default_factory=dict, description="stdio 模式注入子进程的环境变量")
+    headers: Dict[str, str] = Field(default_factory=dict, description="HTTP 模式的自定义请求头（如 Authorization）")
+    description: str = Field(default="", max_length=255, description="服务用途说明（仅管理页展示）")
+    enabled: bool = Field(default=True, description="是否启用（停用后模型立即看不见该服务的工具）")
+
+
+class SkillUpsert(BaseModel):
+    """Skill 技能包的新增 / 更新请求体（管理员限定接口，标准 Agent Skills 范式）。
+
+    技能落地为 ``skills/<name>/SKILL.md``：``name`` + ``description`` 写入 YAML frontmatter，
+    ``content`` 是 Markdown 正文。``description`` 是技能触发选择的唯一依据，须单行说明
+    「做什么 + 何时用」。格式约束（hyphen-case / 单行 / 行数）在路由层经 skill_store 校验。
+    """
+
+    name: str = Field(min_length=1, max_length=64, description="技能名（hyphen-case，如 petcare-calc），同时是目录名与唯一标识")
+    description: str = Field(min_length=1, max_length=1024, description="单行说明：做什么 + 何时触发（技能选择的唯一依据）")
+    content: str = Field(min_length=1, max_length=20000, description="SKILL.md 正文（Markdown 指令，不超过 500 行）")
+    enabled: bool = Field(default=True, description="是否启用（停用后下一轮对话不再出现在技能目录）")

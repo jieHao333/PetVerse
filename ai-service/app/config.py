@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     KB_STORAGE_DIR: str = ""
     # 不走网关直连本服务跑运维时的备选凭证，与 ADMIN 角色二选一。
     KB_ADMIN_TOKEN: str = ""
+    # Skill 技能包根目录（标准 Agent Skills 范式：每个技能一个 <name>/SKILL.md 包），
+    # 留空回落到包内 skills/（见 skills_dir 属性）。
+    SKILLS_DIR: str = ""
 
     # ── 下游业务微服务（ai-service 直连拉上下文，注入内部 X-User-Id） ─────
     PET_SERVICE_URL: str = "http://127.0.0.1:8081"
@@ -163,16 +166,24 @@ class Settings(BaseSettings):
     AGENT_MAX_STEPS: int = 3
     # 启用的工具分组（逗号分隔），未知分组会被忽略。关掉某组等价于让模型「看不见」这些工具，
     # 比在提示词里劝它别调用更可靠。
-    # 只读：knowledge / pet / shop / community / profile
+    # 只读：knowledge / skill（技能正文按需加载，始终启用）/ pet / shop / community / profile
     # 写操作：cart 购物车 · interaction 点赞 · pet_edit 档案维护（可撤销）
     #         publish 发布动态（默认开启；每一次都走人工审批，见下方 AGENT_APPROVAL_TOOLS）
     #         content 评论（默认关闭，公开发布且暂无审批）
     # 注意：下单与支付**不是可配置分组**——交易闭环不开放给模型，AI 的电商能力止于加购。
-    AGENT_TOOL_GROUPS: str = "knowledge,pet,shop,cart,community,interaction,pet_edit,publish,profile"
+    AGENT_TOOL_GROUPS: str = "knowledge,skill,pet,shop,cart,community,interaction,pet_edit,publish,profile"
     # 需要人工审批（Human-in-the-loop）的工具，逗号分隔。命中时图会在工具执行前挂起，
     # 由前端弹审批卡片、用户确认后才继续；依赖 checkpoint 保存现场，无 checkpointer 时直接拒绝执行。
     # 默认只保护公开发布；交易类工具已整体下线，不在候选列表里。
     AGENT_APPROVAL_TOOLS: str = "publish_post"
+
+    # ── AI 扩展（管理员在后台配置的 MCP 服务与 Skill 技能） ────────────────
+    # MCP 总开关：置 false 时即使库里有启用中的服务也不装配远程工具（Skill 不受此开关影响）。
+    AGENT_MCP_ENABLED: bool = True
+    # 单个 MCP 服务的连接 / 列工具超时（秒）：不可达的服务只拖累装配阶段，不拖死对话。
+    MCP_LOAD_TIMEOUT: float = 10.0
+    # 扩展配置进程内缓存 TTL（秒）：管理接口写入会显式失效，TTL 兜底多 worker 部署的跨进程刷新。
+    MCP_CACHE_TTL: int = 60
 
     # ── 生成参数 ──────────────────────────────────────────────────────────
     LLM_MAX_TOKENS: int = 512
@@ -276,6 +287,12 @@ class Settings(BaseSettings):
         """上传原文的留存目录；未显式配置时取 ``data/kb``（与仓库语料分开，便于区分来源）。"""
         raw = (self.KB_STORAGE_DIR or "").strip()
         return Path(raw) if raw else BASE_DIR / "data" / "kb"
+
+    @property
+    def skills_dir(self) -> Path:
+        """Skill 技能包根目录；未显式配置时取包内 ``skills/``。"""
+        raw = (self.SKILLS_DIR or "").strip()
+        return Path(raw) if raw else BASE_DIR / "skills"
 
 
 # 进程级单例：所有模块统一 ``from app.config import settings`` 复用同一份配置。

@@ -154,8 +154,15 @@ _KNOWLEDGE_TEMPLATE = """## 参考知识（来自养宠知识库，请优先参�
 {knowledge}
 """
 
+# 管理员配置的技能目录：正文由 extensions.get_skills_prompt 拼好（含「## 可用技能（按需加载）」
+# 标题与 name+description 列表），这里只负责按位置插入——放在档案 / 记忆 / 知识之后、能力清单之前。
+# 渐进式披露：此处仅常驻元数据，技能正文由模型经 load_skill 工具按需加载。
+_SKILLS_TEMPLATE = """{skills}
+"""
+
 
 def build_agent_prompt(pet: PetInfo, memory_context: str = "", knowledge_context: str = "",
+                       skills_context: str = "",
                        medical: bool = False, needs_evidence: bool = False,
                        tools_enabled: bool = True, write_actions: bool = False,
                        publish_action: bool = False, max_steps: int = 3) -> str:
@@ -165,6 +172,7 @@ def build_agent_prompt(pet: PetInfo, memory_context: str = "", knowledge_context
         pet: 当前咨询的宠物档案；字段全空时整段档案省略。
         memory_context: 长期记忆文本（每行一条，已带 ``- [归属]`` 前缀）。
         knowledge_context: 预注入的知识片段（仅多模态只读轮次使用；文本轮次由模型自行检索）。
+        skills_context: 管理员配置的技能元数据目录（已含小节标题，空串时整段省略；正文经 load_skill 按需加载）。
         medical: 是否命中医疗 / 急症护栏；True 时追加医疗安全小节。
         needs_evidence: 是否属于知识/健康类问题；True 时强化「先检索再作答」。
         tools_enabled: 本轮是否绑定了工具。多模态轮次不绑工具，此时输出能力清单会误导模型。
@@ -191,6 +199,8 @@ def build_agent_prompt(pet: PetInfo, memory_context: str = "", knowledge_context
         parts.append(_MEMORY_TEMPLATE.format(memory=memory_context.strip()))
     if (knowledge_context or "").strip():
         parts.append(_KNOWLEDGE_TEMPLATE.format(knowledge=knowledge_context.strip()))
+    if (skills_context or "").strip():
+        parts.append(_SKILLS_TEMPLATE.format(skills=skills_context.strip()))
 
     if tools_enabled:
         parts.append(_TOOL_SECTION)

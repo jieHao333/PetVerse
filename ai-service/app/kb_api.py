@@ -31,6 +31,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, Header, Path, Query, Response, UploadFile
 from fastapi.responses import JSONResponse
 
+from app.admin_auth import admin_denied
 from app.config import settings
 from app.kb import documents, ingest, lexicon, store
 from app.kb.documents import DocParseError, SUPPORTED_SUFFIXES, normalize_species
@@ -84,58 +85,6 @@ def _inside_allowed_dirs(target: FsPath) -> bool:
     return False
 
 
-def _parse_uid(raw: Optional[str]) -> Optional[int]:
-    """解析请求头里的用户 ID。
-
-    Args:
-        raw: 请求头原始值。
-
-    Returns:
-        正整数用户 ID；缺失或非法时返回 None。
-
-    Raises:
-        无。
-    """
-    if not raw:
-        return None
-    try:
-        user_id = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return user_id if user_id > 0 else None
-
-
-ROLE_ADMIN = "ADMIN"
-
-
-def _admin_denied(x_user_id: Optional[str], x_user_role: Optional[str],
-                  x_kb_admin: Optional[str]) -> Optional[JSONResponse]:
-    """管理员校验。
-
-    两条通道任一通过即可：备选令牌（直连运维）或网关鉴权后的 ADMIN 角色。
-
-    Args:
-        x_user_id: 用户 ID 请求头（用于区分「未登录」与「无权限」）。
-        x_user_role: 网关注入的角色。
-        x_kb_admin: 备选令牌请求头。
-
-    Returns:
-        None 表示校验通过；否则返回可直接下发的拒绝报文（401 未登录 / 403 无权限）。
-
-    Raises:
-        无。
-    """
-    token = (settings.KB_ADMIN_TOKEN or "").strip()
-    # 令牌必须非空才启用该通道：否则「配置为空 + 请求头为空」会直接放行所有人。
-    if token and (x_kb_admin or "").strip() == token:
-        return None
-    if _parse_uid(x_user_id) is None:
-        return JSONResponse(status_code=200, content=fail(401, "未登录"))
-    if (x_user_role or "").strip().upper() == ROLE_ADMIN:
-        return None
-    return JSONResponse(status_code=200, content=fail(403, "仅管理员可管理知识库"))
-
-
 @router.get("/kb/documents")
 async def list_documents(
     page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
@@ -160,7 +109,7 @@ async def list_documents(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
     try:
@@ -207,7 +156,7 @@ async def preview_document(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
     try:
@@ -263,7 +212,7 @@ async def download_document_file(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
     doc = await store.get_document(doc_id)
@@ -328,7 +277,7 @@ async def upload_document(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
 
@@ -384,7 +333,7 @@ async def delete_document(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
     try:
@@ -422,7 +371,7 @@ async def reindex(
     Raises:
         无。
     """
-    denied = _admin_denied(x_user_id, x_user_role, x_kb_admin)
+    denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
         return denied
     if _reindex_lock.locked():
