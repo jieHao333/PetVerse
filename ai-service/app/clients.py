@@ -9,13 +9,13 @@
     - ``biz``        进程级单例，直接 import 使用
     - ``_records``   分页响应解包工具（内部）
 
-外部依赖：``httpx``（异步连接池）、``app.config.settings`` 中的各 ``*_SERVICE_URL``。
+外部依赖：``httpx``（异步连接池）、``app.service_discovery``（Nacos 发现与轮询）。
 
 使用示例：
     from app.clients import biz
 
     pets = await biz.get_my_pets(user_id=42)
-    resp = await biz.request("POST", settings.SHOP_SERVICE_URL, "/shop/cart",
+    resp = await biz.request("POST", settings.SHOP_SERVICE_NAME, "/shop/cart",
                              json={"productId": 9, "quantity": 2}, user_id=42)
 
 读 / 写两种契约（刻意不统一）：
@@ -31,6 +31,7 @@ from typing import Any, List, Optional
 import httpx
 
 from app.config import settings
+from app.service_discovery import discovery
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +77,12 @@ class BizClient:
                 logger.warning("关闭业务服务 HTTP 连接池异常（忽略）", exc_info=True)
             self._client = None
 
-    async def get(self, base_url: str, path: str, params: dict = None,
+    async def get(self, service_name: str, path: str, params: dict = None,
                   user_id: int = 0) -> Any:
         """发起一次 GET 并解包统一报文。
 
         Args:
-            base_url: 目标服务根地址（取自 ``settings.*_SERVICE_URL``）。
+            service_name: Nacos 中的逻辑服务名（取自 ``settings.*_SERVICE_NAME``）。
             path: 接口路径，如 ``/pet/my-list``。
             params: 查询参数；None 表示不带参数。
             user_id: 大于 0 时注入 ``X-User-Id`` 头。网关在外部请求上会剥离该头，
@@ -98,6 +99,7 @@ class BizClient:
         if user_id and user_id > 0:
             headers["X-User-Id"] = str(user_id)
         try:
+            base_url = await discovery.resolve(service_name)
             resp = await self._get_client().get(base_url + path, params=params, headers=headers)
             if resp.status_code != 200:
                 logger.warning("业务接口返回非 200: %s%s -> %s", base_url, path, resp.status_code)
@@ -108,11 +110,11 @@ class BizClient:
                 return body.get("data") if body.get("code") == 200 else None
             return body
         except Exception:
-            logger.warning("业务接口调用失败（降级为空）: %s%s", base_url, path, exc_info=True)
+            logger.warning("业务接口调用失败（降级为空）: service=%s path=%s", service_name, path, exc_info=True)
             return None
 
 
-    async def request(self, method: str, base_url: str, path: str, *,
+    async def request(self, method: str, service_name: str, path: str, *,
                       json: Optional[dict] = None, params: Optional[dict] = None,
                       user_id: int = 0) -> dict:
         """发起一次写请求，并**保留**下游的业务错误。
@@ -122,7 +124,7 @@ class BizClient:
 
         Args:
             method: HTTP 方法（``POST`` / ``PUT`` / ``DELETE``）。
-            base_url: 目标服务根地址。
+            service_name: Nacos 中的逻辑服务名；单体模式由发现器统一映射到单体服务。
             path: 接口路径，如 ``/shop/cart``。
             json: 请求体；None 表示无 body。
             params: 查询参数；None 表示不带参数。
@@ -139,10 +141,11 @@ class BizClient:
         if user_id and user_id > 0:
             headers["X-User-Id"] = str(user_id)
         try:
+            base_url = await discovery.resolve(service_name)
             resp = await self._get_client().request(
                 method, base_url + path, json=json, params=params, headers=headers)
         except Exception:
-            logger.warning("业务写接口调用失败: %s %s%s", method, base_url, path, exc_info=True)
+            logger.warning("业务写接口调用失败: %s service=%s path=%s", method, service_name, path, exc_info=True)
             return {"ok": False, "code": 500, "msg": "服务暂时不可用，请稍后再试", "data": None}
 
         if resp.status_code != 200:
@@ -180,7 +183,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.PET_SERVICE_URL, "/pet/my-list", user_id=user_id)
+        data = await self.get(settings.PET_SERVICE_NAME, "/pet/my-list", user_id=user_id)
         return data if isinstance(data, list) else []
 
 
@@ -197,7 +200,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SPACE_SERVICE_URL, "/space/page",
+        data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"sort": "hot", "pageNum": 1, "pageSize": limit},
                               user_id=user_id)
         return _records(data)
@@ -216,7 +219,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SPACE_SERVICE_URL, "/space/page",
+        data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"keyword": keyword, "sort": "hot", "pageNum": 1, "pageSize": limit},
                               user_id=user_id)
         return _records(data)
@@ -234,7 +237,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SPACE_SERVICE_URL, "/space/page",
+        data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"userId": user_id, "pageNum": 1, "pageSize": limit},
                               user_id=user_id)
         return _records(data)
@@ -262,7 +265,7 @@ class BizClient:
             params["keyword"] = keyword
         if category is not None:
             params["category"] = category
-        data = await self.get(settings.SHOP_SERVICE_URL, "/shop/product/page",
+        data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/product/page",
                               params=params, user_id=user_id)
         return _records(data)
 
@@ -278,7 +281,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SHOP_SERVICE_URL, "/shop/cart", user_id=user_id)
+        data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/cart", user_id=user_id)
         return data if isinstance(data, list) else []
 
     async def get_my_orders(self, user_id: int, limit: int = 10) -> List[dict]:
@@ -294,7 +297,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SHOP_SERVICE_URL, "/shop/order/page",
+        data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/order/page",
                               params={"pageNum": 1, "pageSize": limit}, user_id=user_id)
         return _records(data)
 
@@ -313,7 +316,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SHOP_SERVICE_URL, "/shop/review/page",
+        data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/review/page",
                               params={"productId": product_id, "pageNum": 1, "pageSize": limit})
         return _records(data)
 
@@ -330,7 +333,7 @@ class BizClient:
         Raises:
             无。
         """
-        data = await self.get(settings.SHOP_SERVICE_URL, "/shop/review/my/page",
+        data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/review/my/page",
                               params={"pageNum": 1, "pageSize": limit}, user_id=user_id)
         return _records(data)
 
@@ -339,7 +342,7 @@ class BizClient:
 
         失败降级为 None，调用方据此回退到本地推断，不影响推荐主流程。
         """
-        data = await self.get(settings.DATA_SERVICE_URL, f"/data/internal/profile/{user_id}",
+        data = await self.get(settings.DATA_SERVICE_NAME, f"/data/internal/profile/{user_id}",
                               user_id=user_id)
         return data if isinstance(data, dict) else None
 
@@ -348,13 +351,13 @@ class BizClient:
         if not product_ids:
             return []
         ids = ",".join(str(p) for p in product_ids if p is not None)
-        data = await self.get(settings.DATA_SERVICE_URL, "/data/internal/product-stats",
+        data = await self.get(settings.DATA_SERVICE_NAME, "/data/internal/product-stats",
                               params={"ids": ids}, user_id=user_id)
         return data if isinstance(data, list) else []
 
     async def get_rerank_model(self, user_id: int = 0) -> Optional[dict]:
         """从数据中台读取当前激活的重排模型（特征/权重）。无模型或失败时返回 None。"""
-        data = await self.get(settings.DATA_SERVICE_URL, "/data/internal/model", user_id=user_id)
+        data = await self.get(settings.DATA_SERVICE_NAME, "/data/internal/model", user_id=user_id)
         return data if isinstance(data, dict) else None
 
 

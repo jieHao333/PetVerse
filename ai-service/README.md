@@ -1,6 +1,6 @@
   # PetVerse AI 服务（ai-service）
 
-基于 FastAPI 的 AI 能力微服务，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供服务。内部统一使用 **LangGraph** 编排，对话模型与 Embedding 均为 **OpenAI 兼容格式**（改 `base_url` + `model` 即可切换 DeepSeek / 阿里云百炼等任意服务商）。
+基于 FastAPI 的 AI 能力微服务，启动后注册进 Nacos（供网关 `lb://ai-service` 发现），通过网关统一入口 `/api/ai/**`（StripPrefix=1）对外提供服务。调用下游业务时同样从 Nacos 获取健康实例并轮询分流，不再配置固定服务地址。内部统一使用 **LangGraph** 编排，对话模型与 Embedding 均为 **OpenAI 兼容格式**（改 `base_url` + `model` 即可切换 DeepSeek / 阿里云百炼等任意服务商）。
 
 ## 能力总览
 
@@ -137,7 +137,12 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `KNOWLEDGE_DIR` / `KB_CHUNK_*` / `EMBED_BATCH_SIZE` | 语料目录 / 切分长度（目标·合并下限·硬上限）/ 单批 Embedding 条数 |
 | `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
 | `SKILLS_DIR` | Skill 技能包根目录（标准 `skills/<name>/SKILL.md`），留空默认包内 `skills/` |
-| `*_SERVICE_URL` | 各业务微服务地址（ai-service 直连拉取上下文，注入内部 `X-User-Id`） |
+| `NACOS_SERVER_ADDR` / `NACOS_GROUP` / `NACOS_NAMESPACE` | Nacos 地址 / 分组 / 命名空间；注册与下游发现共用，须与 Java 服务一致，命名空间留空表示 `public` |
+| `SERVICE_DEPLOY_MODE` | `microservice`（默认）：按各服务名发现；`monolith`：所有业务请求统一路由到单体服务 |
+| `PET_SERVICE_NAME` 等 `*_SERVICE_NAME` | 微服务模式下各业务域在 Nacos 中的服务名，默认与 Java 的 `spring.application.name` 一致 |
+| `MONOLITH_SERVICE_NAME` | 单体模式的目标服务名，默认 `petverse-single` |
+| `SERVICE_DISCOVERY_CACHE_TTL` | 健康实例列表的本地缓存秒数（默认 10）；到期单飞刷新，Nacos 网络故障时可暂用旧列表 |
+| `HTTP_TIMEOUT` | 已选中实例的业务 HTTP 调用超时秒数（默认 8） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
 | `AGENT_MAX_STEPS` / `AGENT_TOOL_GROUPS` | 单轮最多几轮「模型 → 工具」循环（超限强制收敛）/ 启用的工具分组（默认 `knowledge,pet,shop,cart,community,interaction,pet_edit,publish,profile`；`publish` 发布动态默认开启但每次都会挂起等审批，`content` 评论默认关闭，关掉即让模型看不见该组工具） |
@@ -145,6 +150,30 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `AGENT_MCP_ENABLED` / `MCP_LOAD_TIMEOUT` / `MCP_CACHE_TTL` | MCP 扩展总开关（默认 true）/ 单服务连接与列工具超时秒数（默认 10）/ 扩展配置进程内缓存 TTL 秒数（默认 60，管理接口写入会立即失效，TTL 兜底多 worker 跨进程刷新） |
 | `HISTORY_MAX_MESSAGES` | LLM 上下文窗口条数（从 checkpoint 记忆裁剪最近 N 条） |
 | `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数 |
+
+### 服务发现与部署模式
+
+微服务部署保持默认配置即可；服务名需要与 Nacos 控制台中的名称一致：
+
+```dotenv
+SERVICE_DEPLOY_MODE=microservice
+PET_SERVICE_NAME=pet-service
+SPACE_SERVICE_NAME=space-service
+USER_SERVICE_NAME=user-service
+SOCIAL_SERVICE_NAME=social-service
+REMARK_SERVICE_NAME=remark-service
+SHOP_SERVICE_NAME=shop-service
+DATA_SERVICE_NAME=data-service
+```
+
+服务名必须与 Nacos 注册名一致；原固定地址配置已由这组服务名替代，不再通过环境变量保存任何业务实例 IP / 端口。单体部署（包括单体多实例）只需设置以下两项，其余业务服务名不会参与路由：
+
+```dotenv
+SERVICE_DEPLOY_MODE=monolith
+MONOLITH_SERVICE_NAME=petverse-single
+```
+
+两种模式都会过滤不健康、已禁用或权重为 0 的实例，并在实例间轮询。单体模式把 `/pet/**`、`/space/**`、`/shop/**`、`/data/**` 等路径直接请求到选中的单体实例，不再分别发现各业务服务名；有多个 `petverse-single` 实例时仍会自动分流。实例列表默认缓存 10 秒，Nacos 刷新请求失败时可暂用旧列表，但 Nacos 明确返回无健康实例时不会继续访问旧地址。
 
 > pgvector 维度必须与 `EMBEDDING_DIM` 一致（`kb_chunk.embedding vector(1024)`）；切换 Embedding 模型需重建知识库表。
 
@@ -186,6 +215,12 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 
 ```powershell
 .venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
+```
+
+服务发现与路由的单元测试（无需启动 Nacos）：
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 ## 接口列表

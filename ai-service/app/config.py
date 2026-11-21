@@ -12,17 +12,19 @@
 
 使用示例：
     from app.config import settings
+    from app.service_discovery import discovery
 
     if settings.is_mock:                      # 没有真实 Key 时统一走内置 mock
         ...
     dsn = settings.pg_dsn                     # psycopg 直连串
-    url = f"{settings.PET_SERVICE_URL}/pet/my-list"
+    base_url = await discovery.resolve(settings.PET_SERVICE_NAME)  # 轮询一个健康实例
 
 注意：``is_mock`` / ``embedding_enabled`` 等属性是「读时求值」的，不要在 import 阶段就把
 结果缓存成模块常量——测试里改 ``settings`` 后应当立即生效。
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -45,6 +47,9 @@ class Settings(BaseSettings):
     AI_SERVICE_IP: str = "127.0.0.1"
     AI_SERVICE_PORT: int = 8086
     NACOS_SERVER_ADDR: str = "localhost:8848"
+    NACOS_GROUP: str = "DEFAULT_GROUP"
+    # 空字符串表示 public 命名空间；需与 Java 服务注册时使用的命名空间一致。
+    NACOS_NAMESPACE: str = ""
 
     # ── 对话模型（OpenAI 兼容协议） ───────────────────────────────────────
     LLM_API_KEY: str = ""
@@ -137,15 +142,19 @@ class Settings(BaseSettings):
     # 留空回落到包内 skills/（见 skills_dir 属性）。
     SKILLS_DIR: str = ""
 
-    # ── 下游业务微服务（ai-service 直连拉上下文，注入内部 X-User-Id） ─────
-    PET_SERVICE_URL: str = "http://127.0.0.1:8081"
-    SPACE_SERVICE_URL: str = "http://127.0.0.1:8082"
-    USER_SERVICE_URL: str = "http://127.0.0.1:8083"
-    SOCIAL_SERVICE_URL: str = "http://127.0.0.1:8084"
-    REMARK_SERVICE_URL: str = "http://127.0.0.1:8085"
-    SHOP_SERVICE_URL: str = "http://127.0.0.1:8087"
-    # 数据中台统一数据服务：微服务版直连 data-service:8089；单体版设为 http://127.0.0.1:8080
-    DATA_SERVICE_URL: str = "http://127.0.0.1:8089"
+    # ── 下游业务服务发现（ai-service 直连实例，注入内部 X-User-Id） ───────
+    # microservice：按下列服务名分别发现；monolith：统一路由到 MONOLITH_SERVICE_NAME。
+    SERVICE_DEPLOY_MODE: Literal["microservice", "monolith"] = "microservice"
+    MONOLITH_SERVICE_NAME: str = "petverse-single"
+    PET_SERVICE_NAME: str = "pet-service"
+    SPACE_SERVICE_NAME: str = "space-service"
+    USER_SERVICE_NAME: str = "user-service"
+    SOCIAL_SERVICE_NAME: str = "social-service"
+    REMARK_SERVICE_NAME: str = "remark-service"
+    SHOP_SERVICE_NAME: str = "shop-service"
+    DATA_SERVICE_NAME: str = "data-service"
+    # 实例列表缓存秒数；刷新失败时使用旧列表，避免 Nacos 抖动放大为业务故障。
+    SERVICE_DISCOVERY_CACHE_TTL: float = 10.0
     HTTP_TIMEOUT: float = 8.0
 
     # ── 结果缓存 TTL（秒） ────────────────────────────────────────────────

@@ -136,7 +136,7 @@ def _user_id(state: Dict[str, Any]) -> int:
         return 0
 
 
-async def _run_action(state: Dict[str, Any], tool_name: str, method: str, base_url: str,
+async def _run_action(state: Dict[str, Any], tool_name: str, method: str, service_name: str,
                       path: str, payload: Optional[dict], formatter, params: Optional[dict] = None) -> str:
     """执行一次写操作：身份校验 → 幂等检查 → 请求下游 → 格式化 → 记录幂等。
 
@@ -144,7 +144,7 @@ async def _run_action(state: Dict[str, Any], tool_name: str, method: str, base_u
         state: 注入的图状态（提供 user_id 与 run_id）。
         tool_name: 工具名（幂等指纹的一部分，同时用于审计日志）。
         method: HTTP 方法。
-        base_url: 目标服务根地址。
+        service_name: Nacos 中的目标服务名。
         path: 接口路径。
         payload: 请求体；None 表示无 body。
         formatter: 把 ``biz.request`` 的返回转成结果文本的函数。
@@ -168,7 +168,7 @@ async def _run_action(state: Dict[str, Any], tool_name: str, method: str, base_u
         logger.info("写操作幂等命中，跳过重复执行: tool=%s user=%s", tool_name, user_id)
         return cached
 
-    resp = await biz.request(method, base_url, path, json=payload, params=params, user_id=user_id)
+    resp = await biz.request(method, service_name, path, json=payload, params=params, user_id=user_id)
     text = formatter(resp)
     logger.info("写操作: tool=%s user=%s path=%s ok=%s", tool_name, user_id, path, resp.get("ok"))
     if resp.get("ok"):
@@ -205,7 +205,7 @@ async def add_to_cart(product_id: Annotated[int, Field(gt=0)],
                        cartItemId=item.get("id"), productId=product_id, quantity=total or quantity)
 
     return await _run_action(state, "add_to_cart", "POST",
-                             settings.SHOP_SERVICE_URL, "/shop/cart", payload, fmt)
+                             settings.SHOP_SERVICE_NAME, "/shop/cart", payload, fmt)
 
 
 @tool(parse_docstring=True)
@@ -231,7 +231,7 @@ async def update_cart_quantity(cart_item_id: Annotated[int, Field(gt=0)],
                        cartItemId=cart_item_id, quantity=quantity)
 
     return await _run_action(state, "update_cart_quantity", "PUT",
-                             settings.SHOP_SERVICE_URL, "/shop/cart", payload, fmt)
+                             settings.SHOP_SERVICE_NAME, "/shop/cart", payload, fmt)
 
 
 @tool(parse_docstring=True)
@@ -251,7 +251,7 @@ async def remove_from_cart(cart_item_id: Annotated[int, Field(gt=0)],
         return _result(True, f"已把购物车条目 {cart_item_id} 移出购物车", cartItemId=cart_item_id)
 
     return await _run_action(state, "remove_from_cart", "DELETE",
-                             settings.SHOP_SERVICE_URL, f"/shop/cart/{cart_item_id}", None, fmt)
+                             settings.SHOP_SERVICE_NAME, f"/shop/cart/{cart_item_id}", None, fmt)
 
 
 # ── 社区互动 ──────────────────────────────────────────────────────────────
@@ -273,7 +273,7 @@ async def like_post(post_id: Annotated[int, Field(gt=0)],
         return _result(True, "已点赞该动态", postId=post_id)
 
     return await _run_action(state, "like_post", "POST",
-                             settings.REMARK_SERVICE_URL, f"/remark/like/{_TARGET_SPACE}/{post_id}", None, fmt)
+                             settings.REMARK_SERVICE_NAME, f"/remark/like/{_TARGET_SPACE}/{post_id}", None, fmt)
 
 
 @tool(parse_docstring=True)
@@ -293,7 +293,7 @@ async def unlike_post(post_id: Annotated[int, Field(gt=0)],
         return _result(True, "已取消点赞", postId=post_id)
 
     return await _run_action(state, "unlike_post", "DELETE",
-                             settings.REMARK_SERVICE_URL, f"/remark/like/{_TARGET_SPACE}/{post_id}", None, fmt)
+                             settings.REMARK_SERVICE_NAME, f"/remark/like/{_TARGET_SPACE}/{post_id}", None, fmt)
 
 
 @tool(parse_docstring=True)
@@ -333,7 +333,7 @@ async def comment_post(post_id: Annotated[int, Field(gt=0)], content: str,
         return _result(True, "评论已发布", commentId=data.get("id"), postId=post_id)
 
     return await _run_action(state, "comment_post", "POST",
-                             settings.REMARK_SERVICE_URL, "/remark/comment", payload, fmt)
+                             settings.REMARK_SERVICE_NAME, "/remark/comment", payload, fmt)
 
 
 @tool(parse_docstring=True)
@@ -375,7 +375,7 @@ async def publish_post(content: str, state: Annotated[dict, InjectedState],
         return _result(True, "动态已发布", postId=data.get("spaceId"))
 
     return await _run_action(state, "publish_post", "POST",
-                             settings.SPACE_SERVICE_URL, "/space", payload, fmt)
+                             settings.SPACE_SERVICE_NAME, "/space", payload, fmt)
 
 
 # ── 宠物档案 ──────────────────────────────────────────────────────────────
@@ -408,7 +408,7 @@ async def register_pet(name: str, species: str, state: Annotated[dict, InjectedS
                        petId=data.get("id"), name=data.get("name") or name)
 
     return await _run_action(state, "register_pet", "POST",
-                             settings.PET_SERVICE_URL, "/pet/register", payload, fmt)
+                             settings.PET_SERVICE_NAME, "/pet/register", payload, fmt)
 
 
 @tool(parse_docstring=True)
@@ -445,6 +445,6 @@ async def update_pet_health(pet_id: Annotated[int, Field(gt=0)],
         return _result(True, f"已把{pet_name}的{label}更新为 {content}", petId=pet_id, category=category)
 
     return await _run_action(state, "update_pet_health", "PUT",
-                             settings.PET_SERVICE_URL, "/pet/health", payload, fmt)
+                             settings.PET_SERVICE_NAME, "/pet/health", payload, fmt)
 
 

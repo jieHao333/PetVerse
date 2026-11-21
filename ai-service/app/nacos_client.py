@@ -49,12 +49,13 @@ class NacosRegistrar:
     """
 
     def __init__(self, server_addr: str, service_name: str, ip: str, port: int,
-                 group: str = "DEFAULT_GROUP"):
+                 group: str = "DEFAULT_GROUP", namespace: str = ""):
         self._server_addr = server_addr
         self._service_name = service_name
         self._ip = ip
         self._port = port
         self._group = group
+        self._namespace = namespace
         self._sdk_client = None
         self._beat_thread: Optional[threading.Thread] = None
         self._running = False
@@ -118,7 +119,7 @@ class NacosRegistrar:
             logger.warning("nacos-sdk-python 未安装，跳过 SDK 注册，直接走 OpenAPI")
             return False
         try:
-            client = nacos.NacosClient(self._server_addr)
+            client = nacos.NacosClient(self._server_addr, namespace=self._namespace or None)
             client.add_naming_instance(
                 self._service_name, self._ip, self._port, group_name=self._group)
             self._sdk_client = client
@@ -148,6 +149,8 @@ class NacosRegistrar:
             # 临时实例：靠心跳存活，进程退出后自动摘除，不必手工清理。
             "ephemeral": "true",
         }
+        if self._namespace:
+            params["namespaceId"] = self._namespace
         try:
             resp = httpx.post(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS)
             # Nacos v1 接口成功时返回纯文本 "ok"（大小写与前后缀不稳定，故用小写包含判断）。
@@ -177,6 +180,8 @@ class NacosRegistrar:
             "groupName": self._group,
             "ephemeral": "true",
         }
+        if self._namespace:
+            params["namespaceId"] = self._namespace
         try:
             resp = httpx.delete(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS)
             if resp.status_code == 200:
@@ -265,6 +270,8 @@ class NacosRegistrar:
             "port": self._port,
             "groupName": self._group,
         }
+        if self._namespace:
+            params["namespaceId"] = self._namespace
         fail_count = 0
         while self._running:
             try:
@@ -303,6 +310,8 @@ registrar = NacosRegistrar(
     service_name=settings.AI_SERVICE_NAME,
     ip=settings.AI_SERVICE_IP,
     port=settings.AI_SERVICE_PORT,
+    group=settings.NACOS_GROUP,
+    namespace=settings.NACOS_NAMESPACE,
 )
 
 

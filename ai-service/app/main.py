@@ -96,10 +96,11 @@ async def lifespan(app: FastAPI):
         logger.info("知识库规模: %s", await kb_store.stats())
     # 注册与反注册是同步阻塞调用（HTTP / SDK），放线程池执行以免卡住事件循环启动。
     await asyncio.to_thread(nacos_client.register)
-    logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s）",
+    logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s, deploy=%s）",
                 settings.AI_SERVICE_NAME, settings.AI_SERVICE_IP,
                 settings.AI_SERVICE_PORT, settings.is_mock,
-                settings.RAG_ENABLED, settings.embedding_enabled)
+                settings.RAG_ENABLED, settings.embedding_enabled,
+                settings.SERVICE_DEPLOY_MODE)
     yield
     await asyncio.to_thread(nacos_client.deregister)
     await biz.close()

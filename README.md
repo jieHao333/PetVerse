@@ -358,13 +358,13 @@ PetVerse/
 - **分层**：`data_event_raw`(ODS) → `data_behavior`(DWD) → `data_user_profile`/`data_product_stats`(DWS) → `data_metric_daily`(ADS)，另有 `data_sample` 反馈样本（曝光⋈点击）。
 - **聚合**：`DataAggregateTask` 微批（默认 120s）构建画像（物种亲和度/活跃度/消费力）、商品统计（CTR/热度）、按日指标（DAU/推荐CTR/AI采纳率）与样本，按唯一键 upsert，可重复执行。
 - **服务**：内部 Data API `/data/internal/profile/{userId}`、`/data/internal/product-stats` 供 ai-service 一次取数（推荐图已接入，BizClient 兜底）；管理端 `/data/admin/**` 仅管理员，前端「数据看板」页消费。
-- **部署**：建库执行 `data-service/src/main/resources/db/schema.sql`；Nacos 导入 `nacos-config/data-service.yml`；网关已加 `/api/data/**` 路由。单体版（PetVerseSingle）含等价 `data` 包，表并入 `petverse` 单库（`db/upgrade_data.sql`）。ai-service 单体部署时设 `DATA_SERVICE_URL=http://127.0.0.1:8080`。
+- **部署**：建库执行 `data-service/src/main/resources/db/schema.sql`；Nacos 导入 `nacos-config/data-service.yml`；网关已加 `/api/data/**` 路由。单体版（PetVerseSingle）含等价 `data` 包，表并入 `petverse` 单库（`db/upgrade_data.sql`）。ai-service 单体部署时设 `SERVICE_DEPLOY_MODE=monolith`，统一从 Nacos 发现 `petverse-single` 实例。
 
 ---
 
 ## AI 服务
 
-AI 能力由独立的 Python 服务承载：FastAPI 提供 SSE 流式接口，LangGraph 负责多路上下文编排，服务启动后自注册到 Nacos，由网关按 `lb://ai-service` 发现并转发。
+AI 能力由独立的 Python 服务承载：FastAPI 提供 SSE 流式接口，LangGraph 负责多路上下文编排，服务启动后自注册到 Nacos，由网关按 `lb://ai-service` 发现并转发；调用下游业务服务时也从 Nacos 获取健康实例并轮询分流，单体模式统一路由到 `petverse-single`。
 
 | 能力 | 说明 | 编排图 |
 |---|---|---|
@@ -393,7 +393,7 @@ Java 服务的业务配置集中在 Nacos；本地 `application.yml` 仅声明�
 
 | 变量 / 配置项 | 作用范围 | 说明 |
 |---|---|---|
-| `NACOS_SERVER_ADDR` | 全部 Java 服务 | Nacos 地址，默认 `localhost:8848` |
+| `NACOS_SERVER_ADDR` / `NACOS_GROUP` / `NACOS_NAMESPACE` | 全部 Java 服务 + ai-service | Nacos 地址 / 分组 / 命名空间（留空为 `public`），注册与发现须保持一致 |
 | `MYSQL_URL` / `MYSQL_USERNAME` / `MYSQL_PASSWORD` | 各业务服务 | 各服务默认连接各自的 `petverse_*` 库 |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | pet / remark | pet 使用 db1，remark 使用 db2 |
 | `RABBITMQ_HOST` / `RABBITMQ_PORT` / `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` / `RABBITMQ_VHOST` | 全部 Java 服务 | 默认 `localhost:5672`，`guest/guest`；队列与绑定由消费者启动时自动声明 |
@@ -407,7 +407,7 @@ Java 服务的业务配置集中在 Nacos；本地 `application.yml` 仅声明�
 | `petverse.gateway.rate-limit.*` | gateway-service | 令牌桶参数，AI 流式接口使用独立小桶 |
 | `auth.whitelist-paths` / `auth.public-get-paths` | gateway-service | 免鉴权白名单、游客可读 GET 接口 |
 
-AI 服务使用独立的 `.env`：LLM / Embedding / PostgreSQL / Redis / 业务服务地址 / RAG 参数等，完整列表见 [ai-service/.env.example](ai-service/.env.example)。
+AI 服务使用独立的 `.env`：LLM / Embedding / PostgreSQL / Redis / Nacos 服务名与部署模式 / RAG 参数等，完整列表见 [ai-service/.env.example](ai-service/.env.example)。
 
 ---
 
