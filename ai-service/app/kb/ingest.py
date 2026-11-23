@@ -1,24 +1,7 @@
 """知识库入库编排。
 
-职责：把「解析 → 切分 → 生成关键词 → 向量化 → 覆盖写入 → 索引失效」串成一条流程，
+把「解析 → 切分 → 生成关键词 → 向量化 → 覆盖写入 → 索引失效」串成一条流程，
 支持单文件、字节流（上传）与整目录批量三种入口。
-
-主要导出：
-    - ``IngestError``        入库失败（解析之外的流程性错误）
-    - ``ingest_path``        入库单个文件
-    - ``ingest_content``     入库上传的字节内容（并留存原文）
-    - ``ingest_directory``   批量入库目录（供重建与脚本使用）
-    - ``remove_original``    清理上传文档的留存原文
-    - ``embed_texts``        批量向量化（带重试与条数校验）
-
-外部依赖：``app.kb.documents``（解析）、``app.kb.chunking``（切分）、``app.kb.lexicon``（分词）、
-``app.kb.store``（存储）、``app.llm.get_embeddings``。
-
-使用示例：
-    from app.kb import ingest
-
-    await ingest.ingest_path(Path("app/knowledge/急症识别与院前处理.md"))
-    summary = await ingest.ingest_directory(settings.knowledge_dir, force=True)
 
 幂等性：按 ``doc_id`` 覆盖写入；``force=False`` 时内容 sha256 未变的文档直接跳过，
 避免无谓的 Embedding 调用（成本与耗时的主要来源）。
@@ -60,13 +43,8 @@ async def ingest_path(path: Path, origin: str = "repo", *, force: bool = False,
     """入库单个磁盘文件。
 
     Args:
-        path: 文件路径。
         origin: 来源标记（``repo`` 仓库语料 / ``upload`` 后台上传）。
         force: True 时忽略内容哈希强制重新向量化。
-        doc_id: 覆盖文档 ID。
-        title: 覆盖标题。
-        category: 覆盖分类。
-        species: 覆盖物种。
 
     Returns:
         ``{"docId", "source", "chunks", "skipped", "sha256"}``。
@@ -92,13 +70,7 @@ async def ingest_content(filename: str, data: bytes, origin: str = "upload", *,
     且固定 ``force=True``——上传同名文件的本意就是「更新它」，不该被哈希跳过。
 
     Args:
-        filename: 原始文件名。
-        data: 文件字节。
         origin: 来源标记，默认 ``upload``。
-        doc_id: 覆盖文档 ID。
-        title: 覆盖标题。
-        category: 覆盖分类。
-        species: 覆盖物种。
 
     Returns:
         同 ``ingest_path``。
@@ -119,13 +91,9 @@ def _persist_original(doc_id: str, filename: str, data: bytes) -> str:
     Args:
         doc_id: 文档 ID（作为文件名主干，保证同名文档覆盖而非堆积）。
         filename: 原始文件名（取后缀）。
-        data: 文件字节。
 
     Returns:
         留存文件的绝对路径；保存失败时返回空串（预览会回退到片段拼接）。
-
-    Raises:
-        无。
     """
     from app.config import settings
 
@@ -149,12 +117,6 @@ def remove_original(doc: dict) -> None:
 
     Args:
         doc: 文档元信息（需含 ``filePath`` / ``origin``）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     from app.config import settings
 
@@ -188,9 +150,6 @@ async def ingest_directory(directory: Path, *, force: bool = False,
 
     Returns:
         ``{scanned, ingested, skipped, chunks, failures, totalDocuments, totalChunks}``。
-
-    Raises:
-        无——单文件异常已归入 ``failures``。
     """
     from app.kb import store
 
@@ -230,9 +189,6 @@ def _supported_suffixes():
 
     Returns:
         扩展名元组。
-
-    Raises:
-        无。
     """
     from app.kb.documents import SUPPORTED_SUFFIXES
 
@@ -265,8 +221,6 @@ async def _ingest_document(doc: ParsedDocument, origin: str, force: bool,
     """单篇文档的实际入库流程。
 
     Args:
-        doc: 解析结果。
-        origin: 来源标记。
         force: 是否忽略内容哈希。
         file_path: 原文留存路径（可为空）。
 
@@ -319,9 +273,6 @@ async def _ingest_document(doc: ParsedDocument, origin: str, force: bool,
 async def embed_texts(texts: Sequence[str]) -> List[List[float]]:
     """批量向量化。
 
-    Args:
-        texts: 待向量化文本。
-
     Returns:
         与 ``texts`` 等长的向量列表。
 
@@ -353,10 +304,6 @@ async def embed_texts(texts: Sequence[str]) -> List[List[float]]:
 
 async def _embed_batch(embeddings, texts: List[str]) -> List[List[float]]:
     """单批向量化（带线性退避重试）。
-
-    Args:
-        embeddings: Embedding 客户端。
-        texts: 本批文本。
 
     Returns:
         向量列表。

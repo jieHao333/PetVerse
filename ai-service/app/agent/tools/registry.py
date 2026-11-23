@@ -1,21 +1,7 @@
 """工具注册表：按业务域装配模型可调用的能力。
 
-职责：把「有哪些工具」与「这次请求该给模型哪些工具」解耦。新增能力只需写一个
+把「有哪些工具」与「这次请求该给模型哪些工具」解耦。新增能力只需写一个
 ``@tool`` 并在 ``_BUILDERS`` 里登记一行，不需要改图、改条件边或改路由层。
-
-主要导出：
-    - ``ToolContext``    构造工具所需的运行时上下文
-    - ``build_tools``    按分组装配内置工具列表
-    - ``build_tools_async`` 内置工具 + 管理员配置的 MCP 远程工具（对话链路用这个）
-    - ``enabled_groups`` 解析配置里启用的分组
-
-外部依赖：``app.agent.tools.knowledge``、``app.agent.tools.business``、``app.config``。
-
-使用示例：
-    from app.agent.tools import ToolContext, build_tools
-
-    tools = build_tools(ToolContext(user_id=42))
-    model.bind_tools(tools)
 
 分组的意义：线上可以按配置关掉某一域（如商城维护时关掉 shop），模型就会「看不见」
 这些工具，而不是靠提示词劝它别调用。工具的可见性比提示词约束更可靠。
@@ -111,9 +97,6 @@ def _default_groups() -> List[str]:
     Returns:
         ``ALL_GROUPS`` 去掉 ``DEFAULT_OFF_GROUPS``：默认只开低风险、可撤销的能力，
         公开发布与资金/库存类必须由运维显式打开。
-
-    Raises:
-        无。
     """
     return [g for g in ALL_GROUPS if g not in DEFAULT_OFF_GROUPS]
 
@@ -126,9 +109,6 @@ def enabled_groups() -> List[str]:
         （不含 ``content``）。显式配置 ``content`` 时会连带启用 ``publish``（兼容旧语义）。
         非法分组名只记日志、不抛异常——配错一个词
         不该让整个对话服务起不来。
-
-    Raises:
-        无。
     """
     raw = (settings.AGENT_TOOL_GROUPS or "").strip()
     if not raw:
@@ -159,9 +139,6 @@ def has_write_tools(groups: Optional[Sequence[str]] = None) -> bool:
 
     Returns:
         True 表示应给模型追加「操作类能力」的使用规则。
-
-    Raises:
-        无。
     """
     wanted = set(groups) if groups is not None else set(enabled_groups())
     return bool(wanted & WRITE_GROUPS)
@@ -176,9 +153,6 @@ def build_tools(ctx: ToolContext, groups: Optional[Sequence[str]] = None) -> Lis
 
     Returns:
         工具列表；未登录用户只会拿到不需要身份的分组（知识检索）。
-
-    Raises:
-        无——单个分组构造失败只跳过该组，不影响其他能力。
     """
     wanted = list(groups) if groups is not None else enabled_groups()
     tools: List[BaseTool] = []
@@ -208,9 +182,6 @@ async def build_tools_async(ctx: ToolContext, groups: Optional[Sequence[str]] = 
 
     Returns:
         工具列表（内置在前，MCP 在后）。
-
-    Raises:
-        无——MCP 侧异常已在 extensions 内降级。
     """
     from app.agent.extensions import get_mcp_tools
 

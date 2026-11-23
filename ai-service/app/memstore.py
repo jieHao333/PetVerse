@@ -1,23 +1,7 @@
 """长期记忆存储（LangGraph PostgresStore）。
 
-职责：以「用户 / 宠物」两级命名空间保存跨会话的长期记忆条目（偏好、习性、事实），
+以「用户 / 宠物」两级命名空间保存跨会话的长期记忆条目（偏好、习性、事实），
 并同样提供 Windows 可用的异步包装（线程池代理同步实现）。
-
-主要导出：
-    - 命名空间工具：``user_ns`` / ``pet_ns`` / ``user_prefix`` / ``pet_prefix``
-    - ``init`` / ``close`` / ``get_store`` / ``available``  生命周期
-    - ``_ThreadedStore``  异步适配的 store 实现
-
-外部依赖：``langgraph-checkpoint-postgres``（PostgresStore）、``psycopg_pool``、
-``app.config.settings``。
-
-使用示例：
-    from app import memstore
-
-    store = memstore.get_store()
-    if store is not None:
-        await store.aput(memstore.user_ns(42), "budget", {"content": "预算每月 200 元左右"})
-        items = await store.asearch(memstore.pet_ns(42, 7), limit=20)
 
 命名空间约定（层级固定，靠下标定位，勿随意调整顺序）：
     ("petverse", "user_mem", "<user_id>")             用户级记忆
@@ -50,14 +34,8 @@ _ROOT_NS = "petverse"
 def user_ns(user_id: int) -> tuple[str, ...]:
     """用户级记忆命名空间。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         三元组命名空间。
-
-    Raises:
-        无。
     """
     return (_ROOT_NS, "user_mem", str(user_id))
 
@@ -67,13 +45,9 @@ def pet_ns(user_id: int, pet_id: int) -> tuple[str, ...]:
 
     Args:
         user_id: 用户 ID（放在 pet_id 之前，保证同一用户的宠物记忆聚在同一前缀下）。
-        pet_id: 宠物 ID。
 
     Returns:
         四元组命名空间。
-
-    Raises:
-        无。
     """
     return (_ROOT_NS, "pet_mem", str(user_id), str(pet_id))
 
@@ -81,14 +55,8 @@ def pet_ns(user_id: int, pet_id: int) -> tuple[str, ...]:
 def user_prefix(user_id: int) -> tuple[str, ...]:
     """用户记忆的检索前缀（用于按前缀列出该用户全部用户级记忆）。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         命名空间前缀。
-
-    Raises:
-        无。
     """
     return (_ROOT_NS, "user_mem", str(user_id))
 
@@ -96,14 +64,8 @@ def user_prefix(user_id: int) -> tuple[str, ...]:
 def pet_prefix(user_id: int) -> tuple[str, ...]:
     """宠物记忆的检索前缀（跨该用户所有宠物）。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         命名空间前缀。
-
-    Raises:
-        无。
     """
     return (_ROOT_NS, "pet_mem", str(user_id))
 
@@ -125,9 +87,6 @@ class _ThreadedStore(PostgresStore):
 
         Returns:
             True 表示可读写；False 表示当前不可用。
-
-        Raises:
-            无。
         """
         if self._ready:
             return True
@@ -148,15 +107,10 @@ class _ThreadedStore(PostgresStore):
         """按命名空间 + key 读取单条记忆。
 
         Args:
-            namespace: 目标命名空间。
-            key: 记忆键。
             refresh_ttl: LangGraph 接口签名保留项；本地实现不涉及 TTL。
 
         Returns:
             记忆条目；不存在或读取失败时返回 None。
-
-        Raises:
-            无。
         """
         if not await self._ensure_ready():
             return None
@@ -176,18 +130,12 @@ class _ThreadedStore(PostgresStore):
         比引入向量检索更简单可控。参数保留是为了满足 ``BaseStore`` 的接口签名。
 
         Args:
-            namespace_prefix: 命名空间前缀。
             query: 语义检索语句（当前实现忽略）。
             filter: 键值过滤条件（当前实现忽略）。
             limit: 返回条数上限。
-            offset: 偏移量。
-            refresh_ttl: 保留项。
 
         Returns:
             记忆条目列表；不可用时返回空列表。
-
-        Raises:
-            无。
         """
         if not await self._ensure_ready():
             return []
@@ -203,17 +151,10 @@ class _ThreadedStore(PostgresStore):
         """写入 / 覆盖一条记忆。
 
         Args:
-            namespace: 目标命名空间。
             key: 记忆键（新增用 uuid，更新沿用原 key）。
             value: 记忆内容字典（content / kind / petName / createdAt / updatedAt）。
             index: 向量索引配置（当前未使用）。
             ttl: 过期时间（当前未使用，长期记忆不设 TTL）。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         if not await self._ensure_ready():
             return
@@ -224,16 +165,6 @@ class _ThreadedStore(PostgresStore):
 
     async def adelete(self, namespace: tuple, key: str) -> None:
         """删除一条记忆。
-
-        Args:
-            namespace: 目标命名空间。
-            key: 记忆键。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         if not await self._ensure_ready():
             return
@@ -249,9 +180,6 @@ _pool: Optional[ConnectionPool] = None
 
 def _init_sync() -> None:
     """同步创建连接池与 store（供 ``asyncio.to_thread`` 调用）。
-
-    Returns:
-        None。
 
     Raises:
         Exception: 连接池构造失败时抛出。
@@ -272,12 +200,6 @@ def _init_sync() -> None:
 
 async def init() -> None:
     """初始化 store；失败时长期记忆整体降级为不可用，不影响对话。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _store
     try:
@@ -291,12 +213,6 @@ async def init() -> None:
 
 async def close() -> None:
     """关闭连接池并清空 store 引用。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool, _store
     pool, _pool, _store = _pool, None, None
@@ -312,9 +228,6 @@ def get_store() -> Optional[BaseStore]:
 
     Returns:
         store；未初始化成功时返回 None。
-
-    Raises:
-        无。
     """
     return _store
 
@@ -324,8 +237,5 @@ def available() -> bool:
 
     Returns:
         True 表示可以尝试读写长期记忆。
-
-    Raises:
-        无。
     """
     return _store is not None

@@ -1,26 +1,10 @@
 """Skill 技能包存储（标准 Agent Skills 范式）。
 
-职责：以磁盘上的标准技能包管理 Skill——每个技能是 ``skills/<name>/SKILL.md``，
+以磁盘上的标准技能包管理 Skill——每个技能是 ``skills/<name>/SKILL.md``，
 由 YAML frontmatter（``name`` / ``description``，可选 ``enabled``）+ Markdown 正文组成，
 可附 ``scripts/`` ``references/`` ``assets/`` 资源目录。``name`` 为 hyphen-case，
 既是唯一标识也是目录名。本模块只做包的读写与格式校验；「元数据常驻 + 按需加载正文」
 的渐进式披露由运行时（``app.agent.extensions`` + ``load_skill`` 工具）负责。
-
-主要导出：
-    - ``list_skills`` / ``get_skill``        管理页用（含正文）
-    - ``create_skill`` / ``update_skill`` / ``delete_skill``
-    - ``validate_skill``                     格式校验（name / description / 正文行数）
-    - ``list_enabled_metadata``              运行时元数据目录（不含正文）
-    - ``load_body``                          load_skill 工具按需取正文
-
-外部依赖：``pyyaml``（frontmatter 解析）、``app.config.settings``。
-
-使用示例：
-    from app import skill_store
-
-    skill_store.create_skill({"name": "petcare-calc", "description": "……", "content": "……", "enabled": True})
-    catalog = skill_store.list_enabled_metadata()      # [{name, description}]
-    body = skill_store.load_body("petcare-calc")       # 正文 Markdown
 """
 
 import logging
@@ -75,9 +59,6 @@ def validate_skill(data: dict) -> None:
     Args:
         data: {name, description, content, enabled}。
 
-    Returns:
-        None。
-
     Raises:
         SkillError: 任一约束不满足（消息可直接展示）。
     """
@@ -100,9 +81,6 @@ def validate_skill(data: dict) -> None:
 
 def _parse_skill_md(text: str) -> tuple[dict, str]:
     """拆解 SKILL.md 为 (frontmatter 字典, 正文)。
-
-    Args:
-        text: SKILL.md 全文。
 
     Returns:
         (meta, body)。
@@ -167,9 +145,6 @@ def list_skills() -> List[dict]:
 
     Returns:
         技能列表；根目录不存在时为空列表。
-
-    Raises:
-        无——单个非法包跳过并记日志。
     """
     root = _root()
     if not root.is_dir():
@@ -258,9 +233,6 @@ def update_skill(name: str, data: dict) -> Optional[dict]:
 def delete_skill(name: str) -> bool:
     """删除技能包（整目录，含资源）。
 
-    Args:
-        name: 技能名。
-
     Returns:
         True 表示删掉了；False 表示不存在。
 
@@ -281,9 +253,6 @@ def list_enabled_metadata() -> List[dict]:
 
     Returns:
         ``[{name, description}]``；无启用技能时为空列表。
-
-    Raises:
-        无——单个非法包跳过。
     """
     return [{"name": s["name"], "description": s["description"]}
             for s in list_skills() if s["enabled"]]
@@ -292,14 +261,8 @@ def list_enabled_metadata() -> List[dict]:
 def load_body(name: str) -> Optional[str]:
     """按需加载技能正文（load_skill 工具用）。
 
-    Args:
-        name: 技能名。
-
     Returns:
         正文 Markdown；技能不存在 / 未启用 / 非法时返回 None。
-
-    Raises:
-        无。
     """
     try:
         item = _to_dict(_skill_dir(name), include_content=True)

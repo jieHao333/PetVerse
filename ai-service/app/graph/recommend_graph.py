@@ -1,22 +1,7 @@
 """个性化推荐编排图。
 
-职责：结合用户画像（宠物、订单、购物车、评价、动态）从商城商品与社区动态中挑选并排序，
+结合用户画像（宠物、订单、购物车、评价、动态）从商城商品与社区动态中挑选并排序，
 产出「带推荐理由」的推荐流。排序优先用 LLM 重排，失败或 mock 模式下退回启发式排序。
-
-主要导出：
-    - ``RecommendState``      图状态定义
-    - ``recommend``           对外入口（带缓存与单飞）
-    - ``get_recommend_graph`` 取得（并编译一次）图实例
-    - 各节点与打分函数（``gather_profile`` / ``recall_candidates`` / ``rerank`` /
-      ``persist_cache`` 等）
-
-外部依赖：``app.clients.biz``（业务数据）、``app.llm``、``app.cache``、``app.schemas``。
-
-使用示例：
-    from app.graph.recommend_graph import recommend
-
-    feed = await recommend(user_id=42, scene="home")          # 走缓存
-    feed = await recommend(user_id=42, scene="shop", use_cache=False)   # 强制重算
 
 核心约束：**不推荐与用户饲养物种无关的内容**（只养花枝鼠的用户不该看到猫爬架）。
 这条约束在候选过滤（``_is_off_species``）、提示词、以及合并阶段三处同时施加，
@@ -121,9 +106,6 @@ def _species_order(text: str) -> List[str]:
 
     Returns:
         物种组列表，按首次出现位置排序。
-
-    Raises:
-        无。
     """
     ordered: List[str] = []
     lowered = (text or "").lower()
@@ -144,14 +126,8 @@ def _species_order(text: str) -> List[str]:
 def _species_of(text: str) -> Set[str]:
     """抽取文本涉及的物种组集合。
 
-    Args:
-        text: 待分析文本。
-
     Returns:
         物种组集合；无命中时为空集。
-
-    Raises:
-        无。
     """
     return set(_species_order(text))
 
@@ -170,9 +146,6 @@ def _build_intent(profile: Dict[str, Any]) -> Tuple[List[str], List[str], List[s
             - keywords：用于搜索的关键词（含物种组及其同义词），已截断；
             - own_groups：用户饲养的物种组（用于过滤）；
             - own_words：用户自己填写的物种原词（用于生成推荐理由的措辞）。
-
-    Raises:
-        无。
     """
     keywords: List[str] = []
     own_words: List[str] = []
@@ -239,9 +212,6 @@ def _is_off_species(cand: Dict[str, Any], own_groups: Set[str]) -> bool:
 
     Returns:
         True 表示应当排除。
-
-    Raises:
-        无。
     """
     if not own_groups:
         return False
@@ -261,9 +231,6 @@ def _as_number(value: Any) -> int:
 
     Returns:
         整数值；无法转换时返回 0。
-
-    Raises:
-        无。
     """
     try:
         return int(float(value or 0))
@@ -279,9 +246,6 @@ def _first_image_url(media_list: Any) -> str:
 
     Returns:
         图片 URL；没有图片时返回空串。
-
-    Raises:
-        无。
     """
     if not isinstance(media_list, list):
         return ""
@@ -306,13 +270,9 @@ def _relevance(cand: Dict[str, Any], own_groups: Set[str]) -> float:
 
     Args:
         cand: 候选（含 ``title`` / ``_desc`` / ``_targeted`` / ``type`` / ``likeCount``）。
-        own_groups: 用户饲养的物种组。
 
     Returns:
         相关度分数（可为负）。
-
-    Raises:
-        无。
     """
     in_title = _species_of(cand.get("title") or "")
     in_text = in_title | _species_of(cand.get("_desc") or "")
@@ -339,15 +299,10 @@ def _item_reason(cand: Dict[str, Any], own_groups: Set[str], own_words: List[str
     """生成规则版推荐理由（LLM 不可用或补充候选时使用）。
 
     Args:
-        cand: 候选。
-        own_groups: 用户饲养的物种组。
         own_words: 用户填写的物种原词（用于措辞，比物种组更贴近用户表述）。
 
     Returns:
         不超过一句话的推荐理由。
-
-    Raises:
-        无。
     """
     touched = _species_of(cand.get("title") or "") | _species_of(cand.get("_desc") or "")
     if own_groups and (touched & own_groups):
@@ -362,14 +317,10 @@ def _to_item(cand: Dict[str, Any], reason: str, score: float) -> Dict[str, Any]:
 
     Args:
         cand: 内部候选（含 ``_`` 前缀的内部字段）。
-        reason: 推荐理由。
         score: 对外相关度（0~1）。
 
     Returns:
         去掉内部字段、补上 reason / score 的字典。
-
-    Raises:
-        无。
     """
     # 剔除 `_targeted` / `_desc` / `_score` 等内部字段：它们只服务于排序，
     # 暴露出去既增大响应体，也会让人误以为是接口契约的一部分。
@@ -384,6 +335,7 @@ def _to_item(cand: Dict[str, Any], reason: str, score: float) -> Dict[str, Any]:
 
 def _model_prob(weights: List[float], ctr: float, hot: float, exposure: float) -> float:
     """逻辑回归点击概率。特征口径与数据中台训练端严格一致：
+
     x = [1(偏置), ctr, min(hot,100)/100, log1p(exposure)/10]，避免训练-服务偏斜。
     """
     x = [1.0, max(0.0, min(1.0, ctr)), max(0.0, min(100.0, hot)) / 100.0,
@@ -403,9 +355,6 @@ async def gather_profile(state: RecommendState) -> Dict[str, Any]:
 
     Returns:
         ``{"profile": {...}}``：五项数据均为列表（失败项退化为空列表）。
-
-    Raises:
-        无——``return_exceptions=True`` 保证单项失败不影响整体。
     """
     user_id = state.get("user_id", 0)
     pets, orders, cart, reviews, my_posts, data_profile = await asyncio.gather(
@@ -443,9 +392,6 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
     Returns:
         ``{"keywords", "own_groups", "own_words", "candidates"}``，
         ``candidates`` 已按相关度降序且不超过 ``_CANDIDATE_POOL`` 条。
-
-    Raises:
-        无——单次搜索异常由 ``return_exceptions`` 隔离。
     """
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
@@ -561,14 +507,8 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
 async def rerank(state: RecommendState) -> Dict[str, Any]:
     """重排节点：LLM 精选并写推荐理由，失败则启发式排序。
 
-    Args:
-        state: 图状态。
-
     Returns:
         ``{"items": [...], "summary": str}``。
-
-    Raises:
-        无——模型异常已内部降级。
     """
     candidates = state.get("candidates") or []
     if not candidates:
@@ -614,14 +554,10 @@ def _cache_key(user_id: int, scene: str) -> str:
     """拼缓存键。
 
     Args:
-        user_id: 用户 ID。
         scene: 场景（home / shop）。
 
     Returns:
         形如 ``ai:recommend:v3:home:42`` 的键。
-
-    Raises:
-        无。
     """
     return f"ai:recommend:{_CACHE_VERSION}:{scene}:{user_id}"
 
@@ -632,14 +568,8 @@ async def persist_cache(state: RecommendState) -> Dict[str, Any]:
     空结果不缓存是刻意的：业务数据短暂故障导致的空推荐若被缓存 5 分钟，
     用户刷新也看不到内容，体感上就是「推荐坏了」。
 
-    Args:
-        state: 图状态。
-
     Returns:
         空字典（该节点不修改状态）。
-
-    Raises:
-        无。
     """
     user_id = state.get("user_id", 0)
     scene = state.get("scene", "home")
@@ -654,14 +584,8 @@ async def persist_cache(state: RecommendState) -> Dict[str, Any]:
 def _profile_digest(profile: Dict[str, Any]) -> str:
     """把画像压缩成给模型看的简短摘要。
 
-    Args:
-        profile: 画像字典。
-
     Returns:
         多行摘要文本；数据不足时返回一句兜底说明（提示模型只能按热门推荐）。
-
-    Raises:
-        无。
     """
     lines = []
     pets = profile.get("pets") or []
@@ -713,13 +637,9 @@ def _identity(cand_type: str, raw_id: Any) -> Tuple[str, str]:
 
     Args:
         cand_type: ``product`` / ``space``。
-        raw_id: 原始 id。
 
     Returns:
         ``(类型, id 字符串)``。
-
-    Raises:
-        无。
     """
     return cand_type, str(raw_id)
 
@@ -734,15 +654,10 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
     Args:
         model_items: 模型输出的 ``RecommendItem`` 列表。
         candidates: 候选池（已按相关度降序）。
-        own_groups: 用户饲养的物种组。
-        own_words: 用户填写的物种原词。
         top_n: 对外条数上限（随场景变化，见 ``_top_n``）。
 
     Returns:
         最多 ``top_n`` 条的对外结构列表。
-
-    Raises:
-        无。
     """
     index = {_identity(c["type"], c["id"]): c for c in candidates if c.get("id") is not None}
     merged = []
@@ -771,14 +686,8 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
 def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
     """纯规则排序（mock 模式与模型失败时的兜底）。
 
-    Args:
-        state: 图状态。
-
     Returns:
         ``{"items": [...], "summary": str}``。
-
-    Raises:
-        无。
     """
     scene = state.get("scene", "home")
     top_n = _top_n(scene)
@@ -816,9 +725,6 @@ def get_recommend_graph():
 
     Returns:
         已编译的图（无 checkpointer / store：推荐是单轮无状态流程）。
-
-    Raises:
-        无。
     """
     global _graph
     if _graph is not None:
@@ -841,7 +747,6 @@ async def recommend(user_id: int, scene: str = "home", use_cache: bool = True) -
     """生成个性化推荐流。
 
     Args:
-        user_id: 用户 ID。
         scene: 场景，``home`` 或 ``shop``。
         use_cache: 是否使用缓存；False 表示强制重算（但仍会回填缓存）。
 

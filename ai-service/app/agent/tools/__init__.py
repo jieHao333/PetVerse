@@ -1,20 +1,6 @@
 """自主 Agent 的工具子包。
 
-职责：把「模型可调用的能力」按业务域组织成可插拔的注册表，并区分只读能力与写操作。
-
-主要导出：
-    - ``ToolContext``   构造工具所需的运行时上下文
-    - ``build_tools``   按分组装配内置工具列表
-    - ``build_tools_async`` 内置工具 + MCP 远程工具（对话链路用这个）
-    - ``enabled_groups`` 解析配置里启用的分组
-    - ``has_write_tools`` 本次是否启用了有副作用的能力
-
-外部依赖：``langchain_core.tools``、``langgraph.prebuilt``（状态注入）、``app.clients.biz``。
-
-使用示例：
-    from app.agent.tools import ToolContext, build_tools
-
-    tools = build_tools(ToolContext(user_id=42))
+把「模型可调用的能力」按业务域组织成可插拔的注册表，并区分只读能力与写操作。
 
 分组语义：
     只读：``knowledge`` / ``pet`` / ``shop`` / ``community`` / ``profile``

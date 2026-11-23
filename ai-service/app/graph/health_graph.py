@@ -1,20 +1,7 @@
 """宠物健康评估编排图。
 
-职责：把宠物档案整理成评估输入 → 由 LLM 产出结构化报告（评分 / 风险 / 建议 / 计划 / 提醒）
+把宠物档案整理成评估输入 → 由 LLM 产出结构化报告（评分 / 风险 / 建议 / 计划 / 提醒）
 → 写入 ``pet_health_report`` 供历史回看。LLM 不可用或 mock 模式下走规则评估。
-
-主要导出：
-    - ``HealthState``        图状态定义
-    - ``assess``             对外入口（一次性评估）
-    - ``get_health_graph``   取得（并编译一次）图实例
-
-外部依赖：``app.llm``、``app.pg_store``、``app.schemas.PetHealthReport``。
-
-使用示例：
-    from app.graph.health_graph import assess
-
-    report = await assess(user_id=42, pet={"id": 7, "name": "豆豆", "species": "猫",
-                                          "health": {"weight": "4.2kg"}})
 
 合规约束：评估只能「基于用户填写的信息」，不做医疗诊断；报告固定带免责声明。
 这条约束同时体现在提示词和 ``PetHealthReport`` 的默认值里。
@@ -62,14 +49,8 @@ def _profile_lines(pet: Dict[str, Any]) -> tuple[List[str], List[str]]:
     缺失项不是可有可无的信息：它们既是规则评估的扣分依据，也会写进建议里
     「请补全档案」，让用户知道评估为何偏保守。
 
-    Args:
-        pet: 宠物档案字典。
-
     Returns:
         ``(行列表, 缺失字段标签列表)``。
-
-    Raises:
-        无。
     """
     lines: List[str] = []
     missing: List[str] = []
@@ -113,9 +94,6 @@ async def load_profile(state: HealthState) -> Dict[str, Any]:
 
     Returns:
         ``{"profile_text": str, "missing": [...]}``。
-
-    Raises:
-        无。
     """
     pet = state.get("pet") or {}
     lines, missing = _profile_lines(pet)
@@ -144,9 +122,6 @@ async def analyze(state: HealthState) -> Dict[str, Any]:
 
     Returns:
         ``{"report": {...}}``，与 ``PetHealthReport`` 同构。
-
-    Raises:
-        无。
     """
     if settings.is_mock:
         return {"report": _rule_report(state)}
@@ -176,9 +151,6 @@ async def persist(state: HealthState) -> Dict[str, Any]:
 
     Returns:
         空字典（该节点不修改状态）。
-
-    Raises:
-        无——``pg_store.save_health_report`` 内部已降级。
     """
     report = state.get("report") or {}
     await pg_store.save_health_report(
@@ -198,9 +170,6 @@ def _rule_report(state: HealthState) -> Dict[str, Any]:
 
     Returns:
         ``PetHealthReport`` 的字典形式。
-
-    Raises:
-        无。
     """
     pet = state.get("pet") or {}
     health = pet.get("health") or {}
@@ -272,9 +241,6 @@ def get_health_graph():
 
     Returns:
         已编译的图（单轮无状态，不需要 checkpointer）。
-
-    Raises:
-        无。
     """
     global _graph
     if _graph is not None:
@@ -295,7 +261,6 @@ async def assess(user_id: int, pet: Dict[str, Any]) -> Dict[str, Any]:
     """对一只宠物做健康评估。
 
     Args:
-        user_id: 用户 ID。
         pet: 宠物档案（含 ``health``）。
 
     Returns:

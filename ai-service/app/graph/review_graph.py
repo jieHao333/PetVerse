@@ -1,20 +1,7 @@
 """商品评论摘要编排图。
 
-职责：拉取某商品的全部评论 → 让 LLM 归纳情感倾向 / 一句话总结 / 优缺点 / 关键词 →
+拉取某商品的全部评论 → 让 LLM 归纳情感倾向 / 一句话总结 / 优缺点 / 关键词 →
 结果写入二级缓存。评论数不足或 LLM 失败时退回规则摘要。
-
-主要导出：
-    - ``ReviewState``          图状态定义
-    - ``summarize_product``    对外入口（带缓存与单飞）
-    - ``get_review_graph``     取得（并编译一次）图实例
-
-外部依赖：``app.clients.biz``（评论数据）、``app.llm``、``app.cache``、``app.schemas``。
-
-使用示例：
-    from app.graph.review_graph import summarize_product
-
-    summary = await summarize_product(product_id=128)
-    # {"sentiment": "positive", "one_line": "...", "pros": [...], "count": 32, ...}
 
 设计取舍：「优点 / 缺点必须来自真实评论」是硬要求，因此提示词禁止编造，
 且 ``count`` 由服务端按有效评论数回填，不采信模型的计数。
@@ -55,9 +42,6 @@ async def fetch_reviews(state: ReviewState) -> Dict[str, Any]:
 
     Returns:
         ``{"reviews": [...]}``；拉取失败时为空列表。
-
-    Raises:
-        无。
     """
     product_id = state.get("product_id", 0)
     # 取 50 条而摘要只用前 40 条：留一点余量，让「无内容评论」被过滤后仍有足够样本。
@@ -68,14 +52,8 @@ async def fetch_reviews(state: ReviewState) -> Dict[str, Any]:
 def _review_lines(reviews: List[Dict[str, Any]]) -> List[str]:
     """把评论整理成给模型的列表文本。
 
-    Args:
-        reviews: 评论列表。
-
     Returns:
         形如 ``[5星] 评论内容`` 的行列表（已压平换行、截断长度）。
-
-    Raises:
-        无。
     """
     lines = []
     for r in reviews[:_MAX_REVIEWS]:
@@ -96,9 +74,6 @@ async def summarize(state: ReviewState) -> Dict[str, Any]:
 
     Returns:
         ``{"summary": {...}}``，字段与 ``ReviewSummary`` 对齐；无有效评论时返回中性占位。
-
-    Raises:
-        无。
     """
     reviews = state.get("reviews") or []
     valid = [r for r in reviews if (r.get("content") or "").strip()]
@@ -136,14 +111,8 @@ async def persist_cache(state: ReviewState) -> Dict[str, Any]:
     空摘要（无评论）不缓存：用户看到「暂无评论」后可能过一会儿再来，
     若缓存命中就会一直看到旧结论。
 
-    Args:
-        state: 图状态。
-
     Returns:
         空字典（该节点不修改状态）。
-
-    Raises:
-        无。
     """
     product_id = state.get("product_id", 0)
     summary = state.get("summary") or {}
@@ -156,14 +125,8 @@ async def persist_cache(state: ReviewState) -> Dict[str, Any]:
 def _rule_summary(reviews: List[Dict[str, Any]]) -> Dict[str, Any]:
     """基于评分与情感词的规则摘要（LLM 不可用时的兜底）。
 
-    Args:
-        reviews: 有效评论列表。
-
     Returns:
         与 ``ReviewSummary`` 同构的字典。
-
-    Raises:
-        无。
     """
     ratings = [r.get("rating") for r in reviews if isinstance(r.get("rating"), (int, float))]
     avg = sum(ratings) / len(ratings) if ratings else 0
@@ -196,14 +159,8 @@ _NEG_WORDS = ["差", "不好", "失望", "退", "贵", "慢", "破", "问题", "
 def _is_positive(text: str) -> bool:
     """判断评论是否含正面情感词。
 
-    Args:
-        text: 评论内容。
-
     Returns:
         True 表示命中任一正面词。
-
-    Raises:
-        无。
     """
     return any(w in text for w in _POS_WORDS)
 
@@ -211,14 +168,8 @@ def _is_positive(text: str) -> bool:
 def _is_negative(text: str) -> bool:
     """判断评论是否含负面情感词。
 
-    Args:
-        text: 评论内容。
-
     Returns:
         True 表示命中任一负面词。
-
-    Raises:
-        无。
     """
     return any(w in text for w in _NEG_WORDS)
 
@@ -229,14 +180,8 @@ def _keywords(contents: List[str]) -> List[str]:
     只统计 2~4 字的非 ASCII 片段：中文短评的关键词多是双字词或三字短语，
     而 ASCII 片段（型号、英文品牌）用 n-gram 会切出大量无意义碎片。
 
-    Args:
-        contents: 评论内容列表。
-
     Returns:
         频次最高的 6 个候选词（可能包含重叠子串，仅作展示用）。
-
-    Raises:
-        无。
     """
     from collections import Counter
     counter: Counter = Counter()
@@ -260,9 +205,6 @@ def get_review_graph():
 
     Returns:
         已编译的图（无状态，不需要 checkpointer）。
-
-    Raises:
-        无。
     """
     global _graph
     if _graph is not None:
@@ -281,10 +223,6 @@ def get_review_graph():
 
 async def summarize_product(product_id: int, use_cache: bool = True) -> Dict[str, Any]:
     """生成商品评论摘要。
-
-    Args:
-        product_id: 商品 ID。
-        use_cache: 是否使用缓存。
 
     Returns:
         摘要字典；无评论时 ``count`` 为 0。

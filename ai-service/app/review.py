@@ -1,18 +1,7 @@
 """商品评论摘要接口。
 
-职责：暴露 ``POST /ai/shop/review/summary``，把「按商品 ID 生成口碑摘要」的能力提供给
+暴露 ``POST /ai/shop/review/summary``，把「按商品 ID 生成口碑摘要」的能力提供给
 商城页面。业务逻辑（拉评论、LLM 摘要、缓存）在 ``app.graph.review_graph``，本文件只做协议。
-
-主要导出：
-    - ``router``            FastAPI 路由（前缀 ``/ai``）
-    - ``ReviewSummaryRequest`` 请求体模型
-
-外部依赖：``app.graph.review_graph.summarize_product``、``app.schemas``。
-
-使用示例：
-    POST /ai/shop/review/summary
-    Body: {"productId": 128}
-    → {"code":200,"data":{"sentiment":"positive","one_line":"...","count":32,...}}
 """
 
 import logging
@@ -47,13 +36,9 @@ async def review_summary(
 
     Args:
         req: 请求体（含 ``productId``）。
-        x_user_id: 网关注入的用户 ID。
 
     Returns:
         ``ok(ReviewSummary)``；未登录返回 401，内部异常返回 500 通用提示。
-
-    Raises:
-        无——异常统一转成业务报文，前端不会收到裸 5xx。
     """
     if not x_user_id:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))

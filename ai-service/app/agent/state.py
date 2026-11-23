@@ -1,15 +1,8 @@
 """自主 Agent 的状态定义。
 
-职责：定义对话 AgentLoop 的图状态（TypedDict）与初始状态工厂。状态是「一轮对话」的
+定义对话 AgentLoop 的图状态（TypedDict）与初始状态工厂。状态是「一轮对话」的
 唯一事实来源——模型决策、工具结果、引用来源、护栏标记都挂在上面，并由 checkpointer
 按 ``thread_id`` 持久化，下一轮自动恢复。
-
-主要导出：
-    - ``AgentState``     图状态定义
-    - ``merge_knowledge`` 引用来源的合并 reducer
-    - ``initial_state``  构造初始状态
-
-外部依赖：``langchain_core.messages``、``langgraph.graph.message.add_messages``。
 
 设计要点：
     1. ``messages`` 仍用 ``add_messages`` 且字段名不变——存量会话的 checkpoint 里只有这个
@@ -33,13 +26,9 @@ def merge_knowledge(left: List[dict], right: List[dict]) -> List[dict]:
 
     Args:
         left: 已累积的片段列表（LangGraph 传入的当前值，可能为 None）。
-        right: 本次节点新增的片段列表。
 
     Returns:
         去重后的合并列表，保持「先到先得」的顺序（即引用编号的先后顺序）。
-
-    Raises:
-        无——结构异常的条目按内容哈希兜底，不会中断图执行。
     """
     merged: List[dict] = []
     seen = set()
@@ -113,16 +102,10 @@ def initial_state(query: str, pet: Dict[str, Any], user_id: int,
 
     Args:
         query: 本轮用户问题（纯语音时为转写拼接结果）。
-        pet: 宠物档案字典。
-        user_id: 用户 ID。
         messages: 已拼接历史的输入消息（含本轮 HumanMessage）。
-        attachments: 附件列表。
 
     Returns:
         可直接传给 ``graph.ainvoke`` / ``graph.astream`` 的状态字典。
-
-    Raises:
-        无。
     """
     return {
         "query": query,

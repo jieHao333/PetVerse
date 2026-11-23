@@ -1,15 +1,7 @@
 """MySQL → PostgreSQL 一次性数据迁移脚本。
 
-职责：把旧版存在 MySQL 里的 ``chat_session`` / ``chat_message`` 搬到 PostgreSQL，
+把旧版存在 MySQL 里的 ``chat_session`` / ``chat_message`` 搬到 PostgreSQL，
 保留原会话 ID（前端历史链接与 checkpoint 的 thread_id 都依赖它），并修正自增序列。
-
-主要导出：无（作为脚本执行）。
-
-外部依赖：``aiomysql``（仅迁移需要，完成后可卸载）、``psycopg``、``app.persistence``。
-
-使用示例：
-    pip install aiomysql          # 仅迁移时需要
-    python -m scripts.migrate_mysql_to_pg
 
 幂等性：插入使用 ``ON CONFLICT (id) DO NOTHING``，重复执行不会产生重复数据，
 只会报告「已存在跳过 N 条」。迁移完成后无需额外处理 checkpoint 记忆——
@@ -63,9 +55,6 @@ def _localize(dt: datetime) -> datetime:
 
     Returns:
         带时区的时间；已有时区或为 None 时原样返回。
-
-    Raises:
-        无。
     """
     if dt is None or dt.tzinfo is not None:
         return dt
@@ -119,10 +108,6 @@ def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
     显式带上主键 id 插入（而不是让 PG 重新生成），这样会话 ID、消息归属、
     checkpoint 的 thread_id 都能原样沿用。
 
-    Args:
-        sessions: 会话元组列表。
-        messages: 消息元组列表。
-
     Returns:
         ``(新增会话数, 新增消息数)``；已存在的记录不计入。
 
@@ -162,12 +147,6 @@ def _write_pg(sessions: List[tuple], messages: List[tuple]) -> Tuple[int, int]:
 
 async def main() -> None:
     """迁移主流程：读源库 → 确保目标表存在 → 写入 → 打印统计。
-
-    Returns:
-        None。
-
-    Raises:
-        无（连接类错误以 SystemExit 退出）。
     """
     setup_logging()
     sessions, messages = await _read_mysql()

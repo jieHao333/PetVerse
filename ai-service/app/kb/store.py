@@ -1,26 +1,7 @@
 """知识库持久化（PostgreSQL + pgvector）。
 
-职责：维护 ``kb_document``（文档元信息）/ ``kb_chunk``（片段 + 向量）/ ``kb_meta``（版本戳）
+维护 ``kb_document``（文档元信息）/ ``kb_chunk``（片段 + 向量）/ ``kb_meta``（版本戳）
 三张表，提供写入、查询、向量召回三类操作。
-
-主要导出：
-    - ``init`` / ``close`` / ``ensure_ready``   生命周期
-    - ``upsert_document`` / ``delete_document`` / ``clear_all``  写入与删除
-    - ``list_documents`` / ``get_document`` / ``document_chunks`` / ``stats``  查询
-    - ``dense_search`` / ``chunks_by_ids``      向量召回与按 ID 回填
-    - ``version``                               供 BM25 索引判断是否需要重建
-    - ``lexicon_rows`` / ``all_contents``       供索引构建与评测使用
-    - ``CHUNK_KEY_SEP``                         片段复合键分隔符（当前未被引用，用途待确认）
-
-外部依赖：``psycopg`` / ``psycopg_pool``、pgvector 扩展（``vector`` 类型与 ``<=>`` 运算符）、
-``app.config.settings``。
-
-使用示例：
-    from app.kb import store
-
-    await store.init()
-    await store.upsert_document(meta, chunks, vectors)
-    rows = await store.dense_search(vector, k=20)
 
 一致性设计：写入以 ``doc_id`` 为单位整体覆盖（单事务内「删旧片段 → 写文档行 → 写片段」），
 并自增 ``kb_meta.version``；进程内的 BM25 索引据此惰性重建，避免多实例 / 多进程缓存不一致。
@@ -53,9 +34,6 @@ def _ddl() -> List[str]:
 
     Returns:
         DDL 语句列表；每项都用 ``IF NOT EXISTS``，既用于首次部署也用于老库升级。
-
-    Raises:
-        无。
     """
     return [
         """CREATE TABLE IF NOT EXISTS kb_document (
@@ -136,12 +114,6 @@ async def init() -> None:
     """初始化连接池并确保表结构就绪。
 
     失败时清空 ``_pool``，使后续调用走「知识库不可用」的降级路径，而不是反复重试。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     try:
@@ -155,12 +127,6 @@ async def init() -> None:
 
 async def close() -> None:
     """关闭连接池。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     pool, _pool = _pool, None
@@ -175,8 +141,6 @@ def _exec(sql: str, params: Sequence = (), fetch: str = None):
     """同步执行一条 SQL。
 
     Args:
-        sql: SQL 语句。
-        params: 参数序列。
         fetch: ``"all"`` 返回全部行，``"one"`` 返回首行，None 不取结果。
 
     Returns:
@@ -200,11 +164,6 @@ async def _run(sql: str, params: Sequence = (), fetch: str = None):
 
     注意这里没有包 try/except：调用方需要区分「查询失败」与「查询为空」的语义差异。
 
-    Args:
-        sql: SQL 语句。
-        params: 参数序列。
-        fetch: 同上。
-
     Returns:
         查询结果。
 
@@ -219,9 +178,6 @@ async def _run(sql: str, params: Sequence = (), fetch: str = None):
 
 async def _ensure_schema() -> None:
     """确保表结构就绪，并校验向量维度与配置一致。
-
-    Returns:
-        None。
 
     Raises:
         RuntimeError: 已存在表的向量维度与 ``EMBEDDING_DIM`` 不一致时抛出——这是一个
@@ -252,9 +208,6 @@ async def _ensure_schema() -> None:
 
 async def ensure_ready() -> None:
     """对外暴露的「确保表就绪」入口（入库流程调用）。
-
-    Returns:
-        None。
 
     Raises:
         RuntimeError: 见 ``_ensure_schema``。
@@ -327,9 +280,6 @@ async def upsert_document(doc_meta: dict, chunks: List[dict], vectors: List[List
 async def delete_document(doc_id: str) -> bool:
     """删除一篇文档（片段经外键级联删除）。
 
-    Args:
-        doc_id: 文档 ID。
-
     Returns:
         True 表示确实删掉了一行；False 表示文档不存在。
 
@@ -380,7 +330,6 @@ async def list_documents(page: int = 1, size: int = 20,
 
     Args:
         page: 页码，从 1 开始（越界值会被夹到合法范围）。
-        size: 每页条数，1~100。
         keyword: 模糊过滤词，匹配文档名 / 来源 / 分类 / doc_id。
 
     Returns:
@@ -424,9 +373,6 @@ async def list_documents(page: int = 1, size: int = 20,
 async def document_chunks(doc_id: str) -> List[dict]:
     """列出某文档的全部片段（按 chunk_index 升序）。
 
-    Args:
-        doc_id: 文档 ID。
-
     Returns:
         片段列表（chunkIndex / section / content / chars / tokenCount）。
 
@@ -445,9 +391,6 @@ async def document_chunks(doc_id: str) -> List[dict]:
 async def get_document(doc_id: str) -> Optional[dict]:
     """查询单篇文档的元信息（不含片段）。
 
-    Args:
-        doc_id: 文档 ID。
-
     Returns:
         文档字典；不存在时返回 None。
 
@@ -465,10 +408,6 @@ async def get_document(doc_id: str) -> Optional[dict]:
 
 async def document_exists(doc_id: str, sha256: str) -> bool:
     """判断文档是否已存在且内容未变（增量导入的跳过依据）。
-
-    Args:
-        doc_id: 文档 ID。
-        sha256: 本次解析出的内容哈希。
 
     Returns:
         True 表示库中同 doc_id 的 sha256 与本次一致，可以跳过重新向量化。
@@ -540,10 +479,6 @@ async def lexicon_rows() -> List[tuple]:
 async def dense_search(vector: Sequence[float], k: int) -> List[dict]:
     """向量召回：按余弦距离取最近的 k 个片段。
 
-    Args:
-        vector: 查询向量。
-        k: 返回条数。
-
     Returns:
         片段列表，含 ``sim``（余弦相似度，越大越相近）。距离运算符 ``<=>`` 返回的是
         余弦**距离**（1 - 相似度），因此这里做一次换算。
@@ -569,9 +504,6 @@ async def chunks_by_ids(chunk_ids: Sequence[int]) -> List[dict]:
 
     混合检索先用两条通道拿到候选 ID，再统一回填——避免每条通道各自 JOIN 一次文档表。
 
-    Args:
-        chunk_ids: 片段 ID 列表。
-
     Returns:
         片段列表；``chunk_ids`` 为空时直接返回空列表（不发起查询）。
 
@@ -596,9 +528,6 @@ async def chunks_by_ids(chunk_ids: Sequence[int]) -> List[dict]:
 def _vec_text(vector: Sequence[float]) -> str:
     """把向量转成 pgvector 文本字面量。
 
-    Args:
-        vector: 浮点序列。
-
     Returns:
         ``[0.1234567,0.7654321,...]`` 形式的字符串，每个分量固定保留 7 位小数。
         pgvector 接受这种文本字面量，配合 SQL 里的 ``::vector`` 转型即可写入。
@@ -611,9 +540,6 @@ def _vec_text(vector: Sequence[float]) -> str:
 
 def json_default(obj):
     """JSON 序列化的默认编码器（保留中文）。
-
-    Args:
-        obj: 待序列化对象。
 
     Returns:
         JSON 字符串。

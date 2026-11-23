@@ -1,29 +1,8 @@
 """LLM / Embedding 客户端封装。
 
-职责：把 LangChain 的模型客户端收敛为「按需创建 + 进程内复用」的三个惰性单例，并在其上提供
+把 LangChain 的模型客户端收敛为「按需创建 + 进程内复用」的三个惰性单例，并在其上提供
 三类调用方式——流式对话、纯文本调用、结构化（Pydantic）输出；同时内置结构化输出的
 多方式自动降级与无 Key 环境下的模拟流。
-
-主要导出：
-    - ``get_client``        对话模型客户端（OpenAI 兼容，支持任意服务商）
-    - ``get_vision_client`` 视觉模型客户端（多模态看图）
-    - ``get_embeddings``    Embedding 客户端（RAG 向量化）
-    - ``stream_chat``       流式产出增量文本
-    - ``ainvoke_text``      一次性取回完整文本（可临时覆盖温度 / 长度）
-    - ``astructured_invoke`` 让模型按 Pydantic schema 输出结构化结果
-    - ``mock_stream``       模拟回复流（MOCK 模式或无 Key 时使用）
-
-外部依赖：``langchain-openai``（延迟 import，避免未装依赖时整个服务起不来）、
-``langchain_core.messages``、``app.config.settings``。
-
-使用示例：
-    from app.llm import astructured_invoke, stream_chat
-    from app.schemas import ReviewSummary
-
-    async for delta in stream_chat(messages):
-        print(delta, end="")
-
-    summary = await astructured_invoke(ReviewSummary, system_prompt, user_prompt)
 """
 
 import asyncio
@@ -154,8 +133,6 @@ async def ainvoke_text(system_prompt: str, user_prompt: str,
     """一次性取回完整文本（非流式），用于摘要、改写等中间步骤。
 
     Args:
-        system_prompt: 系统提示词。
-        user_prompt: 用户侧输入。
         temperature: 临时覆盖全局温度；None 表示沿用 ``settings.LLM_TEMPERATURE``。
         max_tokens: 临时覆盖全局长度上限；None 表示沿用 ``settings.LLM_MAX_TOKENS``。
 
@@ -188,14 +165,8 @@ _structured_method: Optional[str] = None
 def _json_mode_hint(schema: Type[BaseModel]) -> str:
     """把 Pydantic schema 拼成提示词片段，供不支持原生 schema 约束的服务商使用。
 
-    Args:
-        schema: 目标输出模型。
-
     Returns:
         追加到 system prompt 末尾的约束文本（含完整 JSON Schema）。
-
-    Raises:
-        无。
     """
     schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
     return ("\n\n必须严格按以下 JSON Schema 输出一个 JSON 对象，只输出 JSON，不要任何额外文字：\n"
@@ -209,8 +180,6 @@ async def astructured_invoke(schema: Type[BaseModel], system_prompt: str,
     Args:
         schema: 目标 Pydantic 模型（其 ``Field(description=...)`` 会随 schema 一起下发，
             因此字段描述写得好不好直接决定抽取质量）。
-        system_prompt: 系统提示词。
-        user_prompt: 用户侧输入。
 
     Returns:
         已校验的 ``schema`` 实例。

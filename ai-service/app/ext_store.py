@@ -1,22 +1,9 @@
 """MCP 服务配置的 PostgreSQL 存储。
 
-职责：存放管理员在「AI 扩展管理」页维护的 MCP 服务连接参数（``ai_mcp_server``）。
+存放管理员在「AI 扩展管理」页维护的 MCP 服务连接参数（``ai_mcp_server``）。
 与 ``app.persistence``（会话消息）同款可靠性语义：配置是管理端显式写入的数据，
 读写失败向上抛由路由层转业务错误，不静默降级。Skill 技能不在此处——它是磁盘上的
 标准技能包（``app.skill_store``，``skills/<name>/SKILL.md``）。
-
-主要导出：
-    - ``init`` / ``close`` / ``available``  生命周期
-    - ``list_mcp_servers`` / ``get_mcp_server`` / ``create_mcp_server``
-      / ``update_mcp_server`` / ``delete_mcp_server`` / ``list_enabled_mcp_servers``
-
-外部依赖：``psycopg`` / ``psycopg_pool``、``app.config.settings``。
-
-使用示例：
-    from app import ext_store
-
-    await ext_store.init()
-    servers = await ext_store.list_enabled_mcp_servers()
 """
 
 import asyncio
@@ -60,9 +47,6 @@ _SCHEMA_STATEMENTS = (
 def _init_sync() -> None:
     """同步创建连接池（供 ``asyncio.to_thread`` 调用）。
 
-    Returns:
-        None。
-
     Raises:
         Exception: 连接池构造失败时抛出，由 ``init`` 捕获并降级。
     """
@@ -80,12 +64,6 @@ def _init_sync() -> None:
 
 async def init() -> None:
     """初始化连接池并确保扩展配置表存在。
-
-    Returns:
-        None。
-
-    Raises:
-        无——失败只记日志，管理接口会返回「服务暂不可用」，对话主链路不受影响。
     """
     global _pool
     try:
@@ -104,9 +82,6 @@ async def _ensure_tables() -> bool:
 
     Returns:
         True 表示表已就绪；False 表示当前不可用。
-
-    Raises:
-        无——建表失败只记日志，等冷却结束后重试。
     """
     global _tables_ready, _last_tables_try
     if _tables_ready:
@@ -136,12 +111,6 @@ async def _ensure_tables() -> bool:
 
 async def close() -> None:
     """关闭连接池。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     pool, _pool = _pool, None
@@ -157,9 +126,6 @@ def available() -> bool:
 
     Returns:
         True 表示可以尝试读写。
-
-    Raises:
-        无。
     """
     return _pool is not None
 
@@ -169,7 +135,6 @@ async def _run(sql: str, params: tuple = (), fetch: bool = False):
 
     Args:
         sql: SQL 语句（``%s`` 占位符）。
-        params: 参数元组。
         fetch: True 时返回 ``fetchall()`` 结果。
 
     Returns:
@@ -245,9 +210,6 @@ async def list_enabled_mcp_servers() -> List[dict]:
 async def get_mcp_server(server_id: int) -> Optional[dict]:
     """按 ID 取单个 MCP 服务。
 
-    Args:
-        server_id: 服务 ID。
-
     Returns:
         服务配置；不存在时返回 None。
 
@@ -290,7 +252,6 @@ async def update_mcp_server(server_id: int, data: dict) -> Optional[dict]:
     """整体更新 MCP 服务配置（含启用状态）。
 
     Args:
-        server_id: 服务 ID。
         data: 与 ``create_mcp_server`` 同构的完整配置。
 
     Returns:
@@ -315,9 +276,6 @@ async def update_mcp_server(server_id: int, data: dict) -> Optional[dict]:
 
 async def delete_mcp_server(server_id: int) -> bool:
     """删除 MCP 服务。
-
-    Args:
-        server_id: 服务 ID。
 
     Returns:
         True 表示删掉了；False 表示 ID 不存在。

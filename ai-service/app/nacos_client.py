@@ -1,22 +1,8 @@
 """Nacos 服务注册与心跳保活。
 
-职责：启动时把 ai-service 注册进 Nacos（供网关 ``lb://ai-service`` 发现），并在后台线程
+启动时把 ai-service 注册进 Nacos（供网关 ``lb://ai-service`` 发现），并在后台线程
 持续发送心跳；心跳发现实例丢失时自动重新注册。注册失败**不阻断启动**——服务照常对外
 提供能力，只是网关可能发现不到它。
-
-主要导出：
-    - ``NacosRegistrar``  注册器（SDK 优先、OpenAPI 兜底）
-    - ``registrar``       进程级实例
-    - ``register`` / ``deregister``  供应用生命周期钩子调用的无异常版本
-
-外部依赖：``httpx``（OpenAPI 与心跳）、可选 ``nacos-sdk-python``、
-``app.config.settings``。
-
-使用示例：
-    from app import nacos_client
-
-    await asyncio.to_thread(nacos_client.register)     # 启动时（同步实现，放线程池）
-    await asyncio.to_thread(nacos_client.deregister)   # 停机时
 
 为什么有两套注册实现：``nacos-sdk-python`` 是可选依赖（未装则 import 失败），
 而心跳保活又必须可靠，因此 SDK 不可用时直接走 HTTP OpenAPI，功能等价。
@@ -113,10 +99,6 @@ def _is_loopback_host(host: str) -> bool:
 def _self_reachable(ip: str, port: int) -> bool:
     """用注册地址回连自己，确认这个地址真的能建立连接。
 
-    Args:
-        ip: 待注册的地址。
-        port: 待注册的端口。
-
     Returns:
         True 表示能连上；False 表示不可达（端口未监听 / 只绑了回环 / 网卡被拦）。
     """
@@ -142,7 +124,6 @@ def _resolve_advertise_ip(configured_ip: str, port: int, bind_host: str = "") ->
 
     Args:
         configured_ip: ``AI_SERVICE_IP`` 配置值，空串或通配地址表示跳过。
-        port: 本服务监听端口。
         bind_host: ``AI_SERVICE_HOST``，即 uvicorn 实际绑定的地址。
 
     Returns:
@@ -217,12 +198,6 @@ class NacosRegistrar:
         只有到这一步回连自检才能反映真实的监听状态（构造时端口还没起来，自检必然失败）。
 
         注册失败只记日志，不发异常：服务可用性优先于服务发现的完整性。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         self._ip = _resolve_advertise_ip(self._ip, self._port, settings.AI_SERVICE_HOST)
         registered = self._register_via_sdk() or self._register_via_openapi()
@@ -235,12 +210,6 @@ class NacosRegistrar:
         """注销实例并停止心跳线程。
 
         先停心跳再注销，避免刚注销就被心跳线程重新注册回去。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         self._stop_beat_thread()
         done = False
@@ -261,9 +230,6 @@ class NacosRegistrar:
 
         Returns:
             True 表示注册成功；SDK 未安装或调用失败时返回 False，由调用方降级 OpenAPI。
-
-        Raises:
-            无。
         """
         try:
             import nacos
@@ -288,9 +254,6 @@ class NacosRegistrar:
 
         Returns:
             True 表示注册成功（HTTP 200 且响应体含 ``ok``）。
-
-        Raises:
-            无。
         """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance"
         params = {
@@ -317,12 +280,6 @@ class NacosRegistrar:
 
     def _deregister_via_openapi(self) -> None:
         """用 HTTP OpenAPI 注销实例。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance"
         params = {
@@ -348,12 +305,6 @@ class NacosRegistrar:
         """启动守护心跳线程（已启动则跳过）。
 
         ``daemon=True``：主进程退出时线程不阻塞关闭流程。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         if self._beat_thread is not None and self._beat_thread.is_alive():
             return
@@ -364,12 +315,6 @@ class NacosRegistrar:
 
     def _stop_beat_thread(self) -> None:
         """通知心跳线程退出并等待其结束（最多 2 秒）。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         self._running = False
         if self._beat_thread is not None and self._beat_thread.is_alive():
@@ -381,12 +326,6 @@ class NacosRegistrar:
 
         Args:
             reason: 触发原因（写入日志便于排查是「心跳失败」还是「实例被摘除」）。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         now = time.monotonic()
         if now - self._last_reregister_ts < _REREGISTER_MIN_INTERVAL_SECONDS:
@@ -411,9 +350,6 @@ class NacosRegistrar:
 
         Returns:
             None（线程结束）。
-
-        Raises:
-            无——循环内捕获所有异常，单次失败不会终止线程。
         """
         url = f"http://{self._server_addr}/nacos/v1/ns/instance/beat"
         params = {
@@ -469,12 +405,6 @@ registrar = NacosRegistrar(
 
 def register() -> None:
     """注册实例（吞掉所有异常，保证启动流程不被注册中心问题阻断）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     try:
         registrar.register()
@@ -484,12 +414,6 @@ def register() -> None:
 
 def deregister() -> None:
     """注销实例（吞掉所有异常，保证停机流程不被注册中心问题阻断）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     try:
         registrar.deregister()

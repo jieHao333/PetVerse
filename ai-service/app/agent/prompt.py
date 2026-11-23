@@ -1,25 +1,9 @@
 """自主 Agent 的 System Prompt 组装。
 
-职责：把「人设与规则」「宠物档案」「长期记忆」「预注入的参考知识」「可用能力清单」
+把「人设与规则」「宠物档案」「长期记忆」「预注入的参考知识」「可用能力清单」
 拼成一条完整的 System Prompt。与改造前 ``app.persona.build_system_prompt`` 的区别只有一处：
 知识检索结果与业务查询结果**不再预注入**，改为在工具清单里说明「有这些能力」，
 由模型决定何时调用、调用几次。
-
-主要导出：
-    - ``build_agent_prompt``  组装对话 Agent 的 System Prompt
-
-外部依赖：``app.persona.render_profile_lines``（档案字段口径与旧链路共用）、``app.schemas.PetInfo``。
-
-使用示例：
-    from app.agent.prompt import build_agent_prompt
-
-    prompt = build_agent_prompt(
-        pet=PetInfo(name="豆豆", species="猫"),
-        memory_context="- [用户] 偏好无谷猫粮",
-        medical=True,
-        needs_evidence=True,
-        max_steps=3,
-    )
 
 注意：文案直接决定模型「什么时候调工具」与「怎么标引用」，改动前请同步
 ``app/agent/tools/knowledge.py`` 的编号规则与前端引用面板的解析逻辑。
@@ -184,9 +168,6 @@ def build_agent_prompt(pet: PetInfo, memory_context: str = "", knowledge_context
 
     Returns:
         完整的 System Prompt 字符串。
-
-    Raises:
-        无（所有输入都做了空值与类型兜底）。
     """
     parts: List[str] = [
         "你是 PetVerse 社区的养宠顾问，为用户提供宠物健康、习性、喂养、行为、护理等方面的咨询解答。\n",

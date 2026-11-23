@@ -1,23 +1,12 @@
 """RAG 召回率评测脚本（消融对比）。
 
-职责：用一份「黄金查询集」（问题 + 答案证据子串）批量跑不同检索方案，统计 hit@1 / hit@3 /
+用一份「黄金查询集」（问题 + 答案证据子串）批量跑不同检索方案，统计 hit@1 / hit@3 /
 hit@5 / MRR / 空召回率，用于回答「这套检索到底比改造前好多少、好在哪一环」。
-
-主要导出：无（作为脚本执行）。
 
 三种评测模式（对应改造的三个阶段，差异只在检索实现）：
     - ``baseline``：改造前——旧集合（LangChain PGVector）+ 纯向量 top4 + 0.35 阈值
     - ``corpus``：  只换语料与切分——新库（kb_chunk）+ 同样的纯向量 top4 + 0.35 阈值
     - ``hybrid``：  最终方案——向量 + BM25 混合检索、物种过滤、双门槛
-
-外部依赖：``app.kb.search`` / ``app.kb.store``、``app.llm.get_embeddings``，
-``baseline`` 模式额外需要 ``langchain_postgres`` / ``sqlalchemy``（仅评测使用）。
-
-使用示例：
-    python -m scripts.eval_rag --validate      # 先校验期望子串确实存在于知识库
-    python -m scripts.eval_rag                 # 跑全部三种模式
-    python -m scripts.eval_rag --mode hybrid --verbose
-    python -m scripts.eval_rag --out report.json
 
 判定口径：只要「期望证据子串」全部出现在某个命中片段的正文里，即视为该条命中；
 记录它出现的排名用于算 hit@k 与 MRR。这个口径衡量的是「证据是否进了候选」，
@@ -137,9 +126,6 @@ GOLDEN: List[Dict] = [
 async def _legacy_results(query: str) -> List[dict]:
     """baseline 模式：查改造前的旧向量集合。
 
-    Args:
-        query: 查询语句。
-
     Returns:
         命中片段列表（仅低于阈值的被过滤掉）。
 
@@ -173,9 +159,6 @@ async def _corpus_vector_results(query: str) -> List[dict]:
 
     作用是把「换语料」与「换算法」两个变量的影响拆开——这正是消融实验的核心。
 
-    Args:
-        query: 查询语句。
-
     Returns:
         过阈值后的片段列表。
 
@@ -191,9 +174,6 @@ async def _corpus_vector_results(query: str) -> List[dict]:
 
 async def _hybrid_results(query: str) -> List[dict]:
     """hybrid 模式：走线上真实的混合检索链路。
-
-    Args:
-        query: 查询语句。
 
     Returns:
         检索结果列表。
@@ -221,9 +201,6 @@ def _judge(results: Sequence[dict], expect: Sequence[str], depth: int = 5) -> Tu
 
     Returns:
         ``(是否命中, 排名)``；未命中时排名为 0。
-
-    Raises:
-        无。
     """
     for rank, item in enumerate(results[:depth], start=1):
         # 去掉空格再比较：知识库文本里的数字/单位常带空格（"72 小时"），
@@ -239,14 +216,9 @@ async def run_mode(name: str, golden: List[Dict], verbose: bool) -> dict:
 
     Args:
         name: 模式名（``_MODES`` 的键）。
-        golden: 查询集。
-        verbose: 是否逐条打印命中情况。
 
     Returns:
         ``{label, hit1, hit3, hit5, rr_sum, empty, misses, total, recall, mrr}``。
-
-    Raises:
-        无——单条查询异常按「未命中」计入，避免个别坏样本中断整轮评测。
     """
     label, runner = _MODES[name]
     stats = {"label": label, "hit1": 0, "hit3": 0, "hit5": 0, "rr_sum": 0.0,
@@ -288,14 +260,8 @@ async def validate_expectations(golden: List[Dict]) -> int:
     这一步很容易被跳过、却很重要：写错一个字的期望子串会让该条永远 MISS，
     从而把整体召回率算低，误导后续所有优化判断。
 
-    Args:
-        golden: 查询集。
-
     Returns:
         0 表示全部通过，1 表示存在缺失（供 CI 判断）。
-
-    Raises:
-        无。
     """
     await store.init()
     try:
@@ -319,14 +285,8 @@ async def validate_expectations(golden: List[Dict]) -> int:
 async def main_async(args: argparse.Namespace) -> int:
     """评测主流程。
 
-    Args:
-        args: 命令行参数。
-
     Returns:
         进程退出码（0 正常完成）。
-
-    Raises:
-        无。
     """
     setup_logging()
     golden = GOLDEN
@@ -380,12 +340,6 @@ async def main_async(args: argparse.Namespace) -> int:
 
 async def _check_legacy_collection_exists() -> None:
     """检查旧向量集合是否存在（不存在则 baseline 无意义）。
-
-    Returns:
-        None。
-
-    Raises:
-        无——表不存在只打印提示，不中断评测。
     """
     import psycopg
 

@@ -1,22 +1,8 @@
 """System Prompt 组装。
 
-职责：把「人设与规则」「宠物档案」「长期记忆」「参考知识」「用户真实数据」「就医护栏」
+把「人设与规则」「宠物档案」「长期记忆」「参考知识」「用户真实数据」「就医护栏」
 拼成一条完整的 System Prompt。所有可变内容都做成「有则插入、无则整段省略」，
 避免出现空标题干扰模型。
-
-主要导出：
-    - ``build_system_prompt``  组装对话用 System Prompt
-
-外部依赖：``app.schemas.PetInfo``（仅取字段，不触发任何 IO）。
-
-使用示例：
-    from app.persona import build_system_prompt
-
-    prompt = build_system_prompt(
-        pet=PetInfo(name="豆豆", species="猫"),
-        knowledge_context=kb_context,
-        medical=True,
-    )
 
 注意：这里的文案直接决定回答风格与引用格式（``[1] [2]`` 标注规则），
 改动前请确认与前端「引用来源」面板的解析逻辑一致。
@@ -84,9 +70,6 @@ def render_profile_lines(pet: PetInfo) -> List[str]:
 
     Returns:
         形如 ``["- 名字：豆豆", "- 物种：猫"]`` 的列表；全空时返回空列表。
-
-    Raises:
-        无。
     """
     profile_lines: List[str] = []
     name = (pet.name or "").strip()
@@ -127,9 +110,6 @@ def build_system_prompt(pet: PetInfo, memory_context: str = "",
 
     Returns:
         完整的 System Prompt 字符串。
-
-    Raises:
-        无（所有输入都做了空值与类型兜底）。
     """
     profile_lines = render_profile_lines(pet)
 

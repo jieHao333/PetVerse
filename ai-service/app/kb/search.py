@@ -1,23 +1,7 @@
 """混合检索：向量召回 + BM25 关键词召回 + 序值融合。
 
-职责：把「语义相近」与「术语精确命中」两种召回能力组合起来，并做物种过滤与门槛筛选，
+把「语义相近」与「术语精确命中」两种召回能力组合起来，并做物种过滤与门槛筛选，
 最终产出可直接拼进 Prompt 的片段列表。
-
-主要导出：
-    - ``RagUnavailable``   检索链路不可用（知识库为空、Embedding 未配、向量召回异常）
-    - ``retrieve``         主入口：返回 Top-K 片段
-    - ``format_context``   把片段格式化成 Prompt 上下文（带 ``[n]`` 序号供引用）
-    - ``snippet_of``       片段摘要（用于前端引用面板）
-    - ``SNIPPET_CHARS``    摘要长度
-
-外部依赖：``app.kb.store``（向量库）、``app.kb.lexicon``（BM25 索引）、
-``app.kb.documents``（物种归一化）、``app.llm.get_embeddings``。
-
-使用示例：
-    from app.kb import search
-
-    hits = await search.retrieve("幼猫什么时候打疫苗", pet_species=["猫"])
-    context = search.format_context(hits)
 
 为什么用「序值融合」而不是分数加权：余弦相似度在 0~1 之间且分布集中，BM25 分数是无上界的
 绝对值，直接相加会让 BM25 主导排序。改用「通道内排名归一化后加权」（即 RRF 的简化版），
@@ -129,15 +113,9 @@ async def retrieve(query: str, k: Optional[int] = None,
 def format_context(results: List[dict]) -> str:
     """把检索结果格式化成 Prompt 上下文。
 
-    Args:
-        results: ``retrieve`` 的返回值。
-
     Returns:
         多条片段以空行分隔的文本，每条以 ``[序号] 来源：文档｜小节`` 开头——
         序号是模型标注引用的唯一依据，格式不能随意改。
-
-    Raises:
-        无。
     """
     if not results:
         return ""
@@ -153,10 +131,6 @@ def format_context(results: List[dict]) -> str:
 
 async def _dense_channel(query: str, recall_k: int) -> List[dict]:
     """向量召回通道。
-
-    Args:
-        query: 检索问句。
-        recall_k: 召回条数。
 
     Returns:
         候选列表（``sim`` 为余弦相似度，``matched`` 恒为 0——该通道没有「命中词数」概念）。
@@ -182,15 +156,10 @@ async def _lexical_channel(query: str, extra_terms: Sequence[str],
     但字面命中非常可靠。
 
     Args:
-        query: 检索问句。
         extra_terms: 附加词（品种等），一并分词参与检索。
-        recall_k: 召回条数。
 
     Returns:
         候选列表（``sim`` 恒为 0——该通道没有语义相似度，只用 ``matched`` 表达命中词数）。
-
-    Raises:
-        无——索引未就绪时返回空列表，由向量通道单独支撑。
     """
     index = await lexicon.get_index()
     if index is None or index.total == 0:
@@ -206,9 +175,6 @@ async def _lexical_channel(query: str, extra_terms: Sequence[str],
 
 async def _embed_query(query: str) -> List[float]:
     """把查询语句向量化。
-
-    Args:
-        query: 检索问句。
 
     Returns:
         查询向量。
@@ -243,9 +209,6 @@ def _fuse(dense: List[dict], lexical: List[dict]) -> List[dict]:
 
     Returns:
         融合后的候选列表（按融合分降序），每项额外带 ``score``。
-
-    Raises:
-        无。
     """
     depth = max(1, settings.RAG_RECALL_K)
     fused: Dict[int, dict] = {}
@@ -293,9 +256,6 @@ def _apply_species(candidates: List[dict], target_species: List[str]) -> List[di
 
     Returns:
         处理后的候选（重新按分数降序）。
-
-    Raises:
-        无。
     """
     if not target_species:
         return candidates
@@ -318,14 +278,8 @@ def _apply_species(candidates: List[dict], target_species: List[str]) -> List[di
 def _species_from_query(query: str) -> List[str]:
     """从查询语句里识别物种。
 
-    Args:
-        query: 检索问句。
-
     Returns:
         物种列表（仅「猫」「狗」）；未识别到时为空列表。
-
-    Raises:
-        无。
     """
     found: List[str] = []
     lowered = query.lower()
@@ -346,9 +300,6 @@ def snippet_of(content: str, limit: int = SNIPPET_CHARS) -> str:
 
     Returns:
         去掉 Markdown 噪声、空白压平后的摘要，超长时以省略号结尾。
-
-    Raises:
-        无。
     """
     # 丢掉首行上下文前缀：引用面板已单独展示来源信息，重复显示会浪费空间。
     body = content.split("\n", 1)[1] if "\n" in content else content

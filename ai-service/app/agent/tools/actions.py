@@ -1,16 +1,7 @@
 """用户可执行的写操作工具（加购、点赞、评论、档案维护、发布动态）。
 
-职责：把「用户能在 App 里点的按钮」变成模型可调用的动作。与只读工具的区别不只是
+把「用户能在 App 里点的按钮」变成模型可调用的动作。与只读工具的区别不只是
 HTTP 方法——写操作有副作用，必须处理**重复执行**、**越权**、**不可逆**三件事。
-
-主要导出：
-    - 购物车：``add_to_cart`` / ``update_cart_quantity`` / ``remove_from_cart``
-    - 互动：``like_post`` / ``unlike_post`` / ``comment_post``
-    - 发布：``publish_post``
-    - 档案：``register_pet`` / ``update_pet_health``
-
-外部依赖：``app.clients.biz.request``（保留业务错误）、``app.agent.idempotency``、
-``app.agent.approval``（人工审批）、``langgraph.prebuilt.InjectedState``（取用户身份与 run_id）。
 
 **能力边界（重要）**：AI 的电商能力止于「加入购物车」。**下单、支付、取消订单一律不开放给模型**——
 交易动作必须由用户在 App 里完成。原因不是「审批不够严」，而是资金类操作压根不该由模型发起：
@@ -62,15 +53,11 @@ def _result(ok: bool, message: str, **extra: Any) -> str:
     """构造统一的动作结果（JSON 文本）。
 
     Args:
-        ok: 是否执行成功。
         message: 给模型看的一句话结论（可直接转述给用户）。
         **extra: 附加字段（如 cartItemId / spaceId）；值为 None 的会被丢弃。
 
     Returns:
         ``{"ok": bool, "message": str, ...}`` 的 JSON 字符串。
-
-    Raises:
-        无。
     """
     payload: Dict[str, Any] = {"ok": ok, "message": message}
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -86,9 +73,6 @@ def _fail(prefix: str, resp: dict) -> str:
 
     Returns:
         ``{"ok": false, "message": "...", "code": n}``。
-
-    Raises:
-        无。
     """
     detail = str(resp.get("msg") or "").strip() or "服务暂时不可用"
     return _result(False, f"{prefix}：{detail}", code=resp.get("code"))
@@ -98,14 +82,10 @@ def _blocked(action: str, outcome: ApprovalOutcome) -> str:
     """把「审批未通过」转成给模型的结果。
 
     Args:
-        action: 动作名，如「发布动态」。
         outcome: ``request_approval`` 的返回。
 
     Returns:
         ``{"ok": false, "approval": "rejected"|"unavailable", "message": "..."}``。
-
-    Raises:
-        无。
 
     文案里明确写「不要重试」：模型看到拒绝后常见的错误反应是换个参数再调一次，
     那等于绕过用户意愿。
@@ -121,14 +101,8 @@ def _blocked(action: str, outcome: ApprovalOutcome) -> str:
 def _user_id(state: Dict[str, Any]) -> int:
     """从图状态里取当前用户 ID。
 
-    Args:
-        state: 注入的图状态。
-
     Returns:
         正整数用户 ID；未登录时为 0。
-
-    Raises:
-        无。
     """
     try:
         return int(state.get("user_id") or 0)
@@ -143,18 +117,12 @@ async def _run_action(state: Dict[str, Any], tool_name: str, method: str, servic
     Args:
         state: 注入的图状态（提供 user_id 与 run_id）。
         tool_name: 工具名（幂等指纹的一部分，同时用于审计日志）。
-        method: HTTP 方法。
         service_name: Nacos 中的目标服务名。
-        path: 接口路径。
         payload: 请求体；None 表示无 body。
         formatter: 把 ``biz.request`` 的返回转成结果文本的函数。
-        params: 查询参数。
 
     Returns:
         给模型看的结果文本。
-
-    Raises:
-        无——下游异常已被 ``biz.request`` 收敛成结构体。
     """
     user_id = _user_id(state)
     if user_id <= 0:
@@ -219,7 +187,6 @@ async def update_cart_quantity(cart_item_id: Annotated[int, Field(gt=0)],
 
     Args:
         cart_item_id: 购物车条目 ID，取自 get_my_cart 的 id 字段。
-        quantity: 目标数量，1-999。
     """
     payload = {"id": cart_item_id, "quantity": quantity}
 
@@ -346,7 +313,6 @@ async def publish_post(content: str, state: Annotated[dict, InjectedState],
     公开发布会挂起等待用户人工审批，用户拒绝则不会发布。
 
     Args:
-        content: 动态正文，必填。
         title: 动态标题，可空，最多 100 字。
         visibility: 可见性，0-公开（默认）、1-仅好友、2-仅自己；用户没说时用 0。
     """
@@ -389,7 +355,6 @@ async def register_pet(name: str, species: str, state: Annotated[dict, InjectedS
 
     Args:
         name: 宠物名字，最多 50 字。
-        species: 物种，如「猫」「狗」。
         adoption_date: 收养日期，格式 YYYY-MM-DD；用户没提就留空。
     """
     if not name.strip() or not species.strip():

@@ -1,27 +1,10 @@
 """AI 扩展管理接口（管理员限定）：MCP 服务与 Skill 技能的增删改查与连接测试。
 
-职责：为后台「AI 扩展管理」页提供配置维护能力——MCP 服务（远程工具来源，存 PostgreSQL）
+为后台「AI 扩展管理」页提供配置维护能力——MCP 服务（远程工具来源，存 PostgreSQL）
 与 Skill（标准 ``skills/<name>/SKILL.md`` 技能包，存磁盘）的列表 / 新增 / 更新 / 删除 / 启停，
 以及 MCP 连接测试。写操作成功后立即失效运行时缓存（``app.agent.extensions.invalidate``），
 下一轮对话即生效。Skill 按技能名（hyphen-case）操作，运行时以「元数据目录常驻 + load_skill
 按需取正文」的渐进式披露装配。
-
-主要导出：
-    - ``router``  FastAPI 路由（前缀 ``/ai/admin``，网关对该前缀做 ADMIN 角色校验）
-
-外部依赖：``app.ext_store``（MCP 配置）、``app.skill_store``（技能包）、
-``app.agent.extensions``（连接测试 / 缓存失效）、``app.admin_auth``（管理员校验）、``app.schemas``。
-
-使用示例：
-    GET    /ai/admin/mcp/servers
-    POST   /ai/admin/mcp/servers        (JSON: McpServerUpsert)
-    PUT    /ai/admin/mcp/servers/{id}
-    DELETE /ai/admin/mcp/servers/{id}
-    POST   /ai/admin/mcp/servers/{id}/test
-    GET    /ai/admin/skills
-    POST   /ai/admin/skills             (JSON: SkillUpsert)
-    PUT    /ai/admin/skills/{name}
-    DELETE /ai/admin/skills/{name}
 
 鉴权说明：与知识库管理同一套双通道——网关注入的 ``X-User-Role: ADMIN`` 为主，
 ``X-Kb-Admin`` + ``KB_ADMIN_TOKEN`` 为直连运维备选（见 app.admin_auth）。
@@ -61,9 +44,6 @@ def _validate_mcp(data: McpServerUpsert) -> Optional[str]:
 
     Returns:
         None 表示合法；否则返回可直接展示给管理员的错误说明。
-
-    Raises:
-        无。
     """
     if not data.name.strip():
         return "服务名称不能为空"
@@ -121,14 +101,8 @@ async def list_mcp_servers(
 ):
     """全部 MCP 服务配置（含停用项，按创建先后排序）。
 
-    Args:
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({items: [...]})``；非管理员返回 403。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -152,13 +126,9 @@ async def create_mcp_server(
 
     Args:
         data: 服务配置（传输协议 + 地址 / 命令 + 可选鉴权信息）。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
 
     Returns:
         ``ok(创建后的配置)``；参数不合法 400，名称重复 409。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -188,16 +158,8 @@ async def update_mcp_server(
 ):
     """整体更新 MCP 服务配置（启停开关也走这里，提交完整配置）。
 
-    Args:
-        data: 完整服务配置。
-        server_id: 服务 ID。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok(更新后的配置)``；不存在 404，名称重复 409。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -229,15 +191,8 @@ async def delete_mcp_server(
 ):
     """删除 MCP 服务（下一轮对话起模型不再看见其工具）。
 
-    Args:
-        server_id: 服务 ID。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({"id": server_id})``；不存在 404。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -263,15 +218,8 @@ async def test_mcp_server(
 ):
     """测试 MCP 服务连通性：即时连接一次并列出其暴露的工具（停用中的服务也可测试）。
 
-    Args:
-        server_id: 服务 ID。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({toolCount, tools: [{name, description}]})``；连接失败 400 并附原因。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -307,14 +255,8 @@ async def list_skills(
 ):
     """全部技能包（含停用项与正文，按名称排序）。
 
-    Args:
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({items: [{name, description, enabled, content, bodyLines, resources, updateTime}]})``。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -338,13 +280,9 @@ async def create_skill(
 
     Args:
         data: 技能配置（name / description / content / enabled）。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
 
     Returns:
         ``ok(创建后的技能)``；格式非法或重名 400。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -371,16 +309,8 @@ async def update_skill(
 ):
     """整体更新技能包（启停开关也走这里；改名时迁移目录）。
 
-    Args:
-        data: 完整技能配置。
-        name: 原技能名。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok(更新后的技能)``；不存在 404，格式非法或新名占用 400。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:
@@ -409,15 +339,8 @@ async def delete_skill(
 ):
     """删除技能包（整目录，下一轮对话起不再出现在技能目录）。
 
-    Args:
-        name: 技能名。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({"name": name})``；不存在 404。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="AI 扩展")
     if denied is not None:

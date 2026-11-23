@@ -1,18 +1,8 @@
 """宠物健康评估接口。
 
-职责：暴露 ``POST /ai/health/assess``（生成评估报告）与 ``GET /ai/health/history``
+暴露 ``POST /ai/health/assess``（生成评估报告）与 ``GET /ai/health/history``
 （查询历史报告）。评估逻辑在 ``app.graph.health_graph``，历史报告存在
 ``pet_health_report`` 表（见 ``app.pg_store``）。
-
-主要导出：
-    - ``router``  FastAPI 路由（前缀 ``/ai``）
-
-外部依赖：``app.graph.health_graph.assess``、``app.pg_store``、``app.schemas``。
-
-使用示例：
-    POST /ai/health/assess
-    Body: {"id": 7, "name": "豆豆", "species": "猫", "age": 3,
-           "health": {"weight": "4.2kg", "vaccine": "已打三针"}}
 """
 
 import logging
@@ -33,14 +23,8 @@ router = APIRouter(prefix="/ai")
 def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
     """解析网关注入的用户标识。
 
-    Args:
-        x_user_id: 请求头原始值。
-
     Returns:
         正整数用户 ID；缺失或非法时返回 None。
-
-    Raises:
-        无。
     """
     if not x_user_id:
         return None
@@ -62,13 +46,9 @@ async def assess_health(
 
     Args:
         pet: 宠物档案，``health`` 字段承载体重 / 疫苗 / 病史等评估输入。
-        x_user_id: 网关注入的用户 ID。
 
     Returns:
         ``ok(PetHealthReport)``；未登录返回 401，内部异常返回 500 通用提示。
-
-    Raises:
-        无。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -91,14 +71,9 @@ async def health_history(
 
     Args:
         petId: 宠物 ID（必填）。
-        limit: 返回条数，1~50。
-        x_user_id: 网关注入的用户 ID。
 
     Returns:
         ``ok({"reports": [...]})``；缺少 petId 返回 400。
-
-    Raises:
-        无——查询失败时 ``pg_store`` 已降级为空列表。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:

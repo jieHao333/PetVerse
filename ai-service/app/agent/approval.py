@@ -1,14 +1,7 @@
 """敏感操作的人工审批（Human-in-the-loop）。
 
-职责：在工具执行到「真正产生副作用」之前挂起整张图，把「要做什么、对象是谁、金额多少」
+在工具执行到「真正产生副作用」之前挂起整张图，把「要做什么、对象是谁、金额多少」
 交给前端弹出审批卡片；只有用户明确批准后，图才从挂起点继续执行。
-
-主要导出：
-    - ``ApprovalOutcome``   审批结果（是否需要、是否通过、原因）
-    - ``is_guarded``        该工具是否受审批保护
-    - ``request_approval``  工具内调用：挂起等待审批 / 或被拒时返回原因
-
-外部依赖：``langgraph.types.interrupt``（挂起与恢复）、``app.config.settings``。
 
 工作原理：
     ``interrupt(payload)`` 会抛出一个内部控制流异常，LangGraph 捕获后把当前任务标记为
@@ -65,9 +58,6 @@ def guarded_tools() -> set[str]:
 
     Returns:
         工具名集合；配置为空表示不需要任何审批。
-
-    Raises:
-        无。
     """
     raw = (settings.AGENT_APPROVAL_TOOLS or "").strip()
     return {name.strip() for name in raw.split(",") if name.strip()}
@@ -81,9 +71,6 @@ def is_guarded(tool_name: str) -> bool:
 
     Returns:
         True 表示需要审批。
-
-    Raises:
-        无。
     """
     return tool_name in guarded_tools()
 
@@ -94,7 +81,6 @@ def request_approval(state: Dict[str, Any], tool_name: str, title: str,
 
     Args:
         state: 注入的图状态（读 ``approval_available``）。
-        tool_name: 工具名，用于匹配配置。
         title: 审批卡片标题，如「发布动态」。
         summary: 卡片明细（label/value 列表），应包含金额、对象、数量等关键信息。
         resource: 关联资源 ID（订单 ID / 商品 ID 等），便于前端跳转。
@@ -102,9 +88,6 @@ def request_approval(state: Dict[str, Any], tool_name: str, title: str,
     Returns:
         ``ApprovalOutcome``。``required=False`` 表示该工具无需审批，可直接执行；
         需要审批且被拒时 ``blocked=True``，调用方必须立即返回、不得发起写请求。
-
-    Raises:
-        无——审批通道不可用时返回 ``unavailable=True`` 的结果，而不是抛异常。
 
     注意：本函数会阻塞（挂起）当前图执行；恢复后**会再次执行到这里**，因此调用点之前
     不能有已发生的副作用。

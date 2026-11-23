@@ -1,23 +1,7 @@
 """多模态附件处理（类型识别、限流上传、语音转写、提示词描述）。
 
-职责：把用户上传的图片 / 音频 / 视频转成「对话链路能用的东西」——落 OSS 拿到 URL、
+把用户上传的图片 / 音频 / 视频转成「对话链路能用的东西」——落 OSS 拿到 URL、
 音频转成文字、并把当前模型看不了的内容转成给模型的文字说明（引导用户补充描述）。
-
-主要导出：
-    - 常量：``KIND_IMAGE`` / ``KIND_AUDIO`` / ``KIND_VIDEO``
-    - ``UploadError``   附件校验失败（类型不支持、超限）
-    - ``save_upload``   接收上传流并落 OSS
-    - ``transcribe_audio``  音频转写（ASR，失败返回 None）
-    - ``attachment_summary``  一句话概括附件构成（用于会话标题 / 历史展示）
-    - ``describe_for_prompt`` 生成「模型看不了该附件」的提示语
-
-外部依赖：``httpx``（调用 ASR 接口）、``app.oss``、``app.config.settings``。
-
-使用示例：
-    from app import media
-
-    att = await media.save_upload(file.filename, file.content_type, file.read, user_id)
-    text = await media.transcribe_audio(att, user_id)
 """
 
 import logging
@@ -66,9 +50,6 @@ def detect_kind(mime: str, filename: str) -> Optional[str]:
 
     Returns:
         ``image`` / ``audio`` / ``video``；无法识别时返回 None。
-
-    Raises:
-        无。
     """
     major = (mime or "").split(";")[0].strip().lower()
     kind = _KIND_BY_MAJOR.get(major.split("/")[0]) if "/" in major else None
@@ -81,14 +62,8 @@ def detect_kind(mime: str, filename: str) -> Optional[str]:
 def size_limit(kind: str) -> int:
     """取该类附件的大小上限（字节）。
 
-    Args:
-        kind: 附件大类。
-
     Returns:
         上限字节数；未知类型返回 0（配合调用方判断，等价于「不允许上传」）。
-
-    Raises:
-        无。
     """
     mb = {
         KIND_IMAGE: settings.MEDIA_MAX_IMAGE_MB,
@@ -101,14 +76,8 @@ def size_limit(kind: str) -> int:
 def kind_label(kind: str) -> str:
     """把附件大类转成中文名，用于错误提示。
 
-    Args:
-        kind: 附件大类。
-
     Returns:
         「图片」/「音频」/「视频」，未知类型返回「附件」。
-
-    Raises:
-        无。
     """
     return {KIND_IMAGE: "图片", KIND_AUDIO: "音频", KIND_VIDEO: "视频"}.get(kind, "附件")
 
@@ -120,7 +89,6 @@ async def save_upload(file_name: str, content_type: str, read_bytes, user_id: in
     先读完再拒会让恶意请求轻易打满内存。
 
     Args:
-        file_name: 原始文件名。
         content_type: 客户端上报的 MIME 类型。
         read_bytes: 异步读取函数（如 ``UploadFile.read``），每次返回一个分片，读完返回空。
         user_id: 上传者用户 ID，用于生成带命名空间的 OSS key。
@@ -166,9 +134,6 @@ def mime_by_ext(ext: str) -> str:
 
     Returns:
         对应 MIME；未知后缀返回 ``application/octet-stream``。
-
-    Raises:
-        无。
     """
     return {
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -183,15 +148,8 @@ def mime_by_ext(ext: str) -> str:
 async def read_attachment_bytes(att: dict, user_id: int) -> Optional[bytes]:
     """读取附件原始字节（服务端二次处理用）。
 
-    Args:
-        att: 附件字典，需含 ``key``。
-        user_id: 当前用户 ID，用于越权校验。
-
     Returns:
         文件字节；无 key、非本人命名空间或读取失败时返回 None。
-
-    Raises:
-        无。
     """
     key = (att.get("key") or "").strip()
     if not key:
@@ -209,14 +167,10 @@ async def transcribe_audio(att: dict, user_id: int) -> Optional[str]:
 
     Args:
         att: 附件字典（需含 ``key`` / ``mime`` / ``name``）。
-        user_id: 当前用户 ID。
 
     Returns:
         转写文本；ASR 未配置、读取失败、调用失败或结果为空时均返回 None
         （调用方据此退回「请用文字补充说明」的引导语）。
-
-    Raises:
-        无。
     """
     if not settings.asr_enabled or att.get("type") != KIND_AUDIO:
         return None
@@ -247,14 +201,8 @@ def attachment_summary(attachments: list) -> str:
 
     用途有二：作为纯附件消息的会话标题 / 历史文案；拼进 Prompt 让模型知道用户发了几样东西。
 
-    Args:
-        attachments: 附件字典列表。
-
     Returns:
         概括文本；无附件时返回空串。
-
-    Raises:
-        无。
     """
     if not attachments:
         return ""
@@ -285,16 +233,8 @@ def describe_for_prompt(attachments: list, vision_ready: bool, asr_ready: bool) 
     只在能力缺失时才输出——有能力看图时图片会以多模态消息直接给模型，
     这里再描述一遍会造成重复。
 
-    Args:
-        attachments: 附件字典列表。
-        vision_ready: 视觉能力是否可用。
-        asr_ready: 语音转写能力是否可用。
-
     Returns:
         逐行说明文本；无需说明时返回空串。
-
-    Raises:
-        无。
     """
     lines: list = []
     for att in attachments:

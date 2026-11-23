@@ -1,16 +1,7 @@
 """个性化推荐接口。
 
-职责：暴露 ``GET /ai/recommend/feed``，为首页推荐流与商城「猜你喜欢」提供内容列表。
+暴露 ``GET /ai/recommend/feed``，为首页推荐流与商城「猜你喜欢」提供内容列表。
 业务逻辑（画像聚合、候选召回、重排、缓存）在 ``app.graph.recommend_graph``。
-
-主要导出：
-    - ``router``  FastAPI 路由（前缀 ``/ai``）
-
-外部依赖：``app.graph.recommend_graph.recommend``、``app.schemas``。
-
-使用示例：
-    GET /ai/recommend/feed?scene=home
-    GET /ai/recommend/feed?scene=shop&refresh=true   # 跳过缓存强制重算
 """
 
 import logging
@@ -41,13 +32,9 @@ async def recommend_feed(
     Args:
         scene: 场景，``home`` 首页（商品 + 动态混排）/ ``shop`` 商城（仅商品）。
         refresh: True 时跳过缓存强制重算（用户主动下拉刷新）。
-        x_user_id: 网关注入的用户 ID。
 
     Returns:
         ``ok({"items": [...], "summary": "..."})``；未登录返回 401。
-
-    Raises:
-        无。
     """
     if not x_user_id:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))

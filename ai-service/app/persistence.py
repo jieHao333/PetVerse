@@ -1,27 +1,8 @@
 """会话与消息持久化（PostgreSQL）。
 
-职责：为前端提供可回放的对话历史——会话表 ``chat_session`` 与消息表 ``chat_message``。
+为前端提供可回放的对话历史——会话表 ``chat_session`` 与消息表 ``chat_message``。
 与 LangGraph checkpoint 的分工：checkpoint 存「给模型看的上下文」，本模块存「给人看的历史」，
 两者独立写入，任一方故障都不影响另一方。
-
-主要导出：
-    - ``init`` / ``close``           连接池生命周期
-    - ``create_session``             新建会话
-    - ``list_sessions`` / ``get_session``  会话查询（后者同时用于归属校验）
-    - ``delete_session``             删除会话及其全部消息（单事务）
-    - ``save_turn``                  写入一轮问答（问题 + 回答 + 会话标题维护）
-    - ``save_turn_if_exists``        会话仍存在时才写入（用于中断收尾，避免复活已删会话）
-    - ``read_history``               按时间正序读取历史
-
-外部依赖：``psycopg`` / ``psycopg_pool``、``app.config.settings``。
-
-使用示例：
-    from app import persistence
-
-    await persistence.init()
-    session_id = await persistence.create_session(user_id=42, pet_id=7)
-    await persistence.save_turn(42, 7, session_id, "猫咪打疫苗要注意什么", "……")
-    rows = await persistence.read_history(42, session_id, limit=40)
 """
 
 import asyncio
@@ -84,9 +65,6 @@ _SCHEMA_STATEMENTS = (
 def _init_sync() -> None:
     """同步创建连接池（供 ``asyncio.to_thread`` 调用）。
 
-    Returns:
-        None。
-
     Raises:
         Exception: 连接池构造失败时抛出，由 ``init`` 捕获并降级。
     """
@@ -107,12 +85,6 @@ async def init() -> None:
     """初始化连接池并确保业务表存在。
 
     失败不抛出：持久化不可用时服务仍应启动（历史为空、写入静默失败）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     try:
@@ -131,9 +103,6 @@ async def _ensure_tables() -> bool:
 
     Returns:
         True 表示表已就绪，可以执行 SQL；False 表示当前不可用。
-
-    Raises:
-        无——建表失败只记日志，等冷却结束后重试。
     """
     global _tables_ready, _last_tables_try
     if _tables_ready:
@@ -164,12 +133,6 @@ async def _ensure_tables() -> bool:
 
 async def close() -> None:
     """关闭连接池。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     # 先摘引用再关闭：即使 close 卡住，后续请求也不会再拿到已失效的池。
@@ -186,7 +149,6 @@ async def _run(sql: str, params: tuple = (), fetch: bool = False):
 
     Args:
         sql: SQL 语句（使用 ``%s`` 占位符）。
-        params: 参数元组。
         fetch: True 时返回 ``fetchall()`` 结果，否则返回 None。
 
     Returns:
@@ -217,9 +179,6 @@ async def _run_tx(statements: List[tuple]) -> None:
     Args:
         statements: ``(sql, params)`` 列表。
 
-    Returns:
-        None。
-
     Raises:
         RuntimeError: 表尚未就绪时抛出。
         Exception: 透传 psycopg 异常（事务自动回滚）。
@@ -241,7 +200,6 @@ async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
     """新建会话。
 
     Args:
-        user_id: 用户 ID。
         pet_id: 关联宠物 ID；0 表示未指定宠物。
         title: 初始标题；为空时用「新会话」，等首条消息写入时再替换。
 
@@ -262,9 +220,6 @@ async def create_session(user_id: int, pet_id: int, title: str = "") -> int:
 async def list_sessions(user_id: int) -> List[dict]:
     """列出用户的全部会话（跨宠物，最近活跃在前）。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         会话字典列表，时间字段为 Unix 秒；``petId`` 统一转字符串与历史契约保持一致。
 
@@ -283,10 +238,6 @@ async def list_sessions(user_id: int) -> List[dict]:
 
 async def get_session(user_id: int, session_id: int) -> Optional[dict]:
     """查询会话基本信息，同时充当归属校验。
-
-    Args:
-        user_id: 用户 ID。
-        session_id: 会话 ID。
 
     Returns:
         会话字典；不存在或不属于该用户时返回 None（两种情况刻意不区分，
@@ -309,13 +260,6 @@ async def delete_session(user_id: int, session_id: int) -> None:
 
     两条 DELETE 放在同一事务里：只删会话会留下孤儿消息，只删消息会留下空会话。
     checkpoint 记忆由调用方并发清理（见 ``chat.delete_session``）。
-
-    Args:
-        user_id: 用户 ID。
-        session_id: 会话 ID。
-
-    Returns:
-        None。
 
     Raises:
         Exception: 透传数据库异常。
@@ -341,10 +285,6 @@ def _turn_statements(user_id: int, pet_id: int, session_id: int,
     """组装一轮问答的 SQL 列表（用户消息 + 可选助手消息 + 会话标题/时间维护）。
 
     Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-        session_id: 会话 ID。
-        user_msg: 用户消息文本。
         reply: 助手回复文本；为空时不写助手消息（被中断且零产出时只保留提问）。
         interrupted: 该条助手消息是否为「生成中被中止」。
         attachments: 用户消息携带的附件，落 ``attachments`` JSONB。
@@ -352,9 +292,6 @@ def _turn_statements(user_id: int, pet_id: int, session_id: int,
 
     Returns:
         ``(sql, params)`` 组成的语句列表。
-
-    Raises:
-        无。
     """
     att_json = json.dumps(attachments or [], ensure_ascii=False)
     refs_json = json.dumps(refs or [], ensure_ascii=False)
@@ -375,20 +312,8 @@ async def save_turn(user_id: int, pet_id: int, session_id: int,
     """保存一轮问答（失败仅记日志，不影响本次对话）。
 
     Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-        session_id: 会话 ID。
-        user_msg: 用户消息文本。
-        reply: 助手回复文本。
         interrupted: 回复是否被中止（前端据此渲染「已停止」标记）。
-        attachments: 用户消息附件列表。
         refs: 回复引用的知识库来源列表。
-
-    Returns:
-        None。
-
-    Raises:
-        无——历史落库是「尽力而为」，不能因为写库失败就让用户看不到已经生成的答案。
     """
     try:
         await _run_tx(_turn_statements(user_id, pet_id, session_id,
@@ -407,20 +332,8 @@ async def save_turn_if_exists(user_id: int, pet_id: int, session_id: int,
     无条件写入会因外键缺失而失败，或在无外键的表结构下写出孤儿数据。
 
     Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-        session_id: 会话 ID。
-        user_msg: 用户消息文本。
         reply: 已产出的部分回复（可为空串）。
         interrupted: 固定传 True 的场景见 ``chat._persist_interrupted``。
-        attachments: 用户消息附件列表。
-        refs: 已产出的引用来源列表。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     try:
         # 先做存在性检查而非依赖外键报错：报错会污染日志且无法区分「会话已删」与真实故障。
@@ -439,16 +352,11 @@ async def read_history(user_id: int, session_id: int, limit: Optional[int] = Non
     """读取会话历史（时间正序）。
 
     Args:
-        user_id: 用户 ID。
-        session_id: 会话 ID。
         limit: 只取最近 N 条；None 表示全部。
 
     Returns:
         消息字典列表（role / content / petId / attachments / refs / ts / interrupted）。
         读取失败时返回空列表——历史缺失只影响上下文，不应让接口 500。
-
-    Raises:
-        无。
     """
     if limit is not None and limit > 0:
         # 先按倒序取最近 N 条，再在外层翻回正序：直接正序 + LIMIT 会拿到「最早的 N 条」，
@@ -484,9 +392,6 @@ def _clean_json_list(raw) -> list:
 
     Returns:
         列表；无法解析时返回空列表。
-
-    Raises:
-        无。
     """
     if isinstance(raw, list):
         return raw
@@ -510,9 +415,6 @@ def _clean_attachments(raw) -> list:
 
     Returns:
         合法附件字典列表。
-
-    Raises:
-        无。
     """
     if isinstance(raw, list):
         return [a for a in raw if isinstance(a, dict) and a.get("type") and a.get("url")]

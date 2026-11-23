@@ -1,29 +1,14 @@
-"""对话路由层：SSE 流式对话与会话管理。
+"""对话路由层：``/ai/chat/**`` 的 SSE 流式对话与会话管理。
 
-职责：承载 ``/ai/chat/**`` 接口——流式对话（SSE）、附件上传、历史 / 会话 / 长期记忆的查询与删除。
-本层只做「协议 + 并发 + 落库」，业务决策（要不要检索、查哪些数据、如何作答）全部交给
-``app.agent`` 里的自主 AgentLoop。
+本层只做「协议 + 并发 + 落库」，业务决策（要不要检索、查哪些数据、怎么答）交给 ``app.agent``。
 
-主要导出：
-    - ``router``  FastAPI 路由（前缀 ``/ai``）
-
-外部依赖：``app.agent``（AgentLoop 图 / 事件适配）、``app.persistence``（历史）、
-``app.checkpoint``（对话记忆）、``app.limits``（并发闸）、``app.media`` / ``app.oss``（附件）、
-``app.longterm`` / ``app.memstore``（长期记忆）。
-
-SSE 事件协议（前端按序消费）：
-    meta     → 首帧，回传 sessionId（前端据此把「新会话」变为可回访会话）
-    refs     → 有知识命中时，在答案首字之前推送引用来源
+SSE 事件（前端按序消费）：
+    meta     → 首帧，回传 sessionId
+    refs     → 命中知识时，在答案首字前推送引用来源
     delta    → 增量文本，可出现多次
-    approval → 敏感操作（支付 / 下单 / 公开发布）需要人工审批，本轮挂起且无 done；
-               前端弹卡片后调 ``POST /ai/chat/approve`` 从断点继续
+    approval → 敏感操作待审批，本轮挂起且无 done；前端弹卡片后调 ``POST /ai/chat/approve``
     done     → 正常结束
-    error    → 异常结束，msg 为可直接展示的中文提示
-
-使用示例：
-    POST /ai/chat/stream
-    Header: X-User-Id: 42
-    Body: {"message": "猫咪打疫苗要注意什么", "pet": {"id": 7, "species": "猫"}}
+    error    → 异常结束，msg 可直接展示
 """
 
 import asyncio
@@ -88,36 +73,12 @@ _bg_memory_tasks: set = set()
 
 
 def _sse(data: dict) -> str:
-    """把字典编码为一帧 SSE 数据。
-
-    Args:
-        data: 事件体（须含 ``type``）。
-
-    Returns:
-        形如 ``data: {...}\\n\\n`` 的帧文本；``ensure_ascii=False`` 保证中文不被转义成
-        ``\\uXXXX``（体积约为 1/3，且便于抓包排查）。
-
-    Raises:
-        无。
-    """
+    """编码一帧 SSE；``ensure_ascii=False`` 让中文不转义（体积约 1/3，且便于抓包排查）。"""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _ref_items(knowledge: list) -> list:
-    """把检索结果转成前端引用面板所需的结构。
-
-    同时做两件事：snake_case → camelCase（前端约定）与字段裁剪（只给展示需要的字段）。
-
-    Args:
-        knowledge: ``app.agent`` 产出的知识片段列表（工具 artifact 或预检索结果）。
-
-    Returns:
-        引用项列表，每项含 rank / docId / source / docTitle / kind / section / category /
-        score / matchedBy / snippet。
-
-    Raises:
-        无。
-    """
+    """转成前端引用面板的结构：snake_case → camelCase，并裁掉展示用不到的字段。"""
     items = []
     for item in knowledge or []:
         items.append({
@@ -139,21 +100,7 @@ def _ref_items(knowledge: list) -> list:
 
 def _spawn_memory_extraction(user_id: int, pet_id: int, pet_name: str,
                              user_msg: str, reply: str) -> None:
-    """以「发射后不管」的方式触发长期记忆抽取。
-
-    Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-        pet_name: 宠物名。
-        user_msg: 本轮用户消息。
-        reply: 本轮助手回复。
-
-    Returns:
-        None。
-
-    Raises:
-        无（任务内部自行吞异常）。
-    """
+    """发射后不管地触发长期记忆抽取；任务需留强引用，否则可能被 GC 提前回收。"""
     task = asyncio.create_task(
         longterm.extract_and_apply(user_id, pet_id, pet_name, user_msg, reply))
     _bg_memory_tasks.add(task)
@@ -162,17 +109,7 @@ def _spawn_memory_extraction(user_id: int, pet_id: int, pet_name: str,
 
 
 def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
-    """解析网关注入的用户标识。
-
-    Args:
-        x_user_id: 请求头 ``X-User-Id`` 的原始值。
-
-    Returns:
-        正整数用户 ID；缺失、非法或非正数时返回 None（调用方统一返回「未登录」）。
-
-    Raises:
-        无。
-    """
+    """解析网关注入的 ``X-User-Id``：缺失 / 非法 / 非正数返回 None，调用方统一回「未登录」。"""
     if not x_user_id:
         return None
     try:
@@ -183,20 +120,9 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
 
 
 async def _prepare_attachments(attachments: list, user_id: int) -> list:
-    """补全附件信息（当前只做音频转写）。
+    """原地回填音频转写（``transcript``）。
 
-    必须在进入编排图之前完成：音频对纯文本模型完全不可见，只有先转成文字，
-    用户「发语音提问」才能被正常回答。
-
-    Args:
-        attachments: 附件字典列表（原地修改）。
-        user_id: 用户 ID，用于越权校验。
-
-    Returns:
-        同一个列表（已回填 ``transcript``）。
-
-    Raises:
-        无——转写失败时保持无 transcript，由提示词引导用户补充文字。
+    必须在进图前完成：纯文本模型看不见音频，先转成文字才能回答「发语音提问」。
     """
     if settings.is_mock or not attachments:
         return attachments
@@ -210,18 +136,7 @@ async def _prepare_attachments(attachments: list, user_id: int) -> list:
 
 
 def _attachment_enriched_text(text: str, attachments: list) -> str:
-    """把用户文字与附件说明拼成「给模型看的输入」。
-
-    Args:
-        text: 用户原始文字（可为空）。
-        attachments: 附件列表。
-
-    Returns:
-        拼接后的文本；无附件时原样返回用户文字。
-
-    Raises:
-        无。
-    """
+    """把用户文字与附件说明拼成给模型看的输入；无附件时原样返回。"""
     parts = [text] if text else []
     if attachments:
         # 先给「发了几样东西」的概况，再给「哪些内容你看不到」的补充说明。
@@ -236,18 +151,9 @@ def _attachment_enriched_text(text: str, attachments: list) -> str:
 
 
 async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int], Optional[JSONResponse]]:
-    """确定本轮使用的会话 ID（已有则校验归属，没有则新建）。
+    """确定本轮会话：已有则校验归属，没有则新建。
 
-    Args:
-        user_id: 用户 ID。
-        req: 对话请求（``sessionId`` 可缺省）。
-
-    Returns:
-        ``(session_id, error_response)``：成功时第二项为 None；失败时第一项为 None，
-        第二项是可直接返回给客户端的报文。
-
-    Raises:
-        无——数据库异常被捕获并转成 500 报文。
+    返回 ``(session_id, error_response)``，失败时第二项是可直接下发的报文。
     """
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
     pet_id = pet.id if pet.id is not None else 0
@@ -266,20 +172,10 @@ async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int
 
 
 async def _pump(stream, queue: asyncio.Queue) -> None:
-    """把异步流「泵」进队列，并统一成 ``(kind, payload)`` 二元组。
+    """把异步流泵进队列并统一成 ``(kind, payload)``。
 
-    引入队列是为了让消费端可以用 ``wait_for`` 加超时——直接在 ``async for`` 上等待无法
-    插入心跳，也无法在超时后继续等待同一路流。
-
-    Args:
-        stream: 异步迭代器，产出字符串（增量文本）或 ``(kind, payload)`` 元组。
-        queue: 目标队列。
-
-    Returns:
-        None。
-
-    Raises:
-        无——异常被包装成 ``("error", exc)`` 放入队列，由消费端决定是否重试。
+    用队列是为了消费端能 ``wait_for`` 加超时：直接在 ``async for`` 上等既插不进心跳，
+    超时后也回不到同一路流。
     """
     try:
         async for event in stream:
@@ -291,22 +187,10 @@ async def _pump(stream, queue: asyncio.Queue) -> None:
 
 
 async def _graph_stream(graph_input, config: dict):
-    """执行 AgentLoop（或恢复挂起的图）并产出「对前端有意义的事件」。
+    """执行 AgentLoop（或恢复挂起的图），产出 refs / delta / approval 事件。
 
-    Args:
-        graph_input: 首轮传初始状态字典；审批恢复时传 ``Command(resume=...)``。
-        config: LangGraph 运行配置（含 thread_id）。
-
-    Yields:
-        ``("refs", [...])`` / ``("delta", str)`` / ``("approval", {...})``。
-
-    Raises:
-        Exception: 图执行失败时透传，由 ``_pump`` 转成 error 事件。
-
-    说明：AgentLoop 内部每次模型调用都会产出 token（决策轮 / 改写轮 / 收口轮），
-    只有 ``is_answer_chunk`` 认定的片段才是给用户看的正文；引用来源由 ``extract_refs``
-    提取。工具里触发人工审批时，图会挂起并产出 ``__interrupt__`` 更新，这里转成 approval
-    事件后立即结束——本轮不再有后续 token。
+    AgentLoop 每次模型调用都会出 token（决策轮 / 改写轮 / 收口轮），只有
+    ``is_answer_chunk`` 认定的片段才是正文；审批挂起时产出 approval 后立即结束，不再有 token。
     """
     graph = get_chat_agent()
     # 同时订阅两种流：updates 用于拿节点产出（引用 / 审批），messages 用于拿 token 增量。
@@ -328,17 +212,7 @@ async def _graph_stream(graph_input, config: dict):
 
 
 def _history_messages(history: list) -> List[AnyMessage]:
-    """把数据库历史转成 LangChain 消息，用于「无 checkpoint 时」回填上下文。
-
-    Args:
-        history: ``persistence.read_history`` 的结果（时间正序）。
-
-    Returns:
-        HumanMessage / AIMessage 列表；空内容的消息会被跳过。
-
-    Raises:
-        无。
-    """
+    """把数据库历史转成 LangChain 消息，用于「无 checkpoint 时」回填上下文（空内容跳过）。"""
     messages: List[AnyMessage] = []
     for idx, item in enumerate(history):
         content = item.get("content")
@@ -361,26 +235,8 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
                                refs: Optional[list] = None) -> None:
     """收尾保存「被中止的一轮」。
 
-    两处都要写：checkpoint 让被中止的轮次进入后续对话的长期记忆（否则「暂停即失忆」），
+    两处都要写：checkpoint 让半截轮次进入后续上下文（否则「暂停即失忆」），
     PostgreSQL 让前端历史能回放出半截回复。
-
-    Args:
-        graph: 对话图实例（``aupdate_state`` 需要）。
-        config: 该会话的运行配置。
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-        session_id: 会话 ID。
-        user_msg: 落库用的用户消息文本（附件消息会退化为摘要文案）。
-        human_msg: 送入图的消息对象（含 id 与附件描述）。
-        partial: 已产出的部分回复（可能为空串）。
-        attachments: 用户消息附件。
-        refs: 已推送的引用来源。
-
-    Returns:
-        None。
-
-    Raises:
-        无——两处写入各自独立降级，任一失败都不影响另一处。
     """
     messages: List[AnyMessage] = [human_msg]
     if partial:
@@ -400,20 +256,7 @@ async def _persist_interrupted(graph, config: dict, user_id: int, pet_id: int,
 async def _append_mock_turn(graph, config: dict, input_messages: List[AnyMessage], reply: str) -> None:
     """把 mock 模式的一轮问答补写进图状态。
 
-    mock 模式不执行 AgentLoop（没有模型可供决策），若不补写，checkpoint 里就只有
-    存量的旧消息——多轮「对话」会看起来像自问自答。
-
-    Args:
-        graph: 对话图实例。
-        config: 运行配置。
-        input_messages: 本轮送入图的消息（含回填的历史与本轮用户消息）。
-        reply: 已输出的模拟回复。
-
-    Returns:
-        None。
-
-    Raises:
-        无——补写失败只记日志，不影响已经发给用户的回复。
+    mock 不跑 AgentLoop，不补写的话 checkpoint 里只有旧消息，多轮对话会像自问自答。
     """
     if not checkpoint.available():
         return
@@ -431,19 +274,7 @@ async def _append_mock_turn(graph, config: dict, input_messages: List[AnyMessage
 
 
 def _last_human_text(snapshot) -> str:
-    """从会话快照里取最近一条用户消息文本。
-
-    Args:
-        snapshot: ``graph.aget_state`` 返回的状态快照。
-
-    Returns:
-        用户消息正文；没有时为空串。
-
-    Raises:
-        无。
-
-    用途：审批恢复时这一轮还没落库，需要靠 checkpoint 里的原始提问补写历史。
-    """
+    """取会话快照里最近一条用户消息；审批恢复时这一轮还没落库，靠它补写历史。"""
     values = getattr(snapshot, "values", None) or {}
     for msg in reversed(values.get("messages") or []):
         if isinstance(msg, HumanMessage):
@@ -452,18 +283,9 @@ def _last_human_text(snapshot) -> str:
 
 
 async def _pending_snapshot(graph, config: dict, approval_id: str):
-    """校验会话里是否存在待审批的中断。
+    """校验会话里是否存在待审批的中断，返回 ``(snapshot, error_msg)``。
 
-    Args:
-        graph: 对话图实例。
-        config: 会话运行配置。
-        approval_id: 前端回传的审批单 ID（可为空，表示为「当前挂起的那个」）。
-
-    Returns:
-        ``(snapshot, error_msg)``：成功时 ``error_msg`` 为 None；失败时 snapshot 为 None。
-
-    Raises:
-        无——读取异常被转成可直接展示的中文提示。
+    ``approval_id`` 为空表示「当前挂起的那个」，非空则比对，防止旧审批重放。
     """
     try:
         snapshot = await graph.aget_state(config)
@@ -493,22 +315,7 @@ async def _approval_generator(config: dict, user_id: int, session_id: int, pet_i
                               reason: str):
     """审批恢复的 SSE 生成器：从挂起点继续跑图并输出剩余内容。
 
-    Args:
-        config: 会话运行配置（thread_id 必须与挂起时一致）。
-        user_id: 用户 ID。
-        session_id: 会话 ID。
-        pet_id: 宠物 ID（落库用）。
-        pet_name: 宠物名（记忆抽取用）。
-        user_msg: 本轮用户消息（从 checkpoint 取回，落库用）。
-        snapshot: 挂起时的状态快照。
-        approved: 是否批准。
-        reason: 拒绝原因。
-
-    Yields:
-        str: 编码好的 SSE 帧（meta / refs / delta / approval / done / error）。
-
-    Raises:
-        asyncio.CancelledError: 客户端断开时向上抛，属正常收尾路径。
+    ``config`` 的 thread_id 必须与挂起时一致；客户端断开时向上抛 CancelledError。
     """
     resume_value = {"approved": bool(approved), "reason": (reason or "")[:200], "by": user_id}
 
@@ -601,24 +408,9 @@ async def _approval_generator(config: dict, user_id: int, session_id: int, pet_i
 
 
 async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet_id: int):
-    """SSE 流式对话的核心生成器。
+    """SSE 流式对话核心：抢全局闸 → 抢用户闸 → 组装输入 → 跑图 / mock 流 → 落库 → 归还名额。
 
-    整体结构：抢全局闸 → 抢用户闸 → 组装输入 → 执行图 / 模拟流 → 落库 → 释放名额。
-    所有退出路径（正常、异常、客户端断开）都必须走到 ``finally`` 归还名额，
-    否则并发闸会被逐步耗尽。
-
-    Args:
-        req: 对话请求。
-        user_id: 用户 ID。
-        session_id: 会话 ID（已解析）。
-        pet_id: 宠物 ID。
-
-    Yields:
-        str: 编码好的 SSE 帧。
-
-    Raises:
-        asyncio.CancelledError: 客户端断开 / 任务被取消时向上抛出，属正常收尾路径。
-        GeneratorExit: 生成器被关闭时向上抛出，同样走补写落库的收尾分支。
+    所有退出路径（正常 / 异常 / 客户端断开）都必须走到 ``finally``，否则并发闸会被逐步耗尽。
     """
     pet: PetInfo = req.pet if req.pet is not None else PetInfo()
 
@@ -806,18 +598,7 @@ async def chat_stream(
 ):
     """流式对话（SSE）。
 
-    参数校验在进入流之前完成：一旦返回 ``StreamingResponse``，就无法再改状态码 / 报文，
-    因此「未登录 / 空消息 / 超长 / 超附件数 / 用户忙」都必须提前拦掉。
-
-    Args:
-        req: 对话请求体。
-        x_user_id: 网关注入的用户 ID 请求头。
-
-    Returns:
-        正常情况返回 ``text/event-stream`` 流；参数或鉴权问题返回统一业务报文。
-
-    Raises:
-        无。
+    参数校验必须在返回 ``StreamingResponse`` 之前完成：一旦开始流式响应就改不了状态码。
     """
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
@@ -853,21 +634,7 @@ async def approve_chat(
     req: ApprovalRequest,
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """人工审批敏感操作，并从挂起点继续这一轮对话（SSE）。
-
-    前端收到 ``approval`` 帧后弹审批卡片；用户点「同意 / 拒绝」时调用本接口，
-    服务端用 ``Command(resume=...)`` 恢复图，继续输出剩余回答。
-
-    Args:
-        req: 审批请求（会话 ID、审批单 ID、是否批准、拒绝原因）。
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        正常情况返回 ``text/event-stream`` 流；参数 / 鉴权 / 审批失效返回统一业务报文。
-
-    Raises:
-        无。
-    """
+    """人工审批并从挂起点继续本轮对话（SSE）；前端收到 ``approval`` 帧后调用。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -915,18 +682,7 @@ async def upload_chat_attachment(
     file: UploadFile = File(..., description="附件文件（图片/音频/视频）"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """上传对话附件，返回可随消息回传的附件描述。
-
-    Args:
-        file: 上传文件（图片 / 音频 / 视频）。
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok({type, url, key, mime, name, size})``；失败时返回对应业务错误码。
-
-    Raises:
-        无。
-    """
+    """上传对话附件，返回可随消息回传的附件描述。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -949,18 +705,7 @@ async def get_history(
     sessionId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """查询会话历史（时间正序，助手消息带引用来源）。
-
-    Args:
-        sessionId: 会话 ID（必填）。
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok(HistoryData)``；会话不存在或不属于当前用户时返回 404 报文。
-
-    Raises:
-        无。
-    """
+    """查询会话历史（时间正序，助手消息带引用来源）。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -983,17 +728,7 @@ async def get_history(
 async def list_sessions(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """列出用户的全部会话（跨宠物，最近活跃在前）。
-
-    Args:
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok(SessionListData)``。
-
-    Raises:
-        无。
-    """
+    """列出用户全部会话（跨宠物，最近活跃在前）。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -1010,17 +745,7 @@ async def list_sessions(
 async def list_memories(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """列出用户的长期记忆（用户级 + 宠物级，最近更新在前）。
-
-    Args:
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok(MemoryListData)``。
-
-    Raises:
-        无。
-    """
+    """列出长期记忆（用户级 + 宠物级，最近更新在前）。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -1040,20 +765,7 @@ async def delete_memory(
     petId: Optional[int] = Query(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """删除一条长期记忆。
-
-    Args:
-        key: 记忆键。
-        scope: ``user`` 或 ``pet``；决定在哪个命名空间下删除。
-        petId: 宠物 ID，``scope=pet`` 时必填。
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok(None)``；参数不合法或存储不可用时返回对应错误码。
-
-    Raises:
-        无。
-    """
+    """删除一条长期记忆；``scope=pet`` 时 petId 必填。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -1081,18 +793,7 @@ async def delete_session(
     session_id: int = Path(...),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """删除会话：同时清理消息与对话记忆。
-
-    Args:
-        session_id: 会话 ID。
-        x_user_id: 网关注入的用户 ID。
-
-    Returns:
-        ``ok(None)``；会话不存在时返回 404 报文。
-
-    Raises:
-        无。
-    """
+    """删除会话：并行清理消息与对话记忆。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))

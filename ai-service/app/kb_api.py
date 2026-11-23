@@ -1,20 +1,7 @@
 """知识库管理接口（管理员限定）。
 
-职责：为后台管理页提供知识库的增删查与重建能力——文档列表、在线预览、原文下载、上传入库、
+为后台管理页提供知识库的增删查与重建能力——文档列表、在线预览、原文下载、上传入库、
 删除、全量重建。四个写操作与全部读操作都受同一套管理员校验保护。
-
-主要导出：
-    - ``router``  FastAPI 路由（前缀 ``/ai``）
-
-外部依赖：``app.kb.*``（解析 / 入库 / 存储 / 词表）、``app.config.settings``、``app.schemas``。
-
-使用示例：
-    GET    /ai/kb/documents?page=1&size=20&keyword=疫苗
-    GET    /ai/kb/documents/{docId}/preview
-    GET    /ai/kb/documents/{docId}/file?inline=true
-    POST   /ai/kb/documents         (multipart: file + title/category/species)
-    DELETE /ai/kb/documents/{docId}
-    POST   /ai/kb/reindex
 
 鉴权说明：管理员身份取网关鉴权后注入的 ``X-User-Role``（网关会先剥离客户端同名头）。
 ``X-Kb-Admin`` + ``KB_ADMIN_TOKEN`` 是留给「不经网关直连本服务跑运维」的备选通道——
@@ -62,14 +49,8 @@ def _inside_allowed_dirs(target: FsPath) -> bool:
     ``file_path`` 来自数据库，而数据库里的值可能来自上传 / 迁移 / 手工改库，
     不能假定它一定安全，读取前必须用 realpath 做一次归属校验。
 
-    Args:
-        target: 待校验的路径。
-
     Returns:
         True 表示位于语料目录或上传留存目录内，可以读取。
-
-    Raises:
-        无——路径非法（如含非法字符）时返回 False。
     """
     try:
         resolved = target.resolve()
@@ -100,14 +81,10 @@ async def list_documents(
         page: 页码（从 1 开始）。
         size: 每页条数（1~100）。
         keyword: 模糊过滤关键词（匹配文档名 / 来源 / 分类 / doc_id）。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
 
     Returns:
         ``ok({items, total, page, size, pages, totalDocuments, totalChunks, totalChars,
         supportedKinds})``；非管理员返回 403。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
@@ -145,16 +122,9 @@ async def preview_document(
     优先重解析原文（排版完整、无切分重叠）；原文缺失或解析失败时回退为「按 chunk_index
     拼接入库片段」——后者能看到片段边界与上下文前缀，排查召回问题时反而更有用。
 
-    Args:
-        doc_id: 文档 ID。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({docId, name, source, kind, format, content, contentFrom, hasFile, chunks,
         chunkCount})``；``contentFrom`` 标明正文来源（``file`` / ``chunks``）。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
@@ -202,15 +172,10 @@ async def download_document_file(
     """回读文档原文文件。
 
     Args:
-        doc_id: 文档 ID。
         inline: True 走浏览器内联渲染，False 作为附件下载。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
 
     Returns:
         文件字节流（带 Content-Disposition / Content-Type）；文档无留存原文时返回 404 报文。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
@@ -265,17 +230,12 @@ async def upload_document(
     旧片段在同一事务内先删后写，不会残留孤儿数据。
 
     Args:
-        file: 上传文件。
         title: 文档标题（可选）。
         category: 分类（可选）。
         species: 适用物种，逗号分隔（可选）。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
 
     Returns:
         ``ok({docId, source, chunks, skipped, sha256})``；格式 / 大小 / 解析错误返回 400。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
@@ -323,15 +283,8 @@ async def delete_document(
     ``kb_chunk`` 通过外键 ``ON DELETE CASCADE`` 一并删除（含向量），随后让 BM25 索引失效；
     上传文档的留存原文会清理，**仓库语料源文件不动**——重新全量重建会把它带回来。
 
-    Args:
-        doc_id: 文档 ID。
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok({"docId": doc_id})``；文档不存在返回 404。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:
@@ -362,14 +315,8 @@ async def reindex(
 
     语义是「清空后重建」：上传的文档也会被清掉，因此该操作应视为「恢复出厂语料」。
 
-    Args:
-        x_user_id / x_user_role / x_kb_admin: 鉴权请求头。
-
     Returns:
         ``ok(summary)``；已有重建任务在跑时返回 409。
-
-    Raises:
-        无。
     """
     denied = admin_denied(x_user_id, x_user_role, x_kb_admin, resource="知识库")
     if denied is not None:

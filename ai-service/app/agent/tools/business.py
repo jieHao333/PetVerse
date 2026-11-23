@@ -1,15 +1,7 @@
 """业务数据查询工具（function calling）。
 
-职责：把「用户真实数据」包装成模型可自主调用的工具，让对话能回答「我的订单到哪了」
+把「用户真实数据」包装成模型可自主调用的工具，让对话能回答「我的订单到哪了」
 「我家猫的疫苗记录」这类需要查库的问题，而不是让模型凭空编造。
-
-主要导出：
-    - ``build_pet_tools``        宠物档案（1 个）
-    - ``build_shop_tools``       订单 / 购物车 / 商品检索 / 商品口碑（4 个）
-    - ``build_community_tools``  社区热门动态（1 个）
-    - ``build_profile_tools``    数据中台养护画像（1 个）
-
-外部依赖：``langchain_core.tools``、``app.clients.biz``。
 
 从 ``app/tools.py`` 迁移而来，**工具签名与 docstring 一字未改**——docstring 就是模型的
 工具描述（``parse_docstring=True`` 会解析它生成参数 schema），改写会直接改变模型
@@ -48,9 +40,6 @@ def _dumps(data: object) -> str:
     Returns:
         JSON 字符串；超长时优先按列表条目裁剪，无法裁剪则截断并标注「已截断」。
         序列化失败时退化为 ``str(data)``，保证工具总能返回可读文本。
-
-    Raises:
-        无。
     """
     try:
         text = json.dumps(data, ensure_ascii=False, default=str)
@@ -90,9 +79,6 @@ def _purchasable(item: dict) -> bool:
     Returns:
         True 表示上架、有库存、店铺正常营业。
 
-    Raises:
-        无。
-
     ``status`` 与 ``stock`` 是购买的硬前提，缺失或非法即视为不可购买；
     店铺字段缺失时不做拦截，避免误杀老接口数据。
     """
@@ -116,14 +102,8 @@ def _purchasable(item: dict) -> bool:
 def _project_product(item: dict) -> dict:
     """裁掉商品里用户不该看到 / 模型用不上的字段。
 
-    Args:
-        item: ``ProductVO`` 字典。
-
     Returns:
         只保留购买决策所需字段的新字典（描述截断到 80 字）。
-
-    Raises:
-        无。
     """
     projected = {key: item.get(key) for key in _PRODUCT_FIELDS if item.get(key) is not None}
     desc = str(item.get("description") or "").strip()
@@ -135,14 +115,8 @@ def _project_product(item: dict) -> dict:
 def _project_post(item: dict) -> dict:
     """裁剪动态字段：去掉 userId / visibility / 媒体列表等内部或非必要信息。
 
-    Args:
-        item: ``SpaceVO`` 字典。
-
     Returns:
         只保留浏览与互动所需字段的新字典（正文截断到 200 字）。
-
-    Raises:
-        无。
     """
     projected = {key: item.get(key) for key in _POST_FIELDS if item.get(key) is not None}
     content = str(item.get("content") or "").strip()
@@ -159,9 +133,6 @@ def build_pet_tools(user_id: int) -> List[BaseTool]:
 
     Returns:
         工具列表。
-
-    Raises:
-        无。
     """
 
     @tool(parse_docstring=True)
@@ -183,9 +154,6 @@ def build_shop_tools(user_id: int) -> List[BaseTool]:
 
     Returns:
         工具列表，顺序即提示词中的出现顺序。
-
-    Raises:
-        无。
     """
 
     @tool(parse_docstring=True)
@@ -243,9 +211,6 @@ def build_community_tools(user_id: int) -> List[BaseTool]:
 
     Returns:
         工具列表。
-
-    Raises:
-        无。
     """
 
     @tool(parse_docstring=True)
@@ -264,14 +229,8 @@ def build_community_tools(user_id: int) -> List[BaseTool]:
 def build_profile_tools(user_id: int) -> List[BaseTool]:
     """构造养护画像类工具（数据中台）。
 
-    Args:
-        user_id: 当前登录用户 ID。
-
     Returns:
         工具列表。
-
-    Raises:
-        无。
     """
 
     @tool(parse_docstring=True)

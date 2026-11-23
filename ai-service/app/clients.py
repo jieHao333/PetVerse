@@ -1,22 +1,8 @@
 """下游业务微服务 HTTP 客户端。
 
-职责：ai-service 需要宠物档案、订单、购物车、评价、社区动态等真实数据来做上下文注入与
+ai-service 需要宠物档案、订单、购物车、评价、社区动态等真实数据来做上下文注入与
 推荐重排，这些数据分散在 pet / space / shop 等 Java 微服务里。本模块提供统一访问层：
 共享一个连接池、自动注入内部用户标识，并把**读**与**写**的错误语义分开处理。
-
-主要导出：
-    - ``BizClient``  业务接口客户端（含各业务语义方法）
-    - ``biz``        进程级单例，直接 import 使用
-    - ``_records``   分页响应解包工具（内部）
-
-外部依赖：``httpx``（异步连接池）、``app.service_discovery``（Nacos 发现与轮询）。
-
-使用示例：
-    from app.clients import biz
-
-    pets = await biz.get_my_pets(user_id=42)
-    resp = await biz.request("POST", settings.SHOP_SERVICE_NAME, "/shop/cart",
-                             json={"productId": 9, "quantity": 2}, user_id=42)
 
 读 / 写两种契约（刻意不统一）：
     - ``get`` 系列：失败一律返回空列表 / None。这些数据只用于「给回答补充背景」，
@@ -80,9 +66,6 @@ class BizClient:
 
         Returns:
             配置好超时与连接上限的 ``httpx.AsyncClient``。
-
-        Raises:
-            无（构造阶段不会发起网络请求）。
         """
         if self._client is None:
             self._client = httpx.AsyncClient(
@@ -93,12 +76,6 @@ class BizClient:
 
     async def close(self) -> None:
         """关闭连接池；异常仅记录日志，不影响停机流程。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         if self._client is not None:
             try:
@@ -121,9 +98,6 @@ class BizClient:
 
         Returns:
             报文 ``data`` 字段；非 200、业务码非 200 或发生任何异常时返回 None。
-
-        Raises:
-            无——异常在内部吞掉并降级为 None。
         """
         headers = _identity_headers(user_id)
         try:
@@ -161,9 +135,6 @@ class BizClient:
         Returns:
             ``{"ok": bool, "code": int, "msg": str, "data": Any}``。
             网络异常与超时也走同一结构（``code=500``、``msg`` 为可直接展示的中文）。
-
-        Raises:
-            无——所有异常都收敛成上面的结构，调用方只需判断 ``ok``。
         """
         headers = _identity_headers(user_id)
         try:
@@ -200,14 +171,8 @@ class BizClient:
     async def get_my_pets(self, user_id: int) -> List[dict]:
         """查询用户名下的宠物档案列表。
 
-        Args:
-            user_id: 用户 ID。
-
         Returns:
             宠物档案字典列表；失败或无数据时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.PET_SERVICE_NAME, "/pet/my-list", user_id=user_id)
         return data if isinstance(data, list) else []
@@ -222,9 +187,6 @@ class BizClient:
 
         Returns:
             动态字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"sort": "hot", "pageNum": 1, "pageSize": limit},
@@ -237,13 +199,9 @@ class BizClient:
         Args:
             keyword: 搜索词（如物种、品种）。
             limit: 返回条数上限。
-            user_id: 调用者用户 ID。
 
         Returns:
             动态字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"keyword": keyword, "sort": "hot", "pageNum": 1, "pageSize": limit},
@@ -254,14 +212,10 @@ class BizClient:
         """查询用户自己发布的动态（用于推断其关注的物种/品类）。
 
         Args:
-            user_id: 用户 ID。
             limit: 返回条数上限。
 
         Returns:
             动态字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SPACE_SERVICE_NAME, "/space/page",
                               params={"userId": user_id, "pageNum": 1, "pageSize": limit},
@@ -277,13 +231,9 @@ class BizClient:
             keyword: 搜索词；空串表示不加关键词（按默认排序取在售商品）。
             limit: 返回条数上限。
             category: 分类 ID；None 表示不限分类。
-            user_id: 调用者用户 ID。
 
         Returns:
             商品字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         params: dict = {"pageNum": 1, "pageSize": limit}
         # 空关键词不传参：部分下游会把空串当作「匹配空」而返回 0 条。
@@ -298,14 +248,8 @@ class BizClient:
     async def get_my_cart(self, user_id: int) -> List[dict]:
         """查询用户购物车。
 
-        Args:
-            user_id: 用户 ID。
-
         Returns:
             购物车项字典列表（含失效项及其原因）；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/cart", user_id=user_id)
         return data if isinstance(data, list) else []
@@ -314,14 +258,10 @@ class BizClient:
         """查询用户订单（最近若干条）。
 
         Args:
-            user_id: 用户 ID。
             limit: 返回条数上限。
 
         Returns:
             订单字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/order/page",
                               params={"pageNum": 1, "pageSize": limit}, user_id=user_id)
@@ -333,14 +273,10 @@ class BizClient:
         注意：这是公开数据，不传 ``user_id``，避免下游按用户做可见性裁剪。
 
         Args:
-            product_id: 商品 ID。
             limit: 返回条数上限。
 
         Returns:
             评价字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/review/page",
                               params={"productId": product_id, "pageNum": 1, "pageSize": limit})
@@ -350,14 +286,10 @@ class BizClient:
         """查询用户发表过的商品评价（用于推断其消费偏好）。
 
         Args:
-            user_id: 用户 ID。
             limit: 返回条数上限。
 
         Returns:
             评价字典列表；失败时为空列表。
-
-        Raises:
-            无。
         """
         data = await self.get(settings.SHOP_SERVICE_NAME, "/shop/review/my/page",
                               params={"pageNum": 1, "pageSize": limit}, user_id=user_id)
@@ -393,14 +325,8 @@ def _records(data: Any) -> List[dict]:
     下游分页结构有两种形态：``{"records": [...], "total": n}`` 与直接返回数组。
     统一在这里适配，调用方不必各自判断。
 
-    Args:
-        data: 已解包的 ``data`` 字段。
-
     Returns:
         记录列表；结构不符时返回空列表（不抛错，保持「取不到就当没有」的契约）。
-
-    Raises:
-        无。
     """
     if isinstance(data, dict):
         records = data.get("records")

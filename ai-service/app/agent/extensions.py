@@ -1,25 +1,12 @@
 """管理员配置的扩展能力装配（MCP 工具 + Skill 技能）。
 
-职责：把后台「AI 扩展管理」里启用的 MCP 服务与 Skill 技能装配进对话 Agent——
+把后台「AI 扩展管理」里启用的 MCP 服务与 Skill 技能装配进对话 Agent——
 MCP 服务的远程工具经 ``langchain-mcp-adapters`` 转成 LangChain 工具并入工具列表；
 Skill 采用标准 Agent Skills 的**渐进式披露**：提示词只常驻技能元数据目录
 （name + description），模型判断相关时经 ``load_skill`` 工具按需取回正文。
 MCP 配置存 PostgreSQL（``app.ext_store``），Skill 是磁盘标准技能包（``app.skill_store``，
 ``skills/<name>/SKILL.md``）；本模块做进程内缓存，管理接口写入后调 ``invalidate()``
 显式失效，多 worker 部署靠 TTL 兜底刷新。
-
-主要导出：
-    - ``get_mcp_tools``     启用中 MCP 服务的远程工具（带缓存，失败降级为空）
-    - ``get_skills_prompt`` 启用中技能的元数据目录（带缓存，失败降级为空串）
-    - ``test_mcp_server``   管理页「测试连接」用：即时连一次并返回工具清单
-    - ``invalidate``        配置变更后清空缓存
-
-外部依赖：``langchain-mcp-adapters``（可选，未安装时 MCP 能力整体降级）、
-``app.ext_store`` / ``app.skill_store``、``app.config.settings``。
-
-使用示例：
-    tools = build_tools(ctx) + await get_mcp_tools()   # 含 load_skill 工具
-    prompt = build_agent_prompt(pet, skills_context=await get_skills_prompt())
 
 降级原则：扩展能力是增强项——依赖未安装、存储不可用、MCP 服务不可达或加载超时，
 都只让扩展能力缺席，内置工具与对话主链路不受影响。
@@ -50,12 +37,6 @@ _skills_lock = asyncio.Lock()
 
 def invalidate() -> None:
     """清空扩展能力缓存（管理接口增删改 / 启停后调用，下一轮对话即生效）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _mcp_cache, _skills_cache
     _mcp_cache = None
@@ -95,9 +76,6 @@ def _connection_for(server: dict) -> dict:
 async def _load_server_tools(server: dict) -> List[BaseTool]:
     """连接单个 MCP 服务并列出其工具（每次工具调用会新建会话，列表可长期复用）。
 
-    Args:
-        server: 服务配置字典。
-
     Returns:
         该服务暴露的 LangChain 工具列表。
 
@@ -120,9 +98,6 @@ async def get_mcp_tools() -> List[BaseTool]:
 
     Returns:
         远程工具列表；开关关闭 / 依赖缺失 / 存储不可用 / 全部服务失败时为空列表。
-
-    Raises:
-        无——扩展能力失败不阻断对话。
     """
     global _mcp_cache
     if not settings.AGENT_MCP_ENABLED:
@@ -173,9 +148,6 @@ async def get_skills_prompt() -> str:
 
     Returns:
         目录文本；无启用技能 / 读取失败时为空串。
-
-    Raises:
-        无——技能装配失败不阻断对话。
     """
     global _skills_cache
     now = time.monotonic()

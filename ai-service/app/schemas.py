@@ -1,27 +1,9 @@
-"""请求 / 响应数据契约。
+"""请求 / 响应数据契约，兼作喂给 LLM 的结构化输出模型。
 
-职责：集中定义对外 HTTP 接口的请求体、响应体，以及「喂给 LLM 的结构化输出模型」。
-两类模型放在一起是刻意为之——它们大多同名同义（如 ``PetHealthReport`` 既是 LLM 的输出
-schema，也是接口返回体），分开维护必然漂移。
+两类模型同名同义（如 ``PetHealthReport`` 既是输出 schema 也是接口返回体），放一起避免漂移。
 
-主要导出：
-    - 接口层：``ChatRequest`` / ``ApprovalRequest`` / ``AttachmentInfo`` / ``SessionListData`` / ``HistoryData``
-    - 通用报文：``ok`` / ``fail``（全站统一 HTTP 200 + ``{code,msg,data}``）
-    - 结构化输出：``SearchQuery`` / ``PetHealthReport`` / ``ReviewSummary``
-      / ``RecommendResult`` / ``MemoryUpdateResult``
-    - 共享枚举：``IntentType`` / ``MemoryKind``
-
-外部依赖：仅 ``pydantic``。
-
-使用示例：
-    from app.schemas import PetInfo, ok, fail
-
-    return JSONResponse(status_code=200, content=ok({"sessionId": 12}))
-    return JSONResponse(status_code=200, content=fail(401, "未登录"))
-
-注意：字段上的 ``description`` 不只是文档——带 description 的模型会经
-``model_json_schema()`` 注入提示词（见 ``app.llm._json_mode_hint``），
-改写这些文案会直接影响模型输出质量，勿随意精简。
+注意：字段上的 ``description`` 不只是文档——带 description 的模型会经 ``model_json_schema()``
+注入提示词（见 ``app.llm._json_mode_hint``），改写这些文案会直接影响模型输出质量，勿随意精简。
 """
 
 from typing import Any, Dict, List, Literal, Optional
@@ -32,9 +14,8 @@ from pydantic import BaseModel, Field
 class PetInfo(BaseModel):
     """当前咨询的宠物档案（前端从 pet-service 取到后原样透传）。
 
-    字段几乎全为可选：用户可能还没建档就直接开问，缺失时 Prompt 里对应行直接省略，
-    不阻塞对话。``health`` 是自由结构的键值对（体重 / 疫苗 / 驱虫 / 病史等），
-    键名约定见 ``app.persona._HEALTH_LABELS``。
+    字段几乎全为可选：用户没建档也能直接开问，缺失时 Prompt 里对应行省略。
+    ``health`` 是自由键值对（体重 / 疫苗 / 驱虫 / 病史），键名约定见 ``app.persona._HEALTH_LABELS``。
     """
 
     id: Optional[int] = None
@@ -50,11 +31,7 @@ class PetInfo(BaseModel):
 
 
 class AttachmentInfo(BaseModel):
-    """单条多模态附件。
-
-    先经 ``POST /ai/chat/upload`` 上传并拿到 OSS 地址，再随对话请求回传；
-    ``key`` 用于服务端二次读取（ASR 转写 / 视觉理解），因此即使已有 ``url`` 也要保留。
-    """
+    """单条多模态附件；``key`` 供服务端二次读取（ASR / 视觉），已有 url 也要保留。"""
 
     type: Literal["image", "audio", "video"] = Field(description="附件类型")
     url: str = Field(description="附件地址（OSS 公网 URL）")
@@ -66,11 +43,7 @@ class AttachmentInfo(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """对话请求体。
-
-    ``message`` 与 ``attachments`` 至少要有一个（只发图片/语音也允许），
-    校验在路由层完成而非模型层——这样能返回业务错误码而不是 422。
-    """
+    """对话请求体；``message`` 与 ``attachments`` 至少有一个，校验在路由层做以返回业务错误码。"""
 
     message: str = Field(default="", description="用户本轮输入的文字消息；纯附件时可缺省")
     pet: PetInfo = Field(default_factory=PetInfo, description="当前咨询的宠物信息（缺省时不拼宠物档案）")
@@ -81,10 +54,9 @@ class ChatRequest(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    """敏感操作的人工审批请求体。
+    """敏感操作的人工审批请求，由前端收到 SSE ``approval`` 帧后提交。
 
-    由前端在收到 SSE ``approval`` 帧后提交：批准则图从挂起点继续执行，拒绝则工具直接
-    返回「未批准」，两者都会继续跑完这一轮对话（后续仍由模型给出说明）。
+    批准则图从挂起点继续执行，拒绝则工具返回「未批准」，两者都会跑完这一轮对话。
     """
 
     sessionId: int = Field(description="会话 ID")
@@ -94,7 +66,7 @@ class ApprovalRequest(BaseModel):
 
 
 class SessionItem(BaseModel):
-    """会话列表项；``petId`` 用字符串而非整数，与服务端持久层返回的格式保持一致。"""
+    """会话列表项；``petId`` 用字符串以与持久层返回格式保持一致。"""
 
     id: int
     petId: str = "0"
@@ -110,11 +82,7 @@ class SessionListData(BaseModel):
 
 
 class HistoryMessage(BaseModel):
-    """历史消息项。
-
-    比 LLM 侧的 message 多出 ``attachments`` / ``refs`` / ``interrupted``：前端要靠它们
-    还原附件气泡、引用来源面板，以及「这轮被用户中止」的标记。
-    """
+    """历史消息项；比 LLM 侧 message 多出附件、引用与「被中止」标记，供前端还原。"""
 
     role: str
     content: str
@@ -137,35 +105,15 @@ class HistoryData(BaseModel):
 
 
 def ok(data: Any = None) -> dict:
-    """构造成功报文。
-
-    全站约定 HTTP 状态码恒为 200，业务结果由 ``code`` 表达，前端只解析这一层。
-
-    Args:
-        data: 业务数据，允许为 None（如删除类接口）。
-
-    Returns:
-        ``{"code": 200, "msg": "success", "data": data}``。
-
-    Raises:
-        无。
-    """
+    """构造成功报文（全站 HTTP 状态码恒为 200，业务结果由 ``code`` 表达）。"""
     return {"code": 200, "msg": "success", "data": data}
 
 
 def fail(code: int, msg: str) -> dict:
     """构造失败报文。
 
-    Args:
-        code: 业务错误码（401 未登录 / 400 参数错误 / 403 无权限 / 404 不存在 /
-            409 冲突 / 429 过载 / 500 服务异常）。
-        msg: 可直接展示给用户的中文提示，避免把技术细节透给前端。
-
-    Returns:
-        ``{"code": code, "msg": msg, "data": None}``。
-
-    Raises:
-        无。
+    ``msg`` 需为可直接展示的中文提示，不要把技术细节透给前端；
+    错误码约定：401 未登录 / 400 参数错误 / 403 无权限 / 404 不存在 / 409 冲突 / 429 过载 / 500 异常。
     """
     return {"code": code, "msg": msg, "data": None}
 
@@ -175,7 +123,7 @@ class SearchQuery(BaseModel):
 
     query: str = Field(description="可直接用于知识库检索的完整问句：补全指代（它/那个/这种情况）"
                                    "与前文省略的主体，保留用户原意，不超过 40 字")
-    # 只允许猫/狗：语料与物种过滤规则目前也只标注了这两类，放宽会让过滤失效。
+    # 只允许猫/狗：语料与物种过滤规则也只标注了这两类，放宽会让过滤失效。
     species: List[str] = Field(default_factory=list,
                                description="问题涉及的物种，只允许填「猫」或「狗」；同时涉及两者或不确定时留空")
 
@@ -189,11 +137,7 @@ class HealthReminder(BaseModel):
 
 
 class PetHealthReport(BaseModel):
-    """健康评估报告：LLM 结构化输出模型，同时作为接口返回体。
-
-    评分区间与等级语义在 health_graph 的提示词中有对应约束，改这里要同步改提示词，
-    否则模型产出的 level 与 score 会自相矛盾。
-    """
+    """健康评估报告；评分区间与等级语义在 health_graph 提示词中有对应约束，改这里须同步改提示词。"""
 
     score: int = Field(ge=0, le=100, description="综合健康评分，0-100")
     level: Literal["excellent", "good", "fair", "warning"] = Field(
@@ -203,7 +147,7 @@ class PetHealthReport(BaseModel):
     suggestions: List[str] = Field(default_factory=list, description="养护改进建议")
     care_plan: List[str] = Field(default_factory=list, description="近期养护计划（可执行事项）")
     reminders: List[HealthReminder] = Field(default_factory=list, description="疫苗/驱虫/体检等提醒")
-    # 免责声明默认值兜底：LLM 偶尔漏输出该字段时，也不会把「未声明」的报告直接给用户。
+    # 免责声明给默认值：LLM 漏输出该字段时，也不会把「未声明」的报告直接给用户。
     disclaimer: str = Field(default="本评估基于用户填写信息由 AI 生成，不能替代兽医面诊，如有异常请及时就医。",
                             description="免责声明")
 
@@ -235,8 +179,7 @@ class RecommendResult(BaseModel):
     summary: str = Field(default="", description="整体推荐说明")
 
 
-# 记忆归类：preference 偏好 / habit 习性 / fact 客观事实，仅用于展示与提示词组织，
-# 不参与检索过滤。
+# 记忆归类：preference 偏好 / habit 习性 / fact 客观事实，仅用于展示与提示词组织，不参与检索过滤。
 MemoryKind = Literal["preference", "habit", "fact"]
 
 
@@ -273,19 +216,18 @@ class MemoryOp(BaseModel):
 class MemoryUpdateResult(BaseModel):
     """LLM 输出的记忆维护操作列表。
 
-    用「让模型输出操作指令」而不是「让模型直接写库」：操作可被逐条校验（key 是否存在、
-    content 是否为空），失败也不会污染已有记忆。
+    让模型输出操作指令而非直接写库：每条可校验（key 是否存在、content 是否为空），
+    失败也不会污染已有记忆。
     """
 
     ops: List[MemoryOp] = Field(default_factory=list, description="本轮需要执行的记忆维护操作；无长期有效信息时为空列表或仅一条 none")
 
 
 class McpServerUpsert(BaseModel):
-    """MCP 服务配置的新增 / 更新请求体（管理员限定接口）。
+    """MCP 服务配置的新增 / 更新请求体（管理员接口）。
 
-    传输协议三选一：``streamable_http`` / ``sse`` 填 ``url``（可带 ``headers`` 鉴权头），
-    ``stdio`` 填 ``command`` + ``args``（可带 ``env`` 环境变量）。
-    字段间的组合约束（如 http 必须有 url）在路由层校验，以便返回业务错误码。
+    传输协议三选一：``streamable_http`` / ``sse`` 填 ``url``（可带 ``headers``），
+    ``stdio`` 填 ``command`` + ``args``（可带 ``env``）；组合约束在路由层校验。
     """
 
     name: str = Field(min_length=1, max_length=64, description="服务名称（唯一，管理页与日志展示用）")
@@ -301,11 +243,10 @@ class McpServerUpsert(BaseModel):
 
 
 class SkillUpsert(BaseModel):
-    """Skill 技能包的新增 / 更新请求体（管理员限定接口，标准 Agent Skills 范式）。
+    """Skill 技能包的新增 / 更新请求体（管理员接口，标准 Agent Skills 范式）。
 
-    技能落地为 ``skills/<name>/SKILL.md``：``name`` + ``description`` 写入 YAML frontmatter，
-    ``content`` 是 Markdown 正文。``description`` 是技能触发选择的唯一依据，须单行说明
-    「做什么 + 何时用」。格式约束（hyphen-case / 单行 / 行数）在路由层经 skill_store 校验。
+    落地为 ``skills/<name>/SKILL.md``：``name`` + ``description`` 写入 YAML frontmatter，
+    ``content`` 是 Markdown 正文；``description`` 是技能选择的唯一依据，须单行说明「做什么 + 何时用」。
     """
 
     name: str = Field(min_length=1, max_length=64, description="技能名（hyphen-case，如 petcare-calc），同时是目录名与唯一标识")

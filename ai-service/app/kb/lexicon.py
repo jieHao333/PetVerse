@@ -1,23 +1,7 @@
 """中文分词与进程内 BM25 索引。
 
-职责：为知识库片段建一份内存倒排索引，支持关键词（BM25）召回。索引按需惰性构建，
+为知识库片段建一份内存倒排索引，支持关键词（BM25）召回。索引按需惰性构建，
 并以 ``kb_meta.version`` 判断是否过期——数据一变就整份重建，避免增量维护的复杂度。
-
-主要导出：
-    - ``LexIndex``       倒排索引与 BM25 打分
-    - ``tokenize``       中文分词（jieba，缺失时退化为二元组切分）
-    - ``index_terms``    生成片段的索引词串（入库时写入 ``kb_chunk.tokens``）
-    - ``get_index``      取得（并按版本重建）索引
-    - ``invalidate``     主动失效（删文档 / 重建后调用）
-
-外部依赖：``jieba``（可选）、``app.kb.store``（读取片段 tokens 与版本号）。
-
-使用示例：
-    from app.kb import lexicon
-
-    index = await lexicon.get_index()
-    hits = index.search(lexicon.tokenize("猫耳朵里有咖啡渣"), limit=20)
-    # [(chunk_id, bm25_score, matched_term_count), ...]
 
 为什么索引放在进程内：知识库规模在千级片段量级，全量构建只需毫秒级；改成数据库全文检索
 会引入额外的表与迁移成本，收益不明显。
@@ -67,9 +51,6 @@ class LexIndex:
 
         Args:
             rows: ``(chunk_id, tokens)`` 序列，``tokens`` 是空格分隔的词串。
-
-        Raises:
-            无。
         """
         self.postings: Dict[str, Dict[int, int]] = {}
         self.doc_len: Dict[int, int] = {}
@@ -92,14 +73,10 @@ class LexIndex:
 
         Args:
             terms: 查询词列表（通常来自 ``tokenize``）。
-            limit: 返回条数。
 
         Returns:
             ``(chunk_id, 分数, 命中词数)`` 列表，按分数降序。命中词数供上层做「双门槛」
             判断——它比分数更直观，也不受索引规模影响。
-
-        Raises:
-            无。
         """
         if not self.total or not terms:
             return []
@@ -135,14 +112,8 @@ class LexIndex:
 def tokenize(text: str) -> List[str]:
     """中文分词并过滤停用词 / 单字。
 
-    Args:
-        text: 原始文本。
-
     Returns:
         词列表（已小写、去标点、去停用词、去单字）。
-
-    Raises:
-        无。
     """
     jieba = _get_jieba()
     if jieba is None:
@@ -165,16 +136,12 @@ def index_terms(text: str, extra_terms: Sequence[str] = ()) -> str:
     """生成片段的索引词串（写入 ``kb_chunk.tokens``）。
 
     Args:
-        text: 片段正文。
         extra_terms: 额外词（文档标题 / 分类 / 标签 / 小节）。标签尤其重要：
             「黑下巴」「猫痤疮」这类俗称往往只写在标签里，正文没有原词，
             不补充进来就永远无法被关键词召回。
 
     Returns:
         空格分隔的词串。
-
-    Raises:
-        无。
     """
     terms = tokenize(text)
     for extra in extra_terms or ():
@@ -187,9 +154,6 @@ def _get_jieba():
 
     Returns:
         jieba 模块；未安装时返回 None（调用方退化为二元组切分）。
-
-    Raises:
-        无。
     """
     global _jieba
     if _jieba is None:
@@ -220,14 +184,8 @@ def _fallback_tokenize(text: str) -> List[str]:
 
     二元组无法理解词边界，但能保证「猫癣」「耳螨」这类两字词仍可被命中。
 
-    Args:
-        text: 原始文本。
-
     Returns:
         词列表。
-
-    Raises:
-        无。
     """
     cleaned = _PUNCT.sub(" ", (text or "").lower())
     out: List[str] = []
@@ -275,12 +233,6 @@ def invalidate() -> None:
     """标记索引失效（下次 ``get_index`` 时重建）。
 
     写操作后调用；不直接置空数据，而是把版本号设为 -1，使下一次调用必然重建。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _index, _index_version
     _index = None

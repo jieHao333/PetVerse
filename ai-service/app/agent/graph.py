@@ -1,6 +1,6 @@
 """养宠顾问对话的自主 AgentLoop。
 
-职责：以「模型 + 工具」的最小循环替代改造前的固定编排图。图里只有五个节点，
+以「模型 + 工具」的最小循环替代改造前的固定编排图。图里只有五个节点，
 其中真正做决策的只有 ``agent`` 一个——调不调工具、调哪个、调几次、什么时候停，
 全部由模型在 ``agent`` 节点里自行判断；其余节点负责上下文准备、工具执行与结果收口。
 
@@ -9,22 +9,6 @@
     START → prepare → agent ─┬─(有 tool_calls 且未超预算)→ act → agent
                              ├─(达到 AGENT_MAX_STEPS)────→ conclude → finalize
                              └─(无 tool_calls)──────────→ finalize → END
-
-主要导出：
-    - ``get_chat_agent``     取得（并编译一次）图实例
-    - ``initial_state``      构造初始状态（转出，便于路由层单点导入）
-    - ``preview_knowledge``  mock 模式下的引用预览（不跑模型）
-
-外部依赖：``langgraph``（StateGraph / ToolNode / add_messages）、``app.agent.*``、
-``app.llm``、``app.kb``、``app.checkpoint`` / ``app.memstore``。
-
-使用示例：
-    from app.agent import get_chat_agent, initial_state
-
-    graph = get_chat_agent()
-    state = initial_state(query="猫咪打疫苗要注意什么", pet=pet, user_id=42, messages=[])
-    result = await graph.astream(state, config=checkpoint.thread_config(42, 7),
-                                 stream_mode=["updates", "messages"])
 
 降级策略：
     - 长期记忆读失败 → 本轮不注入记忆，不影响对话；
@@ -83,9 +67,6 @@ def _pet_info(state: AgentState) -> PetInfo:
 
     Returns:
         校验通过的 ``PetInfo``；字段非法时退化为空档案（档案不合法不该让整轮失败）。
-
-    Raises:
-        无。
     """
     try:
         return PetInfo(**(state.get("pet") or {}))
@@ -97,14 +78,8 @@ def _pet_info(state: AgentState) -> PetInfo:
 def _last_ai_message(messages: Sequence[AnyMessage]) -> Optional[AIMessage]:
     """取最近一条 AI 消息。
 
-    Args:
-        messages: 消息序列。
-
     Returns:
         最后一条 ``AIMessage``；没有时返回 None。
-
-    Raises:
-        无。
     """
     for msg in reversed(list(messages or [])):
         if isinstance(msg, AIMessage):
@@ -121,9 +96,6 @@ async def _recall_memory(state: AgentState, config: RunnableConfig) -> str:
 
     Returns:
         每行一条、形如 ``- [用户] 偏好…`` 的文本；未开启或读取失败时为空串。
-
-    Raises:
-        无——记忆是增强项，读失败只降级为空。
     """
     if not settings.MEMORY_ENABLED:
         return ""
@@ -162,14 +134,8 @@ async def _recall_memory(state: AgentState, config: RunnableConfig) -> str:
 def _has_image(attachments: Sequence[Dict[str, Any]]) -> bool:
     """判断本轮是否带可识别的图片。
 
-    Args:
-        attachments: 附件列表。
-
     Returns:
         True 表示至少有一张带 URL 的图片。
-
-    Raises:
-        无。
     """
     for att in attachments or []:
         if att.get("type") == KIND_IMAGE and (att.get("url") or "").strip():
@@ -187,7 +153,6 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     否则用户发一张皮肤患处照片提问，模型将拿不到任何知识依据。
 
     Args:
-        state: 图状态。
         config: 运行配置（用于取 store）。
 
     Returns:
@@ -270,7 +235,6 @@ async def call_model(state: AgentState, config: RunnableConfig) -> Dict[str, Any
     然后自行选择：继续调用工具（返回 ``tool_calls``），或给出最终答复（返回文本）。
 
     Args:
-        state: 图状态。
         config: 运行配置（LangGraph 注入，本节点未直接使用）。
 
     Returns:
@@ -314,10 +278,6 @@ async def run_tools(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
     模型只看 content，结构化命中放在 ``ToolMessage.artifact`` 里，本节点把它收集到
     ``knowledge`` 通道，供路由层推送引用面板。
 
-    Args:
-        state: 图状态。
-        config: 运行配置。
-
     Returns:
         ``{"messages": [...], "knowledge": [...], "step": n+1}``。
 
@@ -348,14 +308,8 @@ async def run_tools(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
 def _pending_tool_calls(state: AgentState) -> List[dict]:
     """取出「已请求但尚未执行」的工具调用。
 
-    Args:
-        state: 图状态。
-
     Returns:
         工具调用字典列表；没有时为空列表。
-
-    Raises:
-        无。
     """
     last = _last_ai_message(state.get("messages") or [])
     if last is None:
@@ -371,7 +325,6 @@ async def conclude(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     ToolMessage（模型自己也知道该调用了没执行），再不绑工具地要一次最终答复。
 
     Args:
-        state: 图状态。
         config: 运行配置（未直接使用）。
 
     Returns:
@@ -407,14 +360,10 @@ async def finalize(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """收口节点：把最终答复提取到 ``reply``，供路由层落库。
 
     Args:
-        state: 图状态。
         config: 运行配置（未直接使用）。
 
     Returns:
         ``{"reply": str}``。空回复保持空串（与改造前一致，路由层按原逻辑处理）。
-
-    Raises:
-        无。
     """
     last = _last_ai_message(state.get("messages") or [])
     reply = (last.text or "").strip() if last else ""
@@ -426,14 +375,8 @@ async def finalize(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 def should_act(state: AgentState) -> str:
     """条件边：决定循环继续、收敛还是结束。
 
-    Args:
-        state: 图状态。
-
     Returns:
         ``"act"`` / ``"conclude"`` / ``"finalize"`` 之一。
-
-    Raises:
-        无。
     """
     pending = _pending_tool_calls(state)
     if not pending:
@@ -455,9 +398,6 @@ def approval_available() -> bool:
     Returns:
         True 表示图编译时注入了 checkpointer，``interrupt`` 能挂起并恢复；False 表示
         没有可恢复的现场，敏感工具应直接拒绝执行。
-
-    Raises:
-        无。
     """
     return _graph_has_saver
 
@@ -469,9 +409,6 @@ def get_chat_agent():
 
     Returns:
         已编译的 ``CompiledStateGraph``，注入了 checkpointer（对话记忆）与 store（长期记忆）。
-
-    Raises:
-        无——checkpointer / store 为 None 时图退化为无记忆模式，仍可正常对话。
     """
     global _graph, _graph_has_saver
     if _graph is not None:
@@ -515,9 +452,6 @@ async def preview_knowledge(state: AgentState) -> List[dict]:
 
     Returns:
         知识片段列表；不需要检索或检索失败时为空列表。
-
-    Raises:
-        无——mock 是演示路径，任何异常都不该让模拟对话中断。
     """
     query = (state.get("query") or "").strip()
     if not settings.RAG_ENABLED or not query:

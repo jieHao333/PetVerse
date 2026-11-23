@@ -1,12 +1,7 @@
 """知识检索工具：把 RAG 混合检索包装成模型可自主调用的能力。
 
-职责：模型决定「要查什么」之后，这里负责把问句变成可检索的自包含问句、走混合检索、
+模型决定「要查什么」之后，这里负责把问句变成可检索的自包含问句、走混合检索、
 按全局序号格式化片段，并把结构化命中结果通过 ``artifact`` 回传给图（用于 SSE 引用面板）。
-
-主要导出：
-    - ``search_pet_knowledge``  LangChain 工具（``response_format="content_and_artifact"``）
-
-外部依赖：``app.kb.search``（混合检索）、``app.llm``（追问改写）、``app.config``。
 
 为什么用 ``content_and_artifact``：
     模型只需要看格式化后的文本（带 ``[n]`` 编号），而服务端还需要原始命中（docId / 分数 /
@@ -42,14 +37,8 @@ _EMPTY_RESULT = "（知识库未检索到与该问题相关的内容。请如实
 def _needs_rewrite(query: str) -> bool:
     """判断问句是否需要先改写再检索。
 
-    Args:
-        query: 待检索的问句。
-
     Returns:
         True 表示过短或含指代/追问信号，需要结合上下文补全。
-
-    Raises:
-        无。
     """
     q = query.strip()
     if len(q) <= settings.RAG_REWRITE_MIN_CHARS:
@@ -62,13 +51,9 @@ def _recent_dialogue(state: Dict[str, Any], limit: int = 4) -> str:
 
     Args:
         state: 图状态（读 ``messages``）。
-        limit: 取最近多少条消息。
 
     Returns:
         形如「用户：…\\n助手：…」的文本；无历史时为空串。
-
-    Raises:
-        无。
     """
     messages = [m for m in (state.get("messages") or [])
                 if isinstance(m, (HumanMessage, AIMessage))]
@@ -90,13 +75,9 @@ async def _rewrite_query(query: str, state: Dict[str, Any]) -> Tuple[str, List[s
 
     Args:
         query: 模型传入的检索问句（可能是「那它呢」这类指代句）。
-        state: 图状态，用于取对话历史。
 
     Returns:
         ``(检索用问句, 物种列表)``；无需改写或改写失败时返回原句与空物种。
-
-    Raises:
-        无——改写失败退回原句，不让一次失败的改写阻断检索。
     """
     if not settings.RAG_QUERY_REWRITE or settings.is_mock or not _needs_rewrite(query):
         return query, []
@@ -131,9 +112,6 @@ def _species_of(state: Dict[str, Any], species: str) -> List[str]:
 
     Returns:
         物种列表，优先级：模型参数 > 宠物档案。
-
-    Raises:
-        无。
 
     模型显式指定优先：用户问「狗能不能吃这个」时，即便档案里养的是猫，也应按狗过滤。
     """

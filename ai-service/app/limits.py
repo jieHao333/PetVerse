@@ -1,25 +1,7 @@
 """单用户并发闸（Redis 计数 + 进程内兜底）。
 
-职责：限制同一用户同时进行的流式对话路数，防止单账号（或脚本）占满全局并发名额、把其他
+限制同一用户同时进行的流式对话路数，防止单账号（或脚本）占满全局并发名额、把其他
 用户挤出服务。计数优先放在 Redis（多实例共享），Redis 不可用时退化为进程内计数。
-
-主要导出：
-    - ``try_acquire``  尝试占用一个名额（返回是否成功、是否走了 Redis）
-    - ``release``      归还名额
-    - ``is_busy``      只读探测当前是否已达上限（用于快速拒绝，不占名额）
-
-外部依赖：``app.memory``（Redis Lua 原子操作）。
-
-使用示例：
-    from app import limits
-
-    acquired, via_redis = await limits.try_acquire(user_id, 2)
-    if not acquired:
-        return "您有正在生成的咨询回复"
-    try:
-        ...
-    finally:
-        await limits.release(user_id, via_redis)   # 必须回传 via_redis 保持计数来源一致
 """
 
 import asyncio
@@ -57,14 +39,8 @@ _local_lock = asyncio.Lock()
 def _key(user_id: int) -> str:
     """拼出计数键。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         Redis 键名，形如 ``ai:conc:user:{id}``。
-
-    Raises:
-        无。
     """
     return f"ai:conc:user:{user_id}"
 
@@ -72,18 +48,11 @@ def _key(user_id: int) -> str:
 async def try_acquire(user_id: int, limit: int) -> tuple:
     """尝试占用一个并发名额。
 
-    Args:
-        user_id: 用户 ID。
-        limit: 该用户允许的最大并发数。
-
     Returns:
         ``(acquired, via_redis)`` 二元组：
             - ``acquired``：是否成功占到名额；
             - ``via_redis``：本次计数是否发生在 Redis 上。归还时必须原样回传给 ``release``，
               否则会在错误的计数体系上做递减，导致名额泄漏。
-
-    Raises:
-        无——Redis 异常在内部降级为进程内计数。
     """
     key = _key(user_id)
     try:
@@ -109,14 +78,7 @@ async def release(user_id: int, via_redis: bool) -> None:
     """归还并发名额。
 
     Args:
-        user_id: 用户 ID。
         via_redis: ``try_acquire`` 返回的计数来源；决定在 Redis 还是进程内字典上递减。
-
-    Returns:
-        None。
-
-    Raises:
-        无——Redis 递减失败时依赖键 TTL 自动回收，不做进程内补偿。
     """
     key = _key(user_id)
     if via_redis:
@@ -140,15 +102,8 @@ async def is_busy(user_id: int, limit: int) -> bool:
 
     用于在建立 SSE 流之前快速拒绝，省掉一次流对象创建与信号量排队。
 
-    Args:
-        user_id: 用户 ID。
-        limit: 该用户允许的最大并发数。
-
     Returns:
         True 表示已达上限。
-
-    Raises:
-        无——Redis 读取失败时改用进程内计数判断。
     """
     key = _key(user_id)
     try:

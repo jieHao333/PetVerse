@@ -1,15 +1,8 @@
 """AgentLoop 与 SSE 接入层之间的事件适配。
 
-职责：把 LangGraph 的原始流事件翻译成路由层关心的两件事——「哪些 token 该下发给用户」
+把 LangGraph 的原始流事件翻译成路由层关心的两件事——「哪些 token 该下发给用户」
 与「这一批更新里有没有新的引用来源」。把这些判断收敛到一处，是为了让路由层不必知道
 图里有哪些节点、哪个节点会产出引用。
-
-主要导出：
-    - ``extract_refs``      从 ``stream_mode="updates"`` 的载荷里取出新增引用
-    - ``extract_interrupt`` 从更新里取出人工审批请求（图已挂起）
-    - ``is_answer_chunk``   判断一条 ``messages`` 流片段是否属于给用户看的答案
-
-外部依赖：``langchain_core.messages``、``app.agent.graph``（节点名常量）。
 
 设计要点：AgentLoop 里每一次模型调用都会产出 token（决策轮、改写轮、收口轮），
 但只有 ``agent`` 的「非工具调用轮」和 ``conclude`` 的收口轮才是答案。按节点名 +
@@ -40,9 +33,6 @@ def extract_refs(payload: Any) -> Optional[List[dict]]:
 
     Returns:
         新增片段列表；本批更新里没有引用时返回 None（调用方据此决定是否推 refs 帧）。
-
-    Raises:
-        无。
     """
     if not isinstance(payload, dict):
         return None
@@ -66,9 +56,6 @@ def extract_interrupt(payload: Any) -> Optional[Dict[str, Any]]:
     Returns:
         审批请求：``{"approvalId", "type", "action", "title", "summary", "resource"}``；
         本次更新不是审批中断时返回 None。
-
-    Raises:
-        无。
     """
     if not isinstance(payload, dict):
         return None
@@ -92,9 +79,6 @@ def is_answer_chunk(chunk: Any, meta: Optional[Dict[str, Any]]) -> bool:
 
     Returns:
         True 表示这是答案节点的正文片段，应当转成 SSE ``delta``。
-
-    Raises:
-        无。
 
     说明：模型决定调用工具的那一轮通常只产出 ``tool_call_chunks``、正文为空；
     少数模型会先说一句「我查一下」再发起调用，这类文本会被 ``tool_call_chunks``

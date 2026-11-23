@@ -1,14 +1,8 @@
 """AgentLoop 的确定性护栏与上下文工程工具。
 
-职责：把「不能交给模型自由发挥」的少数判断收敛到一处——医疗/急症识别、是否需要知识依据、
+把「不能交给模型自由发挥」的少数判断收敛到一处——医疗/急症识别、是否需要知识依据、
 历史窗口裁剪。这些判断**不决定流程走向**（走哪条路由由模型决定），只影响两件事：
 提示词的强化措辞、以及送进模型的上下文长度。
-
-主要导出：
-    - ``classify_hints``  关键词级别的医疗 / 知识判定
-    - ``trim_history``    按条数裁剪历史，且不破坏 tool_call 与 ToolMessage 的配对
-
-外部依赖：``langchain_core.messages``、``app.config.settings``。
 
 设计取舍：为什么不在这里做意图路由？
     改造前的 ``_rule_intents`` 直接决定走哪条分支，词表一漏就整轮走错。现在词表只用来
@@ -54,9 +48,6 @@ def classify_hints(query: str) -> Tuple[bool, bool]:
         ``(medical, needs_evidence)``：
         ``medical`` 表示需要追加「及时就医」护栏；``needs_evidence`` 表示问题偏知识/健康，
         提示词里应引导模型先检索知识库。两者都只是建议，不是路由条件。
-
-    Raises:
-        无。
     """
     q = (query or "").lower().strip()
     if not q:
@@ -81,9 +72,6 @@ def trim_history(messages: Sequence[AnyMessage], limit: int) -> List[AnyMessage]
 
     Returns:
         裁剪后的消息列表。
-
-    Raises:
-        无。
 
     注意：不能简单取 ``messages[-limit:]``——窗口首条若落在 ToolMessage 上，它对应的
     ``AIMessage(tool_calls=...)`` 就被切掉了，OpenAI 兼容接口会直接报
@@ -110,14 +98,8 @@ _INTERRUPTED_TOOL_NOTE = "（该工具调用被用户中断，未返回结果。
 def repair_dangling_tool_calls(messages: Sequence[AnyMessage]) -> List[AnyMessage]:
     """补齐「有调用、无结果」的工具调用，保证消息序列对接口合法。
 
-    Args:
-        messages: 完整消息流。
-
     Returns:
         修复后的新列表（不修改入参）。
-
-    Raises:
-        无。
 
     背景：OpenAI 兼容接口要求每个 ``tool_calls`` 都必须有对应 ``tool_call_id`` 的
     ToolMessage。用户点「停止生成」时，图可能恰好停在「AI 已请求工具、工具还没返回」的

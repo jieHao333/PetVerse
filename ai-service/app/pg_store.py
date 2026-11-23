@@ -1,21 +1,8 @@
 """健康评估报告与温层缓存的 PostgreSQL 存储。
 
-职责：存放两类「可丢但有用」的数据——宠物健康评估历史（``pet_health_report``）与
+存放两类「可丢但有用」的数据——宠物健康评估历史（``pet_health_report``）与
 两级缓存中的**温层**（``ai_cache``，Redis 未命中时回落读取）。与 ``app.persistence``
 （会话与消息）分开，是因为两者的可靠性要求不同：会话历史要尽量保住，这里全部可降级。
-
-主要导出：
-    - ``init`` / ``close`` / ``available``  生命周期
-    - ``save_health_report`` / ``list_health_reports``  健康报告读写
-    - ``cache_get`` / ``cache_set``  温层缓存读写
-
-外部依赖：``psycopg`` / ``psycopg_pool``、``app.config.settings``。
-
-使用示例：
-    from app import pg_store
-
-    await pg_store.save_health_report(user_id=42, pet_id=7, score=88, level="excellent", payload=report)
-    history = await pg_store.list_health_reports(42, 7, limit=10)
 """
 
 import asyncio
@@ -56,12 +43,6 @@ def _init_pool_sync():
 
 async def init() -> None:
     """初始化连接池；失败时健康报告与温层缓存降级为不可用。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     try:
@@ -75,12 +56,6 @@ async def init() -> None:
 
 async def close() -> None:
     """关闭连接池。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     global _pool
     if _pool is not None:
@@ -96,9 +71,6 @@ def available() -> bool:
 
     Returns:
         True 表示可以尝试读写。
-
-    Raises:
-        无。
     """
     return _pool is not None
 
@@ -108,7 +80,6 @@ async def _run(sql: str, params: tuple, fetch: bool = False):
 
     Args:
         sql: SQL 语句（``%s`` 占位符）。
-        params: 参数元组。
         fetch: True 时返回 ``fetchall()`` 结果。
 
     Returns:
@@ -136,17 +107,9 @@ async def save_health_report(user_id: int, pet_id: int, score: int,
     只追加不更新：历史报告的价值在于可对比趋势，覆盖写会丢掉变化过程。
 
     Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
         score: 综合评分（0-100）。
         level: 评级（excellent / good / fair / warning）。
         payload: 完整报告（落 ``payload`` JSONB，供回放）。
-
-    Returns:
-        None。
-
-    Raises:
-        无——保存失败仅记日志，报告已返回给用户。
     """
     sql = ("INSERT INTO pet_health_report (user_id, pet_id, score, level, payload) "
            "VALUES (%s, %s, %s, %s, %s::jsonb)")
@@ -162,14 +125,10 @@ async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> Lis
 
     Args:
         user_id: 用户 ID（同时作为归属校验，防止越权查他人宠物）。
-        pet_id: 宠物 ID。
         limit: 返回条数上限。
 
     Returns:
         报告列表（id / score / level / report / createTime）；失败时为空列表。
-
-    Raises:
-        无。
     """
     sql = ("SELECT id, score, level, payload, "
            "EXTRACT(EPOCH FROM create_time)::bigint AS ts "
@@ -197,14 +156,8 @@ async def list_health_reports(user_id: int, pet_id: int, limit: int = 10) -> Lis
 async def cache_get(cache_key: str) -> Optional[dict]:
     """读取温层缓存（仅返回未过期的行）。
 
-    Args:
-        cache_key: 缓存键。
-
     Returns:
         缓存值；不存在、已过期或读取失败时返回 None。
-
-    Raises:
-        无。
     """
     # 过期判断放在 SQL 里而不是取回后在 Python 里比时间：避免把过期数据带出数据库。
     sql = "SELECT payload FROM ai_cache WHERE cache_key=%s AND expire_time > NOW()"
@@ -228,15 +181,7 @@ async def cache_set(cache_key: str, payload: dict, ttl_seconds: int) -> None:
     """写入温层缓存（同键覆盖并刷新过期时间）。
 
     Args:
-        cache_key: 缓存键。
-        payload: 可序列化的结果体。
         ttl_seconds: 过期秒数；``<= 0`` 视为不缓存。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     if ttl_seconds <= 0:
         return

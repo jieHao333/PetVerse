@@ -1,13 +1,7 @@
 """对话内写操作的幂等保护。
 
-职责：同一轮对话里，同一个写操作（相同工具 + 相同参数）最多真正执行一次。
+同一轮对话里，同一个写操作（相同工具 + 相同参数）最多真正执行一次。
 命中时直接返回上一次的成功结果，不再发起下游请求。
-
-主要导出：
-    - ``get``  查询本轮是否已执行过同一操作
-    - ``put``  记录一次成功执行
-
-外部依赖：仅标准库。
 
 为什么需要它：
     1. 部分模型会在一条回复里把同一个调用发两遍（尤其并行 tool_calls 场景）；
@@ -45,14 +39,10 @@ def _fingerprint(tool: str, args: Dict[str, Any]) -> str:
     """把「工具名 + 参数」压成一个稳定指纹。
 
     Args:
-        tool: 工具名。
         args: 工具参数（应只包含模型可见参数，不含注入的状态）。
 
     Returns:
         十六进制摘要；参数顺序不同但语义相同时指纹一致。
-
-    Raises:
-        无。
     """
     try:
         raw = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
@@ -64,16 +54,8 @@ def _fingerprint(tool: str, args: Dict[str, Any]) -> str:
 def _key(run_id: str, tool: str, args: Dict[str, Any]) -> str:
     """拼接缓存 key。
 
-    Args:
-        run_id: 本轮对话标识。
-        tool: 工具名。
-        args: 工具参数。
-
     Returns:
         缓存 key；``run_id`` 为空时返回空串（表示不做去重）。
-
-    Raises:
-        无。
     """
     if not run_id:
         return ""
@@ -82,15 +64,6 @@ def _key(run_id: str, tool: str, args: Dict[str, Any]) -> str:
 
 def _sweep(now: float) -> None:
     """清理过期条目，必要时整体清空。
-
-    Args:
-        now: 当前时间戳。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     expired = [k for k, (ts, _) in _CACHE.items() if now - ts > _TTL_SECONDS]
     for key in expired:
@@ -105,14 +78,9 @@ def get(run_id: str, tool: str, args: Dict[str, Any]) -> Optional[str]:
 
     Args:
         run_id: 本轮对话标识（来自图状态）。
-        tool: 工具名。
-        args: 工具参数。
 
     Returns:
         上次的成功结果文本；未执行过或已过期时返回 None。
-
-    Raises:
-        无。
     """
     key = _key(run_id, tool, args)
     if not key:
@@ -131,16 +99,7 @@ def put(run_id: str, tool: str, args: Dict[str, Any], result: str) -> None:
     """记录一次成功执行。
 
     Args:
-        run_id: 本轮对话标识。
-        tool: 工具名。
-        args: 工具参数。
         result: 返回给模型的结果文本（命中时原样重放，保证模型看到一致的信息）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     key = _key(run_id, tool, args)
     if not key:
@@ -153,11 +112,5 @@ def put(run_id: str, tool: str, args: Dict[str, Any], result: str) -> None:
 
 def clear() -> None:
     """清空缓存（仅供测试与排障使用）。
-
-    Returns:
-        None。
-
-    Raises:
-        无。
     """
     _CACHE.clear()

@@ -1,26 +1,7 @@
 """知识文档解析（md / docx / pdf / doc）。
 
-职责：把不同格式的文档统一解析成 ``ParsedDocument``——一个带标题层级的小节序列。
+把不同格式的文档统一解析成 ``ParsedDocument``——一个带标题层级的小节序列。
 后续的切分、向量化都只依赖这个中间结构，因此新增格式只需在这里加一个解析器。
-
-主要导出：
-    - ``SUPPORTED_SUFFIXES``    支持的扩展名
-    - ``DocParseError``         解析失败（格式不支持 / 文件损坏 / 无正文）
-    - ``Section`` / ``ParsedDocument``  中间结构
-    - ``parse_file`` / ``parse_bytes``  两种输入形态的解析入口
-    - ``normalize_species`` / ``species_compatible``  物种归一化与兼容判断
-    - ``document_text`` / ``preview_text``  纯文本导出与预览
-    - ``_decode`` / ``_safe_doc_id``  编码与 ID 处理
-
-外部依赖：``python-docx``（docx）、``PyMuPDF``（pdf）、系统命令 ``antiword`` / ``catdoc``（doc）。
-后三者均为**可选**：缺失时抛 ``DocParseError`` 并给出安装提示，不做静默降级——
-产出空文档比报错更难排查。
-
-使用示例：
-    from app.kb import documents
-
-    doc = documents.parse_file(Path("app/knowledge/犬猫疫苗与免疫程序.md"))
-    print(doc.title, doc.category, len(doc.sections))
 """
 
 import hashlib
@@ -89,9 +70,6 @@ class ParsedDocument:
 
         Returns:
             所有小节文本长度之和。
-
-        Raises:
-            无。
         """
         return sum(len(s.text) for s in self.sections)
 
@@ -102,10 +80,8 @@ def parse_file(path: Path, doc_id: Optional[str] = None,
     """解析磁盘上的文档文件。
 
     Args:
-        path: 文件路径。
         doc_id: 覆盖自动推导的文档 ID（默认取文件名主干）。
         title: 覆盖文档标题（默认取 front matter / 文档元信息 / 文件名）。
-        category: 覆盖分类。
         species: 覆盖适用物种（会先做归一化）。
 
     Returns:
@@ -158,7 +134,6 @@ def parse_bytes(filename: str, data: bytes, **kwargs) -> ParsedDocument:
 
     Args:
         filename: 原始文件名，用于推断格式与默认 doc_id。
-        data: 文件字节。
         **kwargs: 覆盖字段（doc_id / title / category / species）。
 
     Returns:
@@ -204,9 +179,6 @@ def normalize_species(values) -> List[str]:
 
     Returns:
         去重后的标准物种列表，取值限定在 猫 / 狗 / 通用 / 其他。
-
-    Raises:
-        无。
     """
     if values is None:
         return []
@@ -231,16 +203,9 @@ def normalize_species(values) -> List[str]:
 def species_compatible(doc_species: List[str], target: List[str]) -> bool:
     """判断文档物种是否可用于目标物种的提问。
 
-    Args:
-        doc_species: 文档标注的物种。
-        target: 提问方物种。
-
     Returns:
         True 表示兼容。任一方为空、或含「通用 / 其他」时不设限——
         通用文档对所有物种都适用，不能因为标注不全被过滤掉。
-
-    Raises:
-        无。
     """
     if not doc_species or not target:
         return True
@@ -254,14 +219,8 @@ def species_compatible(doc_species: List[str], target: List[str]) -> bool:
 def document_text(doc: ParsedDocument) -> str:
     """把文档还原成纯文本（小节标题 + 正文）。
 
-    Args:
-        doc: 解析结果。
-
     Returns:
         纯文本；小节标题只保留末级。
-
-    Raises:
-        无。
     """
     lines = []
     for s in doc.sections:
@@ -303,15 +262,11 @@ def _parse_markdown(raw: bytes, filename: str, stem: str) -> ParsedDocument:
     """解析 Markdown：front matter + 标题层级切分。
 
     Args:
-        raw: 文件字节。
         filename: 原始文件名（作为 ``source``）。
         stem: 默认 doc_id。
 
     Returns:
         解析结果。
-
-    Raises:
-        无（解析问题以「无 sections」体现，由上层统一报错）。
     """
     text = _decode(raw)
     meta, body = _split_front_matter(text)
@@ -370,14 +325,8 @@ def _parse_markdown(raw: bytes, filename: str, stem: str) -> ParsedDocument:
 def _split_front_matter(text: str) -> Tuple[dict, str]:
     """分离 YAML front matter 与正文。
 
-    Args:
-        text: 全文。
-
     Returns:
         ``(元信息字典, 正文)``；没有 front matter 时返回 ``({}, 原文)``。
-
-    Raises:
-        无。
     """
     matched = _FRONT_MATTER.match(text)
     if not matched:
@@ -399,9 +348,6 @@ def _split_list(value: str) -> List[str]:
 
     Returns:
         去空白后的字符串列表。
-
-    Raises:
-        无。
     """
     if not value:
         return []
@@ -411,14 +357,8 @@ def _split_list(value: str) -> List[str]:
 def _heading_path(stack: List[Tuple[int, str]]) -> str:
     """把标题栈拼成路径字符串。
 
-    Args:
-        stack: ``(层级, 标题)`` 列表。
-
     Returns:
         ``章 > 节 > 小节`` 形式；空栈返回空串。
-
-    Raises:
-        无。
     """
     return " > ".join(h for _, h in stack if h)
 
@@ -427,8 +367,6 @@ def _parse_docx(raw: bytes, filename: str, stem: str) -> ParsedDocument:
     """解析 Word（.docx）：按段落样式还原标题层级，表格转成文本。
 
     Args:
-        raw: 文件字节。
-        filename: 原始文件名。
         stem: 默认 doc_id。
 
     Returns:
@@ -512,8 +450,6 @@ def _parse_pdf(raw: bytes, filename: str, stem: str) -> ParsedDocument:
     """解析 PDF：逐页抽取文本，页码作为小节路径。
 
     Args:
-        raw: 文件字节。
-        filename: 原始文件名。
         stem: 默认 doc_id。
 
     Returns:
@@ -557,8 +493,6 @@ def _parse_legacy_doc(raw: bytes, filename: str, stem: str) -> ParsedDocument:
     """解析旧版 Word（.doc，二进制格式）。
 
     Args:
-        raw: 文件字节。
-        filename: 原始文件名。
         stem: 默认 doc_id。
 
     Returns:
@@ -629,12 +563,6 @@ class _TempFile:
 
     def __exit__(self, *exc) -> None:
         """删除临时文件（失败忽略）。
-
-        Returns:
-            None。
-
-        Raises:
-            无。
         """
         if self._path is not None:
             try:
@@ -646,15 +574,9 @@ class _TempFile:
 def _decode(raw: bytes) -> str:
     """按常见编码依次尝试解码。
 
-    Args:
-        raw: 原始字节。
-
     Returns:
         解码后的文本；全部失败时用 utf-8 + replace 兜底，保证不抛异常（宁可乱码也不中断导入）。
         先试 utf-8-sig 是为了吃掉 BOM，否则首个标题会带不可见字符而匹配不上。
-
-    Raises:
-        无。
     """
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
@@ -667,14 +589,8 @@ def _decode(raw: bytes) -> str:
 def _safe_doc_id(stem: str) -> str:
     """把文件名转成安全的 doc_id。
 
-    Args:
-        stem: 文件名主干。
-
     Returns:
         仅保留字母数字、下划线与中文的 ID；清洗后为空时返回 ``doc``（保证 doc_id 非空）。
-
-    Raises:
-        无。
     """
     cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "_", stem.strip()).strip("_")
     return cleaned or "doc"

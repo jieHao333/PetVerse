@@ -1,19 +1,8 @@
 """长期记忆的抽取与维护。
 
-职责：每轮对话结束后，异步判断「本轮是否产生了值得长期记住的信息」，并把模型的判断结果
+每轮对话结束后，异步判断「本轮是否产生了值得长期记住的信息」，并把模型的判断结果
 落成 add / update / delete 操作。与 ``app.memstore`` 的分工：memstore 管存储，本模块管
 「记什么、怎么改」。
-
-主要导出：
-    - ``extract_and_apply``  抽取并应用记忆维护操作（后台任务调用）
-    - ``list_memories``      列出用户全部记忆（用户级 + 其所有宠物级）
-    - ``memory_enabled``     记忆能力总开关（配置 + 存储可用性）
-
-外部依赖：``app.llm.astructured_invoke``、``app.memstore``、``app.schemas``。
-
-使用示例：
-    # 通常在对话流结束后作为后台任务触发，不阻塞用户拿到回复
-    asyncio.create_task(longterm.extract_and_apply(user_id, pet_id, pet_name, user_msg, reply))
 
 记忆清单会作为「既有记忆」一并发给模型，使其能判断「该新增还是该更新某条」，
 避免同一事实被反复 add 成多条。
@@ -41,15 +30,8 @@ _MAX_OPS = 8
 async def _existing_lines(user_id: int, pet_id: int) -> list[tuple[str, str, str]]:
     """取出既有记忆清单，供模型对比去重。
 
-    Args:
-        user_id: 用户 ID。
-        pet_id: 宠物 ID。
-
     Returns:
         ``(key, 归属标签, 内容)`` 三元组列表；store 不可用时返回空列表。
-
-    Raises:
-        无。
     """
     lines: list[tuple[str, str, str]] = []
     store = memstore.get_store()
@@ -75,17 +57,9 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
     因为它跑在对话流结束之后，失败不该影响用户已经看到的回复。
 
     Args:
-        user_id: 用户 ID。
         pet_id: 当前会话关联的宠物 ID（决定 pet 级记忆写入哪个命名空间）。
         pet_name: 宠物名，写入记忆条目以便跨宠物展示时区分。
         user_msg: 本轮用户消息（已含附件描述）。
-        reply: 本轮助手回复。
-
-    Returns:
-        None。
-
-    Raises:
-        无——内部捕获全部异常。
     """
     try:
         existing = await _existing_lines(user_id, pet_id)
@@ -170,14 +144,8 @@ async def extract_and_apply(user_id: int, pet_id: int, pet_name: str,
 async def list_memories(user_id: int) -> list[dict]:
     """列出用户的全部长期记忆（用户级 + 所有宠物级），按更新时间倒序。
 
-    Args:
-        user_id: 用户 ID。
-
     Returns:
         记忆字典列表；store 不可用时为空列表。
-
-    Raises:
-        无。
     """
     items: list[dict] = []
     store = memstore.get_store()
@@ -213,8 +181,5 @@ def memory_enabled() -> bool:
 
     Returns:
         True 表示可以读写长期记忆。
-
-    Raises:
-        无。
     """
     return settings.MEMORY_ENABLED and memstore.available()

@@ -1,24 +1,7 @@
 """服务入口：FastAPI 应用装配与生命周期管理。
 
-职责：
-    1. 修正 ``sys.path``，使 ``python app/main.py`` 这种直接执行方式也能用 ``app.xxx`` 绝对导入；
-    2. 在启动钩子里按依赖顺序初始化各存储 / 注册中心，在停机钩子里逆序释放；
-    3. 挂载全部路由，并把参数校验错误统一改写为业务报文。
-
-主要导出：
-    - ``app``     FastAPI 实例（uvicorn 的入口对象）
-    - ``lifespan`` 启动 / 停机钩子
-
-外部依赖：FastAPI、uvicorn（仅 ``__main__`` 分支），以及本项目全部业务模块。
-
-使用示例：
-    # 方式一（推荐，见 README）
-    python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
-    # 方式二
-    python -m app.main
-
-启动约定：所有初始化都「失败可降级」，唯一例外是必要配置缺失时会在日志里显式告警
-（MOCK 模式、RAG 缺 Embedding），确保运维能第一时间看到而不是等用户报错。
+启动约定：所有初始化都「失败可降级」，只有「能启动但功能不完整」的情况（MOCK 模式、
+RAG 缺 Embedding）会在启动日志里显式告警，避免被误当成代码 bug。
 """
 
 import asyncio
@@ -31,8 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-# 直接执行本文件时（python app/main.py），sys.path[0] 是 app/ 目录，
-# `import app.xxx` 会找不到包；这里把项目根目录补进路径，使两种启动方式行为一致。
+# 直接执行本文件时 sys.path[0] 是 app/，找不到 `app.xxx` 包；补上项目根目录让两种启动方式一致。
 _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PACKAGE_ROOT not in sys.path:
     sys.path.insert(0, _PACKAGE_ROOT)
@@ -50,29 +32,14 @@ from app.recommend import router as recommend_router
 from app.review import router as review_router
 from app.schemas import fail
 
-# 在创建 app 之前配置日志，保证 import 阶段（如各模块创建 logger）之后的所有输出都带统一格式。
+# 必须在创建 app 之前配置，保证 import 阶段之后的所有输出都带统一格式。
 setup_logging()
 logger = logging.getLogger("ai-service")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动 / 停机钩子。
-
-    启动顺序按「被依赖者在前」排列：Redis（缓存 / 并发计数）→ 会话持久化 → 记忆相关
-    （checkpoint / store / 报告库）→ 知识库 → 服务注册。停机严格逆序释放，避免
-    先关底层连接、后关上层对象导致关闭时报错。
-
-    Args:
-        app: FastAPI 实例（框架注入，此处未直接使用）。
-
-    Yields:
-        None：``yield`` 之前的代码在启动时执行，之后在停机时执行。
-
-    Raises:
-        无——各 init 内部均已降级处理。
-    """
-    # 两类「能启动但功能不完整」的情况必须在启动日志里说清楚，否则排查时会误以为是代码 bug。
+    """应用启动 / 停机钩子：启动按「被依赖者在前」初始化，停机严格逆序释放。"""
     if settings.is_mock:
         logger.warning(
             "当前运行在 MOCK 模式（MOCK_CHAT=%s，LLM_API_KEY %s），对话返回内置模拟回复；"
@@ -94,7 +61,7 @@ async def lifespan(app: FastAPI):
     await kb_store.init()
     if settings.RAG_ENABLED and settings.embedding_enabled:
         logger.info("知识库规模: %s", await kb_store.stats())
-    # 注册与反注册是同步阻塞调用（HTTP / SDK），放线程池执行以免卡住事件循环启动。
+    # Nacos 注册是同步阻塞调用，放线程池执行以免卡住事件循环启动。
     await asyncio.to_thread(nacos_client.register)
     logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s, deploy=%s）",
                 settings.AI_SERVICE_NAME, settings.AI_SERVICE_HOST,
@@ -128,18 +95,7 @@ app.include_router(recommend_router)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """把框架级参数校验错误改写成统一业务报文。
 
-    默认情况下 FastAPI 返回 HTTP 422 + 英文错误数组，而前端只认 HTTP 200 +
-    ``{code,msg,data}``；不转换会让参数错误在前端表现为「请求失败」而非可读提示。
-
-    Args:
-        request: 触发异常的请求（用于日志定位）。
-        exc: 校验异常，``errors()`` 含字段级原因。
-
-    Returns:
-        HTTP 200 的 ``fail(400, "参数错误")`` 响应。
-
-    Raises:
-        无。
+    FastAPI 默认返回 422 + 英文错误数组，而前端只认 HTTP 200 + ``{code,msg,data}``。
     """
     logger.warning("参数校验失败: %s %s -> %s", request.method, request.url.path, exc.errors())
     return JSONResponse(status_code=200, content=fail(400, "参数错误"))
@@ -148,7 +104,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 if __name__ == "__main__":
     import uvicorn
 
-    # 直接用 uvicorn.run 而非命令行：便于 IDE 一键调试；生产仍建议用 uvicorn 命令 + 多 worker。
-    # 注意 host 用 AI_SERVICE_HOST（监听地址），不要用 AI_SERVICE_IP（注册给 Nacos 的地址）：
-    # 后者留空时是自动探测出来的，拿去绑定会因为本机没有那张网卡而启动失败。
+    # host 用监听地址 AI_SERVICE_HOST，不要用注册给 Nacos 的 AI_SERVICE_IP：
+    # 后者留空时是探测出来的，拿去绑定会因本机没有那张网卡而启动失败。
     uvicorn.run(app, host=settings.AI_SERVICE_HOST, port=settings.AI_SERVICE_PORT)

@@ -1,18 +1,7 @@
 """知识库导入命令行工具。
 
-职责：把 ``app/knowledge``（或指定目录 / 单个文件）的语料解析、切分、向量化后写入
+把 ``app/knowledge``（或指定目录 / 单个文件）的语料解析、切分、向量化后写入
 PostgreSQL(pgvector)。支持增量导入、强制重导、全量重建与规模查看。
-
-主要导出：无（作为脚本执行）。
-
-外部依赖：``app.kb.*``、``app.config.settings``、``app.logging_setup``。
-
-使用示例：
-    python -m scripts.ingest_knowledge              # 增量导入（内容未变则跳过）
-    python -m scripts.ingest_knowledge --full       # 清空后全量重建
-    python -m scripts.ingest_knowledge --force      # 不跳过，全部重新向量化
-    python -m scripts.ingest_knowledge --file x.pdf
-    python -m scripts.ingest_knowledge --stats      # 只看规模与文档清单
 
 退出码：0 成功 / 1 部分文件失败 / 2 参数或环境错误（便于 CI 与运维脚本判断）。
 """
@@ -57,9 +46,6 @@ async def main() -> int:
 
     Returns:
         进程退出码：0 全部成功 / 1 有文件导入失败 / 2 参数或环境错误。
-
-    Raises:
-        无——异常统一转成退出码（``finally`` 保证连接池关闭）。
     """
     args = _parse_args()
     setup_logging()

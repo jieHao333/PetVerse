@@ -1,20 +1,7 @@
 """文档片段切分。
 
-职责：把解析后的 ``ParsedDocument``（按标题层级组织的小节）切成适合向量化与检索的片段，
+把解析后的 ``ParsedDocument``（按标题层级组织的小节）切成适合向量化与检索的片段，
 并在每个片段前补一行「文档｜分类｜小节」上下文，使其脱离原文后仍能自我说明。
-
-主要导出：
-    - ``Chunk``            片段数据结构
-    - ``split_document``   切分主入口
-
-外部依赖：``app.kb.documents``（``ParsedDocument`` / ``Section``）。
-
-使用示例：
-    from app.kb.chunking import split_document
-
-    chunks = split_document(doc, chunk_size=600, chunk_min=80, chunk_max=900)
-    for c in chunks:
-        print(c.chunk_index, len(c.content), c.section)
 
 三档长度参数的配合：
     ``chunk_size`` 目标长度（尽量不超过）、``chunk_min`` 合并下限（更短的小节并入上一节）、
@@ -56,16 +43,12 @@ def split_document(doc: ParsedDocument, chunk_size: int = 600,
     """把文档切成片段列表。
 
     Args:
-        doc: 已解析的文档。
         chunk_size: 目标片段长度（字符数）。
         chunk_min: 小节长度下限，短于此值尝试并入前一节。
         chunk_max: 片段硬上限，超长内容强制按此长度断开。
 
     Returns:
         片段列表，``chunk_index`` 从 0 连续递增。
-
-    Raises:
-        无。
     """
     # 先合并过短小节：一二级标题下只有一两句话时，单独成片段会缺乏上下文且浪费向量。
     merged = _merge_short_sections(doc.sections, chunk_size, chunk_min)
@@ -97,14 +80,10 @@ def _context_prefix(doc: ParsedDocument, section_path: str) -> str:
     """构造片段首行的上下文前缀。
 
     Args:
-        doc: 文档。
         section_path: 小节路径（``章 > 节``）。
 
     Returns:
         ``文档标题｜分类｜小节`` 形式的字符串（缺项自动省略）。
-
-    Raises:
-        无。
     """
     parts = [doc.title]
     if doc.category:
@@ -123,15 +102,10 @@ def _merge_short_sections(sections: List[Section], chunk_size: int,
     宁可让短小节独立存在。
 
     Args:
-        sections: 原始小节列表。
         chunk_size: 合并后的长度上限。
-        chunk_min: 触发合并的长度阈值。
 
     Returns:
         合并后的小节列表。
-
-    Raises:
-        无。
     """
     out: List[Section] = []
     for sec in sections:
@@ -150,15 +124,10 @@ def _split_section(section: Section, chunk_size: int, chunk_max: int) -> List[st
     """切分单个小节。
 
     Args:
-        section: 小节。
-        chunk_size: 目标长度。
         chunk_max: 硬上限。
 
     Returns:
         文本片段列表。
-
-    Raises:
-        无。
     """
     text = section.text.strip()
     if not text:
@@ -178,15 +147,10 @@ def _split_by_sentences(text: str, chunk_size: int, chunk_max: int) -> List[str]
     """按句切分，并在片段间保留一句重叠。
 
     Args:
-        text: 正文。
-        chunk_size: 目标长度。
         chunk_max: 硬上限（超长单句按此长度硬切）。
 
     Returns:
         片段列表（已 strip 并剔除空白项）。
-
-    Raises:
-        无。
     """
     sentences = [s for s in _SENT_SPLIT.split(text) if s and s.strip()]
     if not sentences:
@@ -224,15 +188,10 @@ def _split_table_block(lines: List[str], chunk_size: int, chunk_max: int) -> Lis
     """切分含表格的小节：普通文本按句切，表格按行切并在每片重复表头。
 
     Args:
-        lines: 小节的所有行。
-        chunk_size: 目标长度。
         chunk_max: 硬上限。
 
     Returns:
         片段列表。
-
-    Raises:
-        无。
     """
     pieces: List[str] = []
     prose: List[str] = []
@@ -290,14 +249,8 @@ def _extract_table_header(table_lines: List[str]) -> tuple[List[str], List[str]]
     Markdown 表格的结构是「表头行 + 分隔行（|---|）+ 数据行」，只有把分隔行也归入表头，
     每个片段才是一张语法完整的表格。
 
-    Args:
-        table_lines: 连续的表格行。
-
     Returns:
         ``(表头行列表, 数据行列表)``。
-
-    Raises:
-        无。
     """
     header: List[str] = []
     rows: List[str] = []
