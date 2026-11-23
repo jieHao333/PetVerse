@@ -43,8 +43,14 @@ class Settings(BaseSettings):
 
     # ── 服务自身与注册中心 ────────────────────────────────────────────────
     AI_SERVICE_NAME: str = "ai-service"
-    # 注册进 Nacos 的 IP 必须是对网关可达的地址；容器/多网卡环境下要显式指定。
-    AI_SERVICE_IP: str = "127.0.0.1"
+    # 监听地址（uvicorn 的 bind）：默认只听回环，本机开发最安全。
+    # 服务器 / 多实例部署改成 0.0.0.0，让注册出去的地址真的能被别的机器连上。
+    AI_SERVICE_HOST: str = "127.0.0.1"
+    # 注册进 Nacos 的 IP 必须是「消费方（网关 / 单体）能连上」的地址，与监听地址是两回事：
+    # 监听 0.0.0.0 时本机有多个网卡，必须挑一个写出去。留空 = 自动挑（见 nacos_client）。
+    # 不要写死 127.0.0.1：多机部署时所有实例会挤在同一个 (ip, port) 上互相覆盖，
+    # 且消费方拿到 127.0.0.1 只会连到自己。
+    AI_SERVICE_IP: str = ""
     AI_SERVICE_PORT: int = 8086
     NACOS_SERVER_ADDR: str = "localhost:8848"
     NACOS_GROUP: str = "DEFAULT_GROUP"
@@ -143,6 +149,10 @@ class Settings(BaseSettings):
     SKILLS_DIR: str = ""
 
     # ── 下游业务服务发现（ai-service 直连实例，注入内部 X-User-Id） ───────
+    # 服务间身份令牌：随每次下游调用以 X-Internal-Token 头发送，业务侧校验通过后
+    # 才信任请求里的 X-User-Id。与单体版的 auth.internal-token（环境变量 INTERNAL_TOKEN）
+    # 必须是同一个值；留空则退回「按来源 IP 信任」的旧通道，跨主机 / 容器部署时必然失效。
+    INTERNAL_TOKEN: str = ""
     # microservice：按下列服务名分别发现；monolith：统一路由到 MONOLITH_SERVICE_NAME。
     SERVICE_DEPLOY_MODE: Literal["microservice", "monolith"] = "microservice"
     MONOLITH_SERVICE_NAME: str = "petverse-single"

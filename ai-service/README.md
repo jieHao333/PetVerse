@@ -137,11 +137,14 @@ psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 | `KNOWLEDGE_DIR` / `KB_CHUNK_*` / `EMBED_BATCH_SIZE` | 语料目录 / 切分长度（目标·合并下限·硬上限）/ 单批 Embedding 条数 |
 | `KB_ADMIN_TOKEN` / `KB_MAX_UPLOAD_MB` | 知识库运维备选令牌（管理员角色之外的第二条通道，可留空）/ 上传大小上限 |
 | `SKILLS_DIR` | Skill 技能包根目录（标准 `skills/<name>/SKILL.md`），留空默认包内 `skills/` |
+| `AI_SERVICE_HOST` / `AI_SERVICE_PORT` | 监听地址与端口（uvicorn 的 bind）。默认 `127.0.0.1` 只给本机用；服务器 / 多实例部署改成 `0.0.0.0`，否则注册出去的内网地址别人连不上 |
+| `AI_SERVICE_IP` | 注册进 Nacos 的实例 IP，与监听地址是两回事：监听 `0.0.0.0` 时本机有多张网卡，必须挑一个写出去。留空 = 自动决定（显式配置 > 按到 Nacos 的路由探测 > 具体监听地址 > 回环），启动时用最终地址回连自检，不可达则退回 `127.0.0.1` 并告警 |
 | `NACOS_SERVER_ADDR` / `NACOS_GROUP` / `NACOS_NAMESPACE` | Nacos 地址 / 分组 / 命名空间；注册与下游发现共用，须与 Java 服务一致，命名空间留空表示 `public` |
 | `SERVICE_DEPLOY_MODE` | `microservice`（默认）：按各服务名发现；`monolith`：所有业务请求统一路由到单体服务 |
 | `PET_SERVICE_NAME` 等 `*_SERVICE_NAME` | 微服务模式下各业务域在 Nacos 中的服务名，默认与 Java 的 `spring.application.name` 一致 |
 | `MONOLITH_SERVICE_NAME` | 单体模式的目标服务名，默认 `petverse-single` |
 | `SERVICE_DISCOVERY_CACHE_TTL` | 健康实例列表的本地缓存秒数（默认 10）；到期单飞刷新，Nacos 网络故障时可暂用旧列表 |
+| `INTERNAL_TOKEN` | 服务间调用令牌，随下游请求以 `X-Internal-Token` 头发出，须与 Java 侧同名环境变量一致。业务网关校验通过后才信任 `X-User-Id`；留空则退回「按来源 IP 信任」的旧通道，跨主机 / 容器部署时画像会被拉空 |
 | `HTTP_TIMEOUT` | 已选中实例的业务 HTTP 调用超时秒数（默认 8） |
 | `REDIS_DB` | AI 模块统一使用的 Redis 库（默认 1；结果缓存与并发计数共用） |
 | `REVIEW_SUMMARY_TTL` / `RECOMMEND_CACHE_TTL` | 缓存 TTL（秒）：评论摘要 6 小时（Redis + `ai_cache` 两级）；推荐 300 秒（仅 Redis，未命中直接重算业务） |
@@ -171,9 +174,25 @@ DATA_SERVICE_NAME=data-service
 ```dotenv
 SERVICE_DEPLOY_MODE=monolith
 MONOLITH_SERVICE_NAME=petverse-single
+# 与单体版同名环境变量保持一致，否则它会剥掉 X-User-Id，宠物档案 / 订单 / 购物车全部 401
+INTERNAL_TOKEN=<32 字节以上随机串>
 ```
 
 两种模式都会过滤不健康、已禁用或权重为 0 的实例，并在实例间轮询。单体模式把 `/pet/**`、`/space/**`、`/shop/**`、`/data/**` 等路径直接请求到选中的单体实例，不再分别发现各业务服务名；有多个 `petverse-single` 实例时仍会自动分流。实例列表默认缓存 10 秒，Nacos 刷新请求失败时可暂用旧列表，但 Nacos 明确返回无健康实例时不会继续访问旧地址。
+
+### 多机 / 多实例部署清单
+
+Nacos、单体、ai-service 分处多台机器时，每个实例都必须注册成**消费方能连上、且彼此不同**的 `(ip, port)`，否则会在注册表里互相覆盖：
+
+| 位置 | 配置 | 常见错误 |
+| --- | --- | --- |
+| ai-service ×N | `AI_SERVICE_HOST=0.0.0.0`、`AI_SERVICE_IP=`（留空自动挑网卡） | 仍是 `127.0.0.1`：N 个实例在 Nacos 里塌缩成 1 个（键相同），且别的机器连不上它 |
+| ai-service ×N | `NACOS_SERVER_ADDR=<Nacos 所在机器的内网 IP>:8848` | 写 `localhost`：Nacos 不在本机时注册直接失败 |
+| ai-service ×N | `SERVICE_DEPLOY_MODE=monolith` + `MONOLITH_SERVICE_NAME=petverse-single` | 用 `microservice` 会去找 `pet-service` 等名字，单体里不存在 |
+| ai-service ×N | `INTERNAL_TOKEN=<同一个随机串>` | 与单体不一致：令牌校验失败，退回 IP 通道后跨机必然 401 |
+| 单体 ×N | 环境变量 `INTERNAL_TOKEN=<同一个随机串>` | 三台填了不同的值，等于没配 |
+
+服务间身份一律以 `X-Internal-Token` 为准，**不要依赖来源 IP**：ai-service 轮询 N 个单体实例时，只有恰好同机那台的源地址是回环，其余实例必然不在白名单里——表现就是「有时能个性化、有时全是热门」这种极难复现的随机失败。
 
 > pgvector 维度必须与 `EMBEDDING_DIM` 一致（`kb_chunk.embedding vector(1024)`）；切换 Embedding 模型需重建知识库表。
 
@@ -216,6 +235,11 @@ python -m scripts.eval_rag              # 跑 A/B/D 三模式消融对比
 ```powershell
 .venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8086
 ```
+
+> `--host`（或 `AI_SERVICE_HOST`）决定监听地址：只绑回环时，注册进 Nacos 的地址也只能是
+> `127.0.0.1`，别的机器连不到它。服务器部署或多实例场景请用 `--host 0.0.0.0`，并让
+> `AI_SERVICE_IP` 留空（自动挑一张可达网卡）；服务启动时会用最终注册地址回连自检，
+> 连不上会退回回环并打告警。
 
 服务发现与路由的单元测试（无需启动 Nacos）：
 

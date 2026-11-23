@@ -444,6 +444,7 @@ AI 服务使用独立的 `.env`：LLM / Embedding / PostgreSQL / Redis / Nacos �
 - 除白名单与游客只读 GET 接口外，请求需携带 `Authorization: Bearer <token>`。
 - 网关先剥离客户端自带的 `X-User-Id` / `X-User-Role`（防伪造），校验 JWT 后重新注入；下游服务通过 `UserContext` 获取当前用户。
 - `/internal/**` 仅供服务间 Feign 调用，禁止经网关从外部访问；管理端 / 商家端接口按角色校验。
+- 服务间调用（ai-service → 业务接口）凭 `X-Internal-Token` 证明来源可信，再以 `X-User-Id` 声明身份；令牌未配置时退回可信内网 IP 白名单。不用「来源 IP 是否回环」作主判据，因为 Nacos 注册的是局域网地址，同机部署的源地址也不是 `127.0.0.1`，会被误判为外部请求而剥掉身份头。
 - 角色变更（如商家审批通过）后需要重新登录，令牌中的角色声明才会更新。
 
 ### SSE 事件

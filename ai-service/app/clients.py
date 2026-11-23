@@ -23,6 +23,13 @@
       拉不到时应退化为通用回答，而不是让用户看到 500。
     - ``request``：返回 ``{ok, code, msg, data}``，**保留业务错误**。加购失败要告诉用户
       「库存不足」，而不是静默当作成功——写操作不能降级。
+
+服务间身份（为什么不只看 IP）：
+    每次调用都会带上 ``X-Internal-Token``（值取 ``settings.INTERNAL_TOKEN``）。业务侧的鉴权
+    过滤器先校验这个共享令牌，通过了才信任 ``X-User-Id``。早期实现是用「来源 IP 是否在
+    回环地址白名单里」来判断内部调用，但 Nacos 注册的是局域网地址（192.168/10.x），
+    ai-service 即便同机部署，源地址也不是 127.0.0.1，身份头会被当成外部伪造头剥离，
+    导致宠物档案、订单、购物车这些需要身份的接口全部 401 —— 画像一空，推荐就退化成热门兜底。
 """
 
 import logging
@@ -34,6 +41,29 @@ from app.config import settings
 from app.service_discovery import discovery
 
 logger = logging.getLogger(__name__)
+
+
+def _identity_headers(user_id: int) -> dict:
+    """构造服务间调用的身份头。
+
+    两个头各司其职，缺一不可：``X-Internal-Token`` 证明「请求来自受信任的内部服务」，
+    ``X-User-Id`` 说明「以哪个用户的身份查询」。令牌未配置时不发送该头，业务侧会退回
+    「按来源 IP 信任」的旧逻辑——那条通道只在同回环地址下有效，跨主机 / 容器部署会失效。
+
+    Args:
+        user_id: 目标用户 ID；0 表示匿名或系统级调用，不注入用户身份。
+
+    Returns:
+        可直接传给 httpx 的请求头字典；两个头都不需要时为空字典。
+    """
+    headers: dict = {}
+    token = settings.INTERNAL_TOKEN.strip()
+    if token:
+        headers["X-Internal-Token"] = token
+    # 只在有效用户下注入：user_id=0 表示匿名/系统调用，带上反而会被下游判为非法。
+    if user_id and user_id > 0:
+        headers["X-User-Id"] = str(user_id)
+    return headers
 
 
 class BizClient:
@@ -86,7 +116,8 @@ class BizClient:
             path: 接口路径，如 ``/pet/my-list``。
             params: 查询参数；None 表示不带参数。
             user_id: 大于 0 时注入 ``X-User-Id`` 头。网关在外部请求上会剥离该头，
-                这里是服务间调用，用它表明「以哪个用户的身份查询」。
+                这里是服务间调用，用它表明「以哪个用户的身份查询」；配合
+                ``X-Internal-Token`` 才能让业务侧接受这个身份。
 
         Returns:
             报文 ``data`` 字段；非 200、业务码非 200 或发生任何异常时返回 None。
@@ -94,10 +125,7 @@ class BizClient:
         Raises:
             无——异常在内部吞掉并降级为 None。
         """
-        headers = {}
-        # 只在有效用户下注入：user_id=0 表示匿名/系统调用，带上反而会被下游判为非法。
-        if user_id and user_id > 0:
-            headers["X-User-Id"] = str(user_id)
+        headers = _identity_headers(user_id)
         try:
             base_url = await discovery.resolve(service_name)
             resp = await self._get_client().get(base_url + path, params=params, headers=headers)
@@ -137,9 +165,7 @@ class BizClient:
         Raises:
             无——所有异常都收敛成上面的结构，调用方只需判断 ``ok``。
         """
-        headers = {}
-        if user_id and user_id > 0:
-            headers["X-User-Id"] = str(user_id)
+        headers = _identity_headers(user_id)
         try:
             base_url = await discovery.resolve(service_name)
             resp = await self._get_client().request(

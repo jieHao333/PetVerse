@@ -39,10 +39,11 @@ from app.schemas import RecommendResult
 logger = logging.getLogger(__name__)
 
 # 缓存版本号：调整召回/排序逻辑后手动 +1，可让旧结构缓存立即失效（避免上线后仍吐旧数据）。
-_CACHE_VERSION = "v5"
+# v7：画像取数通道改走后端服务间令牌，修复「画像恒为空 → 只推热门」的缓存也要一并作废。
+_CACHE_VERSION = "v7"
 
 # ── 召回规模参数 ──────────────────────────────────────────────────────────
-# 关键词数量直接决定并发请求数：商品每词 6 条、动态每词 4 条，5 个词 ≈ 50 条候选。
+# 关键词数量直接决定并发请求数：首页商品每词 6 条、动态每词 4 条；商城商品每词 10 条。
 _MAX_KEYWORDS = 5
 _MAX_POST_KEYWORDS = 2
 _PRODUCT_PER_KEYWORD = 6
@@ -54,8 +55,20 @@ _HOT_POST_LIMIT = 8
 # 送入 LLM 重排的候选上限：再多会超出上下文且显著增加成本。
 _CANDIDATE_POOL = 24
 _TOP_N = 8
+# 商城「猜你喜欢」是纯商品场景，展示名额与召回量都比首页混排大：
+# 兜底召回若仍用 8/12 条，去重加物种过滤后凑不满 14 个名额。
+_SHOP_TOP_N = 14
+_SHOP_PRODUCT_PER_KEYWORD = 10
+_SHOP_PRODUCT_BACKUP_LIMIT = 14
+_SHOP_BLANK_PRODUCT_LIMIT = 20
 # 首页最多几条社区动态：商品是主诉求，动态太多会让推荐流看起来像信息流。
 _HOME_SPACE_MAX = _TOP_N // 2
+
+
+def _top_n(scene: str) -> int:
+    """对外推荐条数上限：商城纯商品 14 条，首页混排 8 条。"""
+    return _SHOP_TOP_N if scene == "shop" else _TOP_N
+
 
 # 物种同义词表：用于从商品名/标题里识别物种，并判断候选是否与用户饲养的物种相关。
 _SPECIES_TOKENS: Dict[str, List[str]] = {
@@ -441,14 +454,19 @@ async def recall_candidates(state: RecommendState) -> Dict[str, Any]:
     own_groups = set(own_groups_list)
 
     # 每个关键词一个请求，另加一个「兜底请求」（不带头关键词）保证候选池不会因为
-    # 关键词过窄而空掉。
+    # 关键词过窄而空掉。商城要凑满 14 条，每词与兜底召回量都比首页大。
+    shop = scene == "shop"
+    per_keyword = _SHOP_PRODUCT_PER_KEYWORD if shop else _PRODUCT_PER_KEYWORD
     product_coros: List[Any] = []
     product_targeted: List[bool] = []
     for kw in keywords:
-        product_coros.append(biz.search_products(kw, limit=_PRODUCT_PER_KEYWORD, user_id=user_id))
+        product_coros.append(biz.search_products(kw, limit=per_keyword, user_id=user_id))
         product_targeted.append(True)
-    product_coros.append(biz.search_products("", limit=_BLANK_PRODUCT_LIMIT if not keywords
-                                             else _PRODUCT_BACKUP_LIMIT, user_id=user_id))
+    if shop:
+        backup_limit = _SHOP_BLANK_PRODUCT_LIMIT if not keywords else _SHOP_PRODUCT_BACKUP_LIMIT
+    else:
+        backup_limit = _BLANK_PRODUCT_LIMIT if not keywords else _PRODUCT_BACKUP_LIMIT
+    product_coros.append(biz.search_products("", limit=backup_limit, user_id=user_id))
     product_targeted.append(False)
 
     post_coros: List[Any] = []
@@ -561,6 +579,7 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
 
     profile = state.get("profile") or {}
     own_words = state.get("own_words") or []
+    top_n = _top_n(state.get("scene", "home"))
     profile_text = _profile_digest(profile)
     # 只给模型 id / 标题 / 分类：给全量字段既浪费上下文，也容易诱导模型复述商品详情。
     cand_text = "\n".join(
@@ -571,7 +590,7 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
     species_hint = (f"用户饲养的物种：{'、'.join(own_words)}。" if own_words else "")
     system_prompt = (
         "你是 PetVerse 宠物社区的推荐助手。请结合用户画像，从候选内容中挑选最相关的"
-        f"至多 {_TOP_N} 条，并为每条写一句不超过 30 字的推荐理由——理由必须落到用户画像里的"
+        f"至多 {top_n} 条，并为每条写一句不超过 30 字的推荐理由——理由必须落到用户画像里的"
         "具体信息（宠物名字、物种、最近买过什么），不要写成放到谁身上都适用的万能话术。"
         "硬性要求：只推与用户所养物种相关的内容，其他物种的专属内容一律不选（例如只养花枝鼠"
         "的用户，不要出现猫爬架、猫砂、逗猫棒）；候选里确实没有合适内容时就少推几条，宁缺毋滥。"
@@ -581,7 +600,8 @@ async def rerank(state: RecommendState) -> Dict[str, Any]:
     try:
         result: RecommendResult = await astructured_invoke(RecommendResult, system_prompt, user_prompt)
         items = _merge_items(result.items, candidates,
-                             set(state.get("own_groups") or []), state.get("own_words") or [])
+                             set(state.get("own_groups") or []), state.get("own_words") or [],
+                             top_n)
         if not items:
             return _heuristic_rank(state)
         return {"items": items, "summary": result.summary or ""}
@@ -705,20 +725,21 @@ def _identity(cand_type: str, raw_id: Any) -> Tuple[str, str]:
 
 
 def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[str],
-                 own_words: List[str]) -> List[Dict[str, Any]]:
+                 own_words: List[str], top_n: int) -> List[Dict[str, Any]]:
     """把模型选择与候选池合并成最终列表。
 
     两段式：先采纳模型的选择（校验 id 存在、不重复、物种合规），再用启发式顺序补足到
-    ``_TOP_N``——模型经常只给出 3~5 条，补齐能保证首页不会显得空。
+    ``top_n``——模型经常只给出 3~5 条，补齐能保证推荐流不会显得空。
 
     Args:
         model_items: 模型输出的 ``RecommendItem`` 列表。
         candidates: 候选池（已按相关度降序）。
         own_groups: 用户饲养的物种组。
         own_words: 用户填写的物种原词。
+        top_n: 对外条数上限（随场景变化，见 ``_top_n``）。
 
     Returns:
-        最多 ``_TOP_N`` 条的对外结构列表。
+        最多 ``top_n`` 条的对外结构列表。
 
     Raises:
         无。
@@ -735,7 +756,7 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
         picked.add(key)
         merged.append(_to_item(cand, mi.reason, float(mi.score)))
     for cand in candidates:
-        if len(merged) >= _TOP_N:
+        if len(merged) >= top_n:
             break
         key = _identity(cand["type"], cand["id"])
         if key in picked or _is_off_species(cand, own_groups):
@@ -744,7 +765,7 @@ def _merge_items(model_items, candidates: List[Dict[str, Any]], own_groups: Set[
         # 用启发式分数换算成 0.1~1.0 的对外 score（除以 6 是把 ±分数压到合理区间）。
         merged.append(_to_item(cand, _item_reason(cand, own_groups, own_words),
                                round(max(0.1, min(1.0, 0.5 + cand.get("_score", 0) / 6)), 2)))
-    return merged[:_TOP_N]
+    return merged[:top_n]
 
 
 def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
@@ -760,6 +781,7 @@ def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
         无。
     """
     scene = state.get("scene", "home")
+    top_n = _top_n(scene)
     own_groups = set(state.get("own_groups") or [])
     own_words = state.get("own_words") or []
     candidates = [c for c in (state.get("candidates") or []) if not _is_off_species(c, own_groups)]
@@ -767,18 +789,18 @@ def _heuristic_rank(state: RecommendState) -> Dict[str, Any]:
     spaces = [c for c in candidates if c["type"] == "space"]
 
     if scene == "shop":
-        chosen = products[:_TOP_N]
+        chosen = products[:top_n]
     else:
         # 首页先给动态留固定名额，再补商品；动态太少时用剩余商品填满。
         picked_spaces = spaces[:_HOME_SPACE_MAX]
-        chosen = products[:_TOP_N - len(picked_spaces)] + picked_spaces
-        if len(chosen) < _TOP_N:
+        chosen = products[:top_n - len(picked_spaces)] + picked_spaces
+        if len(chosen) < top_n:
             taken = {(c["type"], c["id"]) for c in chosen}
-            chosen += [c for c in spaces if (c["type"], c["id"]) not in taken][:_TOP_N - len(chosen)]
+            chosen += [c for c in spaces if (c["type"], c["id"]) not in taken][:top_n - len(chosen)]
 
     items = [_to_item(c, _item_reason(c, own_groups, own_words),
                       round(max(0.1, min(1.0, 0.5 + c.get("_score", 0) / 6)), 2))
-             for c in chosen[:_TOP_N]]
+             for c in chosen[:top_n]]
     if own_words:
         summary = f"根据你家{'、'.join(own_words)}的养育需求，从社区与商城挑了这些相关内容"
     else:

@@ -23,6 +23,7 @@
 """
 
 import logging
+import socket
 import threading
 import time
 from typing import Optional
@@ -39,6 +40,153 @@ _HTTP_TIMEOUT_SECONDS = 5
 _REREGISTER_MIN_INTERVAL_SECONDS = 30
 # 连续失败多少次才判定实例已丢失（偶发一两次网络抖动不应触发重注册）。
 _BEAT_FAIL_THRESHOLD = 3
+# 自检回连超时（秒）：只为区分「注册地址可达 / 不可达」，不必等太久。
+_SELF_CHECK_TIMEOUT_SECONDS = 1.5
+# 通配地址不能作为注册地址：消费方拿到 0.0.0.0 无法连接，按「未配置」处理。
+_WILDCARD_IPS = frozenset({"0.0.0.0", "::", "[::]"})
+
+
+def _detect_local_ip() -> str:
+    """探测本机对外网卡地址。
+
+    用 UDP ``connect`` 让内核按路由表选出出接口并填好源地址——不会真的发包，
+    因此不要求目标可达，也不产生任何流量。
+
+    探测顺序：先试 Nacos 地址（选出的正是到注册中心那条路上的网卡），再试公网地址。
+    Nacos 部署在本机时（``NACOS_SERVER_ADDR=localhost``）必须跳过，否则会探回
+    ``127.0.0.1``，等于什么都没做——这正是把注册地址写死成回环的那种退化。
+
+    Returns:
+        点分十进制 IPv4 地址；没有可用路由时回退 ``127.0.0.1``。
+    """
+    # NACOS_SERVER_ADDR 允许带 http:// 前缀与端口，这里只取主机名用于探测。
+    nacos_host = (settings.NACOS_SERVER_ADDR.split("//")[-1]
+                  .split("/")[0].split(":")[0].strip() or "")
+    targets = []
+    if nacos_host and not _is_loopback_host(nacos_host):
+        targets.append((nacos_host, 8848))
+    targets.append(("8.8.8.8", 80))
+
+    for target in targets:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(target)
+            ip = sock.getsockname()[0]
+            # 目标解析到回环时源地址也会是回环，这种结果没有意义，继续试下一个。
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            continue
+        finally:
+            sock.close()
+
+    # 兜底：主机名解析（多网卡机器上可能不是默认路由网卡，总比回环强）
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def _is_loopback_host(host: str) -> bool:
+    """判断主机名是否指向本机回环。
+
+    Args:
+        host: 主机名或 IP 字面量（可能为空）。
+
+    Returns:
+        True 表示 ``localhost`` / ``127.x`` / ``::1`` 这类回环目标。
+    """
+    lowered = (host or "").strip().lower()
+    if not lowered:
+        return True
+    if lowered in ("localhost", "::1", "[::1]"):
+        return True
+    try:
+        return socket.gethostbyname(lowered).startswith("127.")
+    except OSError:
+        return False
+
+
+def _self_reachable(ip: str, port: int) -> bool:
+    """用注册地址回连自己，确认这个地址真的能建立连接。
+
+    Args:
+        ip: 待注册的地址。
+        port: 待注册的端口。
+
+    Returns:
+        True 表示能连上；False 表示不可达（端口未监听 / 只绑了回环 / 网卡被拦）。
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=_SELF_CHECK_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_advertise_ip(configured_ip: str, port: int, bind_host: str = "") -> str:
+    """确定最终写入注册中心的 IP。
+
+    做法是「候选列表 + 回连自检取第一个可达的」，而不是单点判断——因为配置、监听地址、
+    探测结果三者都可能不一致（典型场景：配置文件写 `AI_SERVICE_HOST=127.0.0.1`，
+    实际用 `uvicorn --host 0.0.0.0` 启动）。只有真能连上的地址才值得注册出去。
+
+    候选顺序：
+        1. ``AI_SERVICE_IP`` 显式配置（若它本身是回环、而监听地址不是，会被忽略并告警）；
+        2. 自动探测（沿到 Nacos 的路由选网卡）；
+        3. ``AI_SERVICE_HOST`` 具体监听地址（只听某张网卡时，探测可能选到另一张）；
+        4. 回环地址兜底。
+
+    Args:
+        configured_ip: ``AI_SERVICE_IP`` 配置值，空串或通配地址表示跳过。
+        port: 本服务监听端口。
+        bind_host: ``AI_SERVICE_HOST``，即 uvicorn 实际绑定的地址。
+
+    Returns:
+        最终注册用的 IPv4 地址；全部不可达时退回 ``127.0.0.1`` 并告警。
+    """
+    configured = (configured_ip or "").strip()
+    bind = (bind_host or "").strip()
+    bind_is_loopback = _is_loopback_host(bind)
+
+    # 显式配了回环、但监听的是对外地址：两个意图自相矛盾。
+    # 回环地址的回连自检必然通过，放任它参与竞争就会「永远注册 127.0.0.1 且不报任何错」，
+    # 所以这里直接忽略这个配置项——多机部署最容易被这条坑到。
+    if configured and _is_loopback_host(configured) and not bind_is_loopback:
+        logger.warning(
+            "AI_SERVICE_IP=%s 是回环地址，与监听地址 %s（对外提供服务）矛盾，已忽略该配置；"
+            "多机部署请把它留空，交给程序自动挑一个内网地址", configured, bind)
+        configured = ""
+
+    candidates = []
+    if configured and configured not in _WILDCARD_IPS:
+        candidates.append((configured, "配置 AI_SERVICE_IP"))
+    candidates.append((_detect_local_ip(), "自动探测"))
+    if bind and bind not in _WILDCARD_IPS:
+        candidates.append((bind, "监听地址 AI_SERVICE_HOST"))
+    candidates.append(("127.0.0.1", "回环兜底"))
+
+    tried = set()
+    for ip, source in candidates:
+        if ip in tried:
+            continue
+        tried.add(ip)
+        if _self_reachable(ip, port):
+            logger.info("Nacos 注册地址确定为 %s:%s（来源：%s）", ip, port, source)
+            if _is_loopback_host(ip) and not bind_is_loopback:
+                logger.warning(
+                    "注册地址是回环地址，只有同机消费方能访问：请确认 AI_SERVICE_HOST=0.0.0.0、"
+                    "AI_SERVICE_IP 留空，且 AI 服务注册时本机已监听该端口")
+            return ip
+
+    logger.warning(
+        "候选注册地址均回连失败（%s），本实例退回 127.0.0.1，仅同机消费方可访问。"
+        "若要多机 / 多实例部署，请确认启动参数为 --host 0.0.0.0 且该网卡未被防火墙拦截",
+        "、".join(sorted(tried)))
+    return "127.0.0.1"
 
 
 class NacosRegistrar:
@@ -65,6 +213,9 @@ class NacosRegistrar:
     def register(self) -> None:
         """注册实例并启动心跳线程。
 
+        注册地址在**这里**才确定，而不是构造时：进程是先绑定端口、再触发 lifespan startup，
+        只有到这一步回连自检才能反映真实的监听状态（构造时端口还没起来，自检必然失败）。
+
         注册失败只记日志，不发异常：服务可用性优先于服务发现的完整性。
 
         Returns:
@@ -73,6 +224,7 @@ class NacosRegistrar:
         Raises:
             无。
         """
+        self._ip = _resolve_advertise_ip(self._ip, self._port, settings.AI_SERVICE_HOST)
         registered = self._register_via_sdk() or self._register_via_openapi()
         if not registered:
             logger.warning("Nacos 注册失败（SDK 与 OpenAPI 均未成功），ai-service 照常启动，稍后由心跳线程继续尝试保活")

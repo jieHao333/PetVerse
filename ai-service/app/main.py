@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
     # 注册与反注册是同步阻塞调用（HTTP / SDK），放线程池执行以免卡住事件循环启动。
     await asyncio.to_thread(nacos_client.register)
     logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s, deploy=%s）",
-                settings.AI_SERVICE_NAME, settings.AI_SERVICE_IP,
+                settings.AI_SERVICE_NAME, settings.AI_SERVICE_HOST,
                 settings.AI_SERVICE_PORT, settings.is_mock,
                 settings.RAG_ENABLED, settings.embedding_enabled,
                 settings.SERVICE_DEPLOY_MODE)
@@ -149,4 +149,6 @@ if __name__ == "__main__":
     import uvicorn
 
     # 直接用 uvicorn.run 而非命令行：便于 IDE 一键调试；生产仍建议用 uvicorn 命令 + 多 worker。
-    uvicorn.run(app, host=settings.AI_SERVICE_IP, port=settings.AI_SERVICE_PORT)
+    # 注意 host 用 AI_SERVICE_HOST（监听地址），不要用 AI_SERVICE_IP（注册给 Nacos 的地址）：
+    # 后者留空时是自动探测出来的，拿去绑定会因为本机没有那张网卡而启动失败。
+    uvicorn.run(app, host=settings.AI_SERVICE_HOST, port=settings.AI_SERVICE_PORT)
