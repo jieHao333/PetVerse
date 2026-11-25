@@ -1,5 +1,3 @@
-# 与前后端代码放在同一目录下
-
 name: petverse
 
 services:
@@ -16,7 +14,7 @@ services:
       - --default-time-zone=+08:00
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./PetVerse/PetVerseSingle/src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./PetVerseSingle/src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
@@ -47,7 +45,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:-petverse123}
     volumes:
       - pg-data:/var/lib/postgresql/data
-      - ./PetVerse/ai-service/db/schema_pgvector.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./ai-service/db/schema_pgvector.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 10s
@@ -121,7 +119,7 @@ services:
   app:
     image: petverse-single:latest
     build:
-      context: ./PetVerse/PetVerseSingle
+      context: ./PetVerseSingle
     environment:
       SPRING_PROFILES_ACTIVE: server
       MYSQL_URL: "jdbc:mysql://mysql:3306/petverse?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
@@ -158,9 +156,9 @@ services:
   ai-service:
     image: petverse-ai:latest
     build:
-      context: ./PetVerse/ai-service
+      context: ./ai-service
     env_file:
-      - ./PetVerse/ai-service/.env
+      - ./ai-service/.env
     environment:
       AI_SERVICE_HOST: 0.0.0.0
       AI_SERVICE_PORT: "8086"
@@ -195,7 +193,7 @@ services:
   web:
     image: petverse-web:latest
     build:
-      context: ./PetVerse-web
+      context: ../PetVerse-web
     ports:
       - "80:80"
     depends_on:
