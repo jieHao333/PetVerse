@@ -72,6 +72,9 @@ class _ThreadedMemorySaver(PostgresSaver):
                            int(_SETUP_RETRY_COOLDOWN), exc_info=True)
         return self._ready
 
+    async def ensure_ready(self) -> bool:
+        """显式触发建表（供启动阶段主动初始化使用）。"""
+        return await self._ensure_ready()
 
     async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """读取某 thread 的最新 checkpoint。
@@ -200,6 +203,8 @@ async def init() -> None:
         await asyncio.to_thread(_init_sync)
         logger.info("LangGraph checkpoint 已初始化(PostgreSQL): %s@%s:%s/%s",
                     settings.PG_USER, settings.PG_HOST, settings.PG_PORT, settings.PG_DB)
+        if _saver is not None and settings.PG_AUTO_CREATE_TABLES:
+            await _saver.ensure_ready()
     except Exception:
         logger.warning("LangGraph checkpoint 初始化失败,对话记忆将降级为无记忆", exc_info=True)
         _saver = None

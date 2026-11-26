@@ -102,6 +102,9 @@ class _ThreadedStore(PostgresStore):
                            int(_SETUP_RETRY_COOLDOWN), exc_info=True)
         return self._ready
 
+    async def ensure_ready(self) -> bool:
+        """显式触发建表（供启动阶段主动初始化使用）。"""
+        return await self._ensure_ready()
 
     async def aget(self, namespace: tuple, key: str, *, refresh_ttl=None):
         """按命名空间 + key 读取单条记忆。
@@ -206,6 +209,8 @@ async def init() -> None:
         await asyncio.to_thread(_init_sync)
         logger.info("LangGraph 长期记忆 store 已初始化(PostgreSQL): %s@%s:%s/%s",
                     settings.PG_USER, settings.PG_HOST, settings.PG_PORT, settings.PG_DB)
+        if _store is not None and settings.PG_AUTO_CREATE_TABLES:
+            await _store.ensure_ready()
     except Exception:
         logger.warning("LangGraph 长期记忆 store 初始化失败,长期记忆将降级为不可用", exc_info=True)
         _store = None

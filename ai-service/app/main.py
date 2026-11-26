@@ -8,7 +8,7 @@ import asyncio
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -37,6 +37,16 @@ setup_logging()
 logger = logging.getLogger("ai-service")
 
 
+async def _register_after_ready() -> None:
+    """等 uvicorn 真正监听端口后再注册 Nacos。
+
+    lifespan startup 阶段端口尚未开始监听，此时回连自检必然失败，会把 127.0.0.1
+    注册出去，网关跨容器访问不到。
+    """
+    await asyncio.sleep(1.5)
+    await asyncio.to_thread(nacos_client.register)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动 / 停机钩子：启动按「被依赖者在前」初始化，停机严格逆序释放。"""
@@ -61,14 +71,17 @@ async def lifespan(app: FastAPI):
     await kb_store.init()
     if settings.RAG_ENABLED and settings.embedding_enabled:
         logger.info("知识库规模: %s", await kb_store.stats())
-    # Nacos 注册是同步阻塞调用，放线程池执行以免卡住事件循环启动。
-    await asyncio.to_thread(nacos_client.register)
+    # Nacos 注册放后台任务：lifespan 阶段 uvicorn 还没监听端口，注册前自检会失败。
+    register_task = asyncio.create_task(_register_after_ready())
     logger.info("ai-service 启动完成: %s @ %s:%s（mock=%s, rag开关=%s, embedding=%s, deploy=%s）",
                 settings.AI_SERVICE_NAME, settings.AI_SERVICE_HOST,
                 settings.AI_SERVICE_PORT, settings.is_mock,
                 settings.RAG_ENABLED, settings.embedding_enabled,
                 settings.SERVICE_DEPLOY_MODE)
     yield
+    register_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await register_task
     await asyncio.to_thread(nacos_client.deregister)
     await biz.close()
     await checkpoint.close()
