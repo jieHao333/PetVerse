@@ -29,6 +29,10 @@ PetVerse（宠域）后端覆盖账号与角色、虚拟宠物养成、真实宠
 
 Spring Cloud Gateway 作为统一入口，负责 JWT 鉴权、身份透传、限流与 CORS；8 个 Java 业务服务各自使用独立数据库，通过 Nacos 完成注册发现与配置下发，RabbitMQ 承载异步链路。AI 能力由独立的 Python 服务（FastAPI + LangGraph）提供，经网关 `/api/ai/**` 对外。
 
+## 视频介绍
+
+https://github.com/user-attachments/assets/7f25f5d1-a1be-4c64-9050-2ed45abeb2d7
+
 ## 快速开始
 
 前置条件：
