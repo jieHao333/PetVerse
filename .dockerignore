@@ -1,0 +1,11 @@
+.git
+.gitignore
+.idea
+**/target
+PetVerseSingle
+ai-service
+nacos-config
+docs
+docker-compose*.yml
+*.iml
+README.md

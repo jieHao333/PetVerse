@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS pet_catalog
   DEFAULT CHARSET = utf8mb4 COMMENT ='宠物图鉴';
 
 -- 图鉴种子数据
-INSERT INTO pet_catalog (id, name, species, breed, rarity, description, image_url, create_time, update_time)
+INSERT IGNORE INTO pet_catalog (id, name, species, breed, rarity, description, image_url, create_time, update_time)
 VALUES (1, '小橘猫', '猫', '中华田园猫', 1, '最常见的橘色小猫，性格粘人', '/images/pet/cat-orange.png', NOW(), NOW()),
        (2, '小狸花', '猫', '中华狸花猫', 1, '身手矫健的小花猫', '/images/pet/cat-tabby.png', NOW(), NOW()),
        (3, '泰迪犬', '狗', '贵宾犬', 1, '活泼可爱的卷毛小狗', '/images/pet/dog-poodle.png', NOW(), NOW()),

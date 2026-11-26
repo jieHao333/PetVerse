@@ -89,6 +89,8 @@ class Settings(BaseSettings):
     PG_DB: str = "petverse_ai"
     PG_POOL_MIN: int = 1
     PG_POOL_MAX: int = 10
+    # 启动时自动创建 LangGraph 官方 checkpoint/store 表（幂等）；关闭后仍会在首次使用时惰性建表。
+    PG_AUTO_CREATE_TABLES: bool = True
 
     # ── RAG 检索参数（调参说明见 README「配置说明」） ─────────────────────
     RAG_ENABLED: bool = True

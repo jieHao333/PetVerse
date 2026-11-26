@@ -27,7 +27,7 @@ spring:
       max-request-size: 60MB
   # Elasticsearch 8.15.5，用于商品全文检索；未启动时搜索自动降级为数据库模糊查询
   elasticsearch:
-    uris: http://localhost:9200
+    uris: ${ES_URIS:http://localhost:9200}
     connection-timeout: 2s
     socket-timeout: 5s
   # RabbitMQ：订单超时延迟消息、商户审批事件、商品索引事件的生产与消费；

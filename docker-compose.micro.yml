@@ -1,0 +1,390 @@
+name: petverse-micro
+
+x-service-build: &service-build
+  context: .
+  dockerfile: Dockerfile.service
+
+x-java-env: &java-env
+  MYSQL_USERNAME: root
+  MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+  REDIS_HOST: redis
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-petverse}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-petverse123}
+  RABBITMQ_VHOST: /
+  NACOS_SERVER_ADDR: nacos:8848
+  ES_URIS: http://elasticsearch:9200
+  JWT_SECRET: ${JWT_SECRET:-petverse-jwt-secret-key-please-change-in-production-2026}
+  MQ_ENABLED: "true"
+  OSS_ENDPOINT: ${OSS_ENDPOINT:-}
+  OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
+  OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
+  OSS_BUCKET_NAME: ${OSS_BUCKET_NAME:-}
+  JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:+ExitOnOutOfMemoryError"
+  TZ: Asia/Shanghai
+
+x-service-depends: &service-depends
+  mysql-init:
+    condition: service_completed_successfully
+  nacos-init:
+    condition: service_completed_successfully
+  redis:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+  elasticsearch:
+    condition: service_healthy
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_ROOT_HOST: "%"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+      - --max-connections=300
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-123456}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    hostname: petverse-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-petverse}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-petverse123}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.5
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ingest.geoip.downloader.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  nacos:
+    image: nacos/nacos-server:v2.4.3
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "false"
+      JVM_XMS: 512m
+      JVM_XMX: 512m
+      JVM_XMN: 256m
+    volumes:
+      - nacos-data:/home/nacos/data
+      - nacos-logs:/home/nacos/logs
+    ports:
+      - "8848:8848"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8848/nacos/v1/console/health/readiness"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: petverse_ai
+      POSTGRES_USER: ${PG_USER:-petverse}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-petverse123}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./ai-service/db/schema_pgvector.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mysql-init:
+    image: mysql:8.0
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+    volumes:
+      - ./user-service/src/main/resources/db/schema.sql:/schema/user.sql:ro
+      - ./pet-service/src/main/resources/db/schema.sql:/schema/pet.sql:ro
+      - ./space-service/src/main/resources/db/schema.sql:/schema/space.sql:ro
+      - ./social-service/src/main/resources/db/schema.sql:/schema/social.sql:ro
+      - ./remark-service/src/main/resources/db/schema.sql:/schema/remark.sql:ro
+      - ./shop-service/src/main/resources/db/schema.sql:/schema/shop.sql:ro
+      - ./promotion-service/src/main/resources/db/schema.sql:/schema/promotion.sql:ro
+      - ./data-service/src/main/resources/db/schema.sql:/schema/data.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for item in \
+          "petverse_user /schema/user.sql" \
+          "petverse_pet /schema/pet.sql" \
+          "petverse_space /schema/space.sql" \
+          "petverse_social /schema/social.sql" \
+          "petverse_remark /schema/remark.sql" \
+          "petverse_shop /schema/shop.sql" \
+          "petverse_promotion /schema/promotion.sql" \
+          "petverse_data /schema/data.sql"
+        do
+          set -- $$item
+          db=$$1
+          file=$$2
+          mysql -hmysql -uroot -p"$$MYSQL_ROOT_PASSWORD" \
+            -e "CREATE DATABASE IF NOT EXISTS $$db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+          mysql -hmysql -uroot -p"$$MYSQL_ROOT_PASSWORD" "$$db" < "$$file"
+        done
+    restart: "no"
+
+  nacos-init:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      nacos:
+        condition: service_healthy
+    volumes:
+      - ./nacos-config:/config:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for f in /config/*.yml; do
+          dataId=$$(basename "$$f" .yml)
+          curl -fsS -X POST "http://nacos:8848/nacos/v1/cs/configs" \
+            --data-urlencode "dataId=$$dataId" \
+            --data-urlencode "group=DEFAULT_GROUP" \
+            --data-urlencode "tenant=" \
+            --data-urlencode "type=yaml" \
+            --data-urlencode "content@$$f" >/dev/null
+        done
+    restart: "no"
+
+  gateway-service:
+    image: petverse/gateway-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: gateway-service
+    environment:
+      <<: *java-env
+    depends_on:
+      nacos-init:
+        condition: service_completed_successfully
+      nacos:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      default:
+        aliases:
+          - app
+    restart: unless-stopped
+
+  user-service:
+    image: petverse/user-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: user-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_user?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  pet-service:
+    image: petverse/pet-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: pet-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_pet?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  space-service:
+    image: petverse/space-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: space-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_space?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  social-service:
+    image: petverse/social-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: social-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_social?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  remark-service:
+    image: petverse/remark-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: remark-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_remark?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  shop-service:
+    image: petverse/shop-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: shop-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_shop?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  promotion-service:
+    image: petverse/promotion-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: promotion-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_promotion?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  data-service:
+    image: petverse/data-service:latest
+    build:
+      <<: *service-build
+      args:
+        SERVICE: data-service
+    environment:
+      <<: *java-env
+      MYSQL_URL: "jdbc:mysql://mysql:3306/petverse_data?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+    depends_on: *service-depends
+    restart: unless-stopped
+
+  ai-service:
+    image: petverse-ai:latest
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./ai-service/.env
+    environment:
+      AI_SERVICE_HOST: 0.0.0.0
+      AI_SERVICE_PORT: "8086"
+      AI_SERVICE_IP: ""
+      NACOS_SERVER_ADDR: nacos:8848
+      NACOS_GROUP: DEFAULT_GROUP
+      NACOS_NAMESPACE: ""
+      SERVICE_DEPLOY_MODE: microservice
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-petverse-internal-token-change-me}
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: petverse_ai
+      PG_USER: ${PG_USER:-petverse}
+      PG_PASSWORD: ${PG_PASSWORD:-petverse123}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "1"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
+      TZ: Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nacos:
+        condition: service_healthy
+    volumes:
+      - ai-data:/app/data
+      - ai-skills:/app/skills
+    restart: unless-stopped
+
+  web:
+    image: petverse-web:latest
+    build:
+      context: ../PetVerse-web
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      gateway-service:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
+  es-data:
+  nacos-data:
+  nacos-logs:
+  pg-data:
+  ai-data:
+  ai-skills:

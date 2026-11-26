@@ -1,0 +1,29 @@
+FROM maven:3.9-eclipse-temurin-21 AS build
+ARG SERVICE
+WORKDIR /src
+COPY pom.xml ./
+COPY petverse-common ./petverse-common
+COPY gateway-service ./gateway-service
+COPY user-service ./user-service
+COPY pet-service ./pet-service
+COPY space-service ./space-service
+COPY social-service ./social-service
+COPY remark-service ./remark-service
+COPY shop-service ./shop-service
+COPY promotion-service ./promotion-service
+COPY data-service ./data-service
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -pl ${SERVICE} -am package -DskipTests
+
+FROM eclipse-temurin:21-jre-jammy
+ARG SERVICE
+ENV TZ=Asia/Shanghai
+
+RUN groupadd -g 10001 petverse \
+ && useradd -u 10001 -g petverse -s /usr/sbin/nologin petverse
+
+WORKDIR /app
+COPY --from=build --chown=petverse:petverse /src/${SERVICE}/target/${SERVICE}-*.jar /app/app.jar
+
+USER petverse
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
