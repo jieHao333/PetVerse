@@ -4,7 +4,7 @@
 
 **Java + Python 混合微服务的宠物社区平台后端**
 
-虚拟宠物养成 · 真实宠物档案 · 宠域空间 · 好友私聊 · 点赞评论 · 周边商城 · AI 养宠顾问
+真实宠物档案 · 宠域空间 · 好友私聊 · 点赞评论 · 周边商城 · AI 养宠顾问
 
 [![Java](https://img.shields.io/badge/Java-21-ED8B00?style=flat-square&logo=openjdk&logoColor=white)](https://openjdk.org/)
 [![Spring Boot](https://img.shields.io/badge/Spring_Boot-3.4-6DB33F?style=flat-square&logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
@@ -14,8 +14,6 @@
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1C3C3C?style=flat-square)](https://www.langchain.com/langgraph)
 [![Vue](https://img.shields.io/badge/Vue-3-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](https://github.com/374426703/PetVerse/pulls)
-
-[项目简介](#项目简介) · [快速开始](#快速开始) · [系统架构](#系统架构) · [AI 服务](#ai-服务) · [接口约定](#接口约定) · [文档索引](#文档索引)
 
 **前端仓库**：[374426703/PetVerse-web](https://github.com/374426703/PetVerse-web)
 
