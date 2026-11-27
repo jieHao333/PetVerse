@@ -58,6 +58,9 @@ EMBEDDING_MODEL=text-embedding-v3
 ```
 
 - 不填 LLM Key 时设 `MOCK_CHAT=true`，对话走内置模拟回复。
+- 也可以在启动后进入「AI 扩展 → 模型」页配置供应商与模型（支持 OpenAI 兼容与 Anthropic 两种协议），
+  选中哪个下一轮对话就用哪个，无需改 `.env` 重启；`.env` 的 `LLM_*` 只作兜底。
+- 对话附件仅支持图片，单张默认上限 10MB。
 - 不填 Embedding 时知识类提问直接报错，不做无依据作答。
 - `.env` 里的 `PG_*`、`REDIS_*`、`NACOS_SERVER_ADDR` 由 compose 覆盖为容器地址，保留示例值即可。
 

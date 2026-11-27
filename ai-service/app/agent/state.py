@@ -59,7 +59,7 @@ class AgentState(TypedDict, total=False):
             重试时沿用同一个 ``run_id``，避免把加购重复提交。
         pet: 宠物档案字典（工具与 Prompt 共用）。
         user_id: 当前登录用户 ID，工具据此做数据隔离。
-        attachments: 本轮附件列表（图片 / 音频 / 视频）。
+        attachments: 本轮图片附件列表（当前只支持图片）。
         system_prompt: ``prepare`` 组装的系统提示，``agent`` 每轮复用。
         memory_text: 召回到的长期记忆（保留下来便于排障与观测）。
         medical: 是否命中医疗 / 急症护栏。
@@ -101,7 +101,7 @@ def initial_state(query: str, pet: Dict[str, Any], user_id: int,
     ``run_id`` 不变，写操作因此能识别出「这次调用刚才已经执行过」。
 
     Args:
-        query: 本轮用户问题（纯语音时为转写拼接结果）。
+        query: 本轮用户问题原文（纯图片消息时为空串）。
         messages: 已拼接历史的输入消息（含本轮 HumanMessage）。
 
     Returns:

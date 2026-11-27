@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     NACOS_NAMESPACE: str = ""
 
     # ── 对话模型（OpenAI 兼容协议） ───────────────────────────────────────
+    # 这一组是「兜底配置」：管理员在「AI 扩展 → 模型」页配置并启用模型后，
+    # 运行时以数据库里的选择为准（见 app.model_registry）；未配置时回落到这里。
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = ""
     LLM_MODEL: str = ""
@@ -49,20 +51,14 @@ class Settings(BaseSettings):
     # 必须与 kb_chunk.embedding 的向量维度一致，store 初始化时会校验。
     EMBEDDING_DIM: int = 1024
 
-    # ── 多模态附件 ────────────────────────────────────────────────────────
+    # ── 多模态附件（当前只支持图片） ──────────────────────────────────────
     CHAT_MAX_ATTACHMENTS: int = 4
-    # 图片 / 音频 / 视频分别设限：共用一个阈值会误伤视频或放宽图片。
     MEDIA_MAX_IMAGE_MB: int = 10
-    MEDIA_MAX_AUDIO_MB: int = 20
-    MEDIA_MAX_VIDEO_MB: int = 50
-    # 视觉模型独立配置：多数服务商的对话模型与视觉模型不是同一个。
+    # 视觉模型兜底配置：当前模型自带视觉能力时不会用到；
+    # 老部署里配过的继续有效（Key / 地址留空时由 model_validator 复用 LLM_*）。
     LLM_VISION_MODEL: str = ""
     LLM_VISION_API_KEY: str = ""
     LLM_VISION_BASE_URL: str = ""
-    # ASR 走 OpenAI 兼容的 /audio/transcriptions 协议。
-    ASR_API_KEY: str = ""
-    ASR_BASE_URL: str = ""
-    ASR_MODEL: str = ""
 
     # ── 附件存储（阿里云 OSS） ────────────────────────────────────────────
     OSS_ENDPOINT: str = ""
@@ -180,7 +176,9 @@ class Settings(BaseSettings):
     MCP_CACHE_TTL: int = 60
 
     # ── 生成参数 ──────────────────────────────────────────────────────────
-    LLM_MAX_TOKENS: int = 512
+    # 单次生成的最大输出（token），不是上下文窗口；128K = 128 * 1024。
+    # 模型行上填了「最大输出」时以模型行为准，这里只是兜底默认值。
+    LLM_MAX_TOKENS: int = 131072
     LLM_TEMPERATURE: float = 0.8
 
     model_config = SettingsConfigDict(
@@ -209,8 +207,17 @@ class Settings(BaseSettings):
 
     @property
     def is_mock(self) -> bool:
-        """是否模拟模式：缺 Key 也算 mock，让无凭证环境仍能跑通全链路（启动日志会告警）。"""
-        return self.MOCK_CHAT or not self.LLM_API_KEY.strip()
+        """是否模拟模式：没有任何可用的模型凭证时也算 mock，让无 Key 环境仍能跑通全链路。
+
+        凭证来源不止 ``LLM_API_KEY``——管理员可以在「AI 扩展 → 模型」页配置模型，
+        因此这里委托 ``model_registry`` 判断（读进程内缓存，不产生数据库访问）。
+        局部导入是为了避开 config ↔ model_registry 的循环依赖。
+        """
+        if self.MOCK_CHAT:
+            return True
+        from app import model_registry
+
+        return not model_registry.is_configured()
 
     @property
     def llm_enabled(self) -> bool:
@@ -224,15 +231,12 @@ class Settings(BaseSettings):
 
     @property
     def vision_enabled(self) -> bool:
-        """多模态看图是否可用（mock 模式下恒为 false）。"""
-        return (not self.is_mock) and bool(self.LLM_VISION_MODEL.strip()
-                                           and self.LLM_VISION_API_KEY.strip()
-                                           and self.LLM_VISION_BASE_URL.strip())
+        """多模态看图是否可用（当前模型带视觉能力，或 .env 单独配了视觉模型）。"""
+        if self.is_mock:
+            return False
+        from app import model_registry
 
-    @property
-    def asr_enabled(self) -> bool:
-        """语音转写是否可用；不可用时音频只做占位说明，不影响文字对话。"""
-        return bool(self.ASR_API_KEY.strip() and self.ASR_BASE_URL.strip() and self.ASR_MODEL.strip())
+        return model_registry.vision_ready_cached()
 
     @property
     def oss_configured(self) -> bool:

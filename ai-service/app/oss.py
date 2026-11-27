@@ -1,7 +1,7 @@
 """对象存储（阿里云 OSS）适配层。
 
-把对话附件（图片 / 音频 / 视频）上传到 OSS 并回传公网地址，同时提供「按 key 读回字节」
-给服务端二次处理（语音转写、视觉理解）。
+把对话图片附件上传到 OSS 并回传公网地址（图片直接以 URL 交给视觉模型），
+同时提供「按 key 读回字节」的通用能力，供后续需要服务端二次处理的场景使用。
 """
 
 import asyncio
@@ -94,7 +94,8 @@ def _bucket() -> oss2.Bucket:
         可用的 ``oss2.Bucket`` 实例。
 
     Raises:
-        OssError: 配置不完整时抛出，提示补全 ``OSS_*`` 参数。
+        OssError: 配置不完整时抛出。错误文案面向终端用户，只说明「暂时不可用」，
+            具体缺哪几项配置写在日志里，避免把部署细节暴露给普通用户。
     """
     global _bucket_client
     if _bucket_client is None:
@@ -102,7 +103,11 @@ def _bucket() -> oss2.Bucket:
         with _lock:
             if _bucket_client is None:
                 if not configured():
-                    raise OssError("附件存储未配置，请先在 ai-service/.env 中填写 OSS_* 参数")
+                    # 排障信息只进日志：用户侧不该看到 .env / OSS_* 这类部署细节。
+                    logger.error(
+                        "附件存储未配置：请在 ai-service/.env 中填写 OSS_ENDPOINT / "
+                        "OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME")
+                    raise OssError("图片上传暂时不可用，请稍后再试，或先发送文字描述")
                 auth = oss2.Auth(settings.OSS_ACCESS_KEY_ID, settings.OSS_ACCESS_KEY_SECRET)
                 _bucket_client = oss2.Bucket(auth, settings.OSS_ENDPOINT, settings.OSS_BUCKET_NAME)
     return _bucket_client
@@ -144,8 +149,7 @@ async def upload(key: str, data: bytes, content_type: str) -> str:
 async def get_bytes(key: str) -> Optional[bytes]:
     """按 key 读回对象字节。
 
-    读取失败不抛错：调用方（语音转写 / 视觉理解）拿到 None 后会降级为文字提示，
-    比让整轮对话失败更合理。
+    读取失败不抛错：调用方拿到 None 后自行降级，比让整轮对话失败更合理。
 
     Returns:
         文件字节；失败或配置缺失时返回 None。

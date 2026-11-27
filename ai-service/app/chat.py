@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.types import Command
 
-from app import checkpoint, limits, llm, longterm, memstore, media, oss, persistence
+from app import checkpoint, limits, llm, longterm, memstore, media, model_registry, oss, persistence
 from app.agent import get_chat_agent, initial_state, preview_knowledge
 from app.agent.events import extract_interrupt, extract_refs, is_answer_chunk
 from app.agent.graph import NODE_FINALIZE
@@ -56,6 +56,9 @@ _SLOT_RELEASE_TIMEOUT = 2.0
 # 流式生成的最大尝试次数：仅首帧前失败才重试，避免已输出内容后重复。
 _STREAM_ATTEMPTS = 2
 _ERROR_MSG = "AI 服务暂时开小差了，请稍后再试"
+# 面向终端用户的固定提示：上传链路的具体原因（存储未配置、鉴权失败等）只写日志，
+# 不透给用户——这类信息属于部署细节，只有管理员需要知道。
+_UPLOAD_ERROR_MSG = "图片上传暂时不可用，请稍后再试，或先发送文字描述"
 _USER_BUSY_MSG = "您有正在生成的咨询回复，请等它结束后再发送"
 _APPROVAL_EXPIRED_MSG = "没有待审批的操作，可能已处理或已过期"
 _APPROVAL_STALE_MSG = "审批已失效，请重新发起该操作"
@@ -119,35 +122,51 @@ def _parse_user_id(x_user_id: Optional[str]) -> Optional[int]:
     return user_id if user_id > 0 else None
 
 
-async def _prepare_attachments(attachments: list, user_id: int) -> list:
-    """原地回填音频转写（``transcript``）。
+def _attachment_enriched_text(text: str, attachments: list, vision_ready: bool) -> str:
+    """把用户文字与附件说明拼成给模型看的输入；无附件时原样返回。
 
-    必须在进图前完成：纯文本模型看不见音频，先转成文字才能回答「发语音提问」。
+    能看图时不再复述「用户发送了 N 张图片」——图本身就在内容块里，重复只会占上下文；
+    看不了图时才需要这段概况 + 「你看不到」的引导。
     """
-    if settings.is_mock or not attachments:
-        return attachments
-    for att in attachments:
-        if att.get("type") != media.KIND_AUDIO:
-            continue
-        transcript = await media.transcribe_audio(att, user_id)
-        if transcript:
-            att["transcript"] = transcript
-    return attachments
-
-
-def _attachment_enriched_text(text: str, attachments: list) -> str:
-    """把用户文字与附件说明拼成给模型看的输入；无附件时原样返回。"""
     parts = [text] if text else []
-    if attachments:
-        # 先给「发了几样东西」的概况，再给「哪些内容你看不到」的补充说明。
+    if attachments and not vision_ready:
         summary = media.attachment_summary(attachments)
         if summary:
             parts.append(f"（{summary}）")
-        describe = media.describe_for_prompt(
-            attachments, settings.vision_enabled, settings.asr_enabled)
+        describe = media.describe_for_prompt(attachments, vision_ready)
         if describe:
             parts.append(describe)
     return "\n".join(parts)
+
+
+def _human_message(text: str, attachments: list, vision_ready: bool, msg_id: str) -> HumanMessage:
+    """构造本轮用户消息。
+
+    图片能真正送进模型时用「文本 + image_url 内容块」的多模态形态——只靠一句
+    「用户发了一张图片」模型是看不到图的；模型不支持看图时退化成纯文本说明，
+    明确告诉它「你看不到」，避免它按文件名编造图片内容。
+
+    Args:
+        text: 用户输入的文字（可能为空）。
+        attachments: 本轮附件（当前只会有图片）。
+        vision_ready: 本轮是否具备看图能力。
+        msg_id: 消息 ID（LangGraph 的 add_messages 依据它去重，由调用方生成）。
+
+    Returns:
+        ``HumanMessage``：纯文本或内容块列表。
+    """
+    enriched = _attachment_enriched_text(text, attachments, vision_ready)
+    images = [a for a in attachments
+              if a.get("type") == media.KIND_IMAGE and (a.get("url") or "").strip()]
+    if not (vision_ready and images):
+        return HumanMessage(content=enriched or "（附件咨询）", id=msg_id)
+
+    blocks: list = [{"type": "text", "text": enriched or "请结合图片回答。"}]
+    for att in images:
+        # OpenAI 与 Anthropic 都接受这种 image_url 形态（ChatAnthropic 内部会转成
+        # Anthropic 的 image source），因此不需要按协议分叉。
+        blocks.append({"type": "image_url", "image_url": {"url": att["url"]}})
+    return HumanMessage(content=blocks, id=msg_id)
 
 
 async def _resolve_session(user_id: int, req: ChatRequest) -> tuple[Optional[int], Optional[JSONResponse]]:
@@ -433,6 +452,10 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
     graph = None
     config: Optional[dict] = None
     human_msg: Optional[HumanMessage] = None
+    # 提前初始化：中断收尾（except 分支）会引用这两个变量，避免「异常发生在赋值之前」
+    # 时抛出 NameError 把真正的错误盖掉。
+    attachments: list = []
+    persist_msg = ""
     try:
         acquired, via_redis = await limits.try_acquire(user_id, _USER_MAX_CONCURRENT)
         if not acquired:
@@ -444,22 +467,14 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
         config = checkpoint.thread_config(user_id, session_id)
         text = (req.message or "").strip()
         attachments = [a.model_dump() for a in (req.attachments or [])]
-        enriched = _attachment_enriched_text(text, attachments)
-        # 纯附件消息也要有内容，否则空 HumanMessage 会让模型无从下手。
-        human_msg = HumanMessage(content=enriched or "（附件咨询）", id=uuid4().hex)
+        # 看图能力取决于「当前生效模型」（管理页可随时切换），先解析再决定消息形态：
+        # 能看图就走多模态内容块，不能看图则退化成文字说明。
+        vision_ready = await model_registry.vision_ready()
+        human_msg = _human_message(text, attachments, vision_ready, uuid4().hex)
         # 落库文本与模型输入分开：历史里展示「图片×2」比展示整段附件说明更清爽。
         persist_msg = text or (media.attachment_summary(attachments) or "附件咨询")
 
         yield _sse({"type": "meta", "sessionId": session_id})
-
-        if attachments:
-            # 转写要等 OSS 下载 + ASR 调用，放在 meta 帧之后：让前端先拿到 sessionId，
-            # 体感上「已经开始响应」而不是干等。
-            attachments = await _prepare_attachments(attachments, user_id)
-            enriched = _attachment_enriched_text(text, attachments)
-            if enriched:
-                # 沿用原消息 id，保证同一条消息在状态里不被视作两条。
-                human_msg = HumanMessage(content=enriched, id=human_msg.id)
 
         input_messages: List[AnyMessage] = [human_msg]
         if checkpoint.available():
@@ -479,10 +494,8 @@ async def _stream_generator(req: ChatRequest, user_id: int, session_id: int, pet
                     user_id, session_id, limit=settings.HISTORY_MAX_MESSAGES)
                 input_messages = _history_messages(history) + input_messages
 
-        # 检索查询优先用文字；纯语音提问则用转写结果拼成查询。
+        # 检索查询直接用文字；纯图片消息没有可检索的语义，交给模型决定是否追问。
         query = text
-        if not query:
-            query = "；".join(a.get("transcript") or "" for a in attachments).strip("；")
         state = initial_state(
             query=query,
             pet=pet.model_dump(),
@@ -611,6 +624,10 @@ async def chat_stream(
     if len(req.attachments) > settings.CHAT_MAX_ATTACHMENTS:
         return JSONResponse(status_code=200, content=fail(
             400, f"单条消息最多携带 {settings.CHAT_MAX_ATTACHMENTS} 个附件"))
+    # 对话只支持图片：历史数据里可能残留音频 / 视频附件，这里显式拒绝而不是静默忽略，
+    # 让调用方知道该能力已下线。
+    if any(a.type != media.KIND_IMAGE for a in req.attachments):
+        return JSONResponse(status_code=200, content=fail(400, "当前仅支持发送图片附件"))
 
     # 提前判断「忙」：省掉一次会话创建与流对象构造，也避免用户看到 meta 帧后才被拒绝。
     if await limits.is_busy(user_id, _USER_MAX_CONCURRENT):
@@ -679,10 +696,10 @@ async def approve_chat(
 
 @router.post("/chat/upload")
 async def upload_chat_attachment(
-    file: UploadFile = File(..., description="附件文件（图片/音频/视频）"),
+    file: UploadFile = File(..., description="图片文件"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
-    """上传对话附件，返回可随消息回传的附件描述。"""
+    """上传对话图片附件，返回可随消息回传的附件描述。"""
     user_id = _parse_user_id(x_user_id)
     if user_id is None:
         return JSONResponse(status_code=200, content=fail(401, "未登录"))
@@ -691,12 +708,12 @@ async def upload_chat_attachment(
     except media.UploadError as exc:
         # 用户输入问题（类型 / 大小），原因可原样展示。
         return JSONResponse(status_code=200, content=fail(400, str(exc)))
-    except oss.OssError as exc:
+    except oss.OssError:
         logger.warning("附件上传失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
-        return JSONResponse(status_code=200, content=fail(500, str(exc)))
+        return JSONResponse(status_code=200, content=fail(500, _UPLOAD_ERROR_MSG))
     except Exception:
         logger.warning("保存附件失败: user_id=%s filename=%s", user_id, file.filename, exc_info=True)
-        return JSONResponse(status_code=200, content=fail(500, "附件上传失败，请稍后再试"))
+        return JSONResponse(status_code=200, content=fail(500, _UPLOAD_ERROR_MSG))
     return JSONResponse(status_code=200, content=ok(attachment))
 
 

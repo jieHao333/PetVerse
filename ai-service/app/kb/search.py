@@ -67,8 +67,9 @@ async def retrieve(query: str, k: Optional[int] = None,
         # 前者是部署问题，必须报错提示跑导入脚本；后者正常返回空即可。
         stats = await store.stats()
         if stats["chunks"] == 0:
-            raise RagUnavailable(
-                "知识库为空：请先执行 scripts/ingest_knowledge.py 导入知识文档")
+            # 具体怎么补数据（跑导入脚本）只写日志：异常文本可能被模型复述给终端用户。
+            logger.error("知识库为空：请先执行 scripts/ingest_knowledge.py 导入知识文档")
+            raise RagUnavailable("知识库暂时还没有可用的内容")
         return []
 
     fused = _fuse(dense, lexical)
@@ -143,7 +144,7 @@ async def _dense_channel(query: str, recall_k: int) -> List[dict]:
         rows = await store.dense_search(vector, recall_k)
     except Exception as exc:
         logger.warning("向量检索通道失败", exc_info=True)
-        raise RagUnavailable("知识库检索失败：向量召回异常") from exc
+        raise RagUnavailable("知识检索暂时不可用") from exc
     return [{"chunk_id": r["chunk_id"], "sim": r["sim"], "matched": 0,
              "matched_by": "vector"} for r in rows]
 
@@ -183,18 +184,20 @@ async def _embed_query(query: str) -> List[float]:
         RagUnavailable: 未配置 Embedding、客户端初始化失败或调用失败。
     """
     if not settings.embedding_enabled:
-        raise RagUnavailable(
-            "知识库检索不可用：请在 ai-service/.env 配置 EMBEDDING_API_KEY / EMBEDDING_MODEL")
+        # 配哪个变量属于部署细节，只进日志；异常文本对用户与模型都保持中性。
+        logger.error("知识检索不可用：未配置 EMBEDDING_API_KEY / EMBEDDING_MODEL")
+        raise RagUnavailable("知识检索暂时不可用")
     try:
         embeddings = get_embeddings()
     except Exception as exc:
-        raise RagUnavailable("知识库检索不可用：Embedding 客户端初始化失败") from exc
+        logger.warning("Embedding 客户端初始化失败", exc_info=True)
+        raise RagUnavailable("知识检索暂时不可用") from exc
     try:
         # embed_query 是同步阻塞调用，放线程池以免阻塞事件循环。
         return await asyncio.to_thread(embeddings.embed_query, query)
     except Exception as exc:
         logger.warning("查询向量化失败", exc_info=True)
-        raise RagUnavailable("知识库检索失败：问题向量化异常") from exc
+        raise RagUnavailable("知识检索暂时不可用") from exc
 
 
 def _fuse(dense: List[dict], lexical: List[dict]) -> List[dict]:

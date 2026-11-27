@@ -1,6 +1,11 @@
-"""MCP 服务配置的 PostgreSQL 存储。
+"""AI 扩展配置的 PostgreSQL 存储（MCP 服务 + 模型供应商）。
 
-存放管理员在「AI 扩展管理」页维护的 MCP 服务连接参数（``ai_mcp_server``）。
+存放管理员在「AI 扩展管理」页维护的两类配置：
+
+- ``ai_mcp_server``：MCP 服务连接参数；
+- ``ai_model_provider`` / ``ai_model_setting``：模型供应商（协议 / 地址 / Key / 模型清单）
+  与「当前生效模型」指针。
+
 与 ``app.persistence``（会话消息）同款可靠性语义：配置是管理端显式写入的数据，
 读写失败向上抛由路由层转业务错误，不静默降级。Skill 技能不在此处——它是磁盘上的
 标准技能包（``app.skill_store``，``skills/<name>/SKILL.md``）。
@@ -41,6 +46,31 @@ _SCHEMA_STATEMENTS = (
          create_time TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
          update_time TIMESTAMPTZ  NOT NULL DEFAULT NOW()
        )""",
+    # 模型供应商：同一供应商下可挂多个模型（共享协议 / 地址 / Key），与 ZCode、Zed 的
+    # 「Provider + Model」两级结构一致；协议只有 openai（/chat/completions）与
+    # anthropic（/v1/messages）两种，前者 base_url 通常带 /v1，后者不带。
+    """CREATE TABLE IF NOT EXISTS ai_model_provider (
+         id          BIGSERIAL    PRIMARY KEY,
+         name        VARCHAR(64)  NOT NULL UNIQUE,
+         protocol    VARCHAR(16)  NOT NULL DEFAULT 'openai',
+         base_url    TEXT         NOT NULL DEFAULT '',
+         api_key     TEXT         NOT NULL DEFAULT '',
+         models      JSONB        NOT NULL DEFAULT '[]'::jsonb,
+         description VARCHAR(255) NOT NULL DEFAULT '',
+         enabled     BOOLEAN      NOT NULL DEFAULT TRUE,
+         create_time TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+         update_time TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+       )""",
+    # 当前生效模型：全表恒只有 id=1 一行（单例），切模型就是改这一行，
+    # 避免在 provider 表上维护「唯一启用」这种容易写坏的约束。
+    """CREATE TABLE IF NOT EXISTS ai_model_setting (
+         id          SMALLINT     PRIMARY KEY,
+         provider_id BIGINT       NOT NULL DEFAULT 0,
+         model_id    VARCHAR(128) NOT NULL DEFAULT '',
+         update_time TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+       )""",
+    """INSERT INTO ai_model_setting (id, provider_id, model_id) VALUES (1, 0, '')
+         ON CONFLICT (id) DO NOTHING""",
 )
 
 
@@ -102,7 +132,7 @@ async def _ensure_tables() -> bool:
     try:
         await asyncio.to_thread(_create)
         _tables_ready = True
-        logger.info("MCP 服务配置表已就绪: ai_mcp_server")
+        logger.info("AI 扩展配置表已就绪: ai_mcp_server / ai_model_provider / ai_model_setting")
     except Exception:
         logger.warning("AI 扩展配置表初始化失败（%ss 后自动重试）",
                        int(_TABLES_RETRY_COOLDOWN), exc_info=True)
@@ -286,3 +316,153 @@ async def delete_mcp_server(server_id: int) -> bool:
     rows = await _run("DELETE FROM ai_mcp_server WHERE id=%s RETURNING id",
                       (server_id,), fetch=True)
     return bool(rows)
+
+
+# ---------------- 模型供应商 ----------------
+#
+# 注意：``api_key`` 属于凭证，存储层原样返回供运行时构造客户端，
+# 管理接口必须先脱敏（``ext_api._provider_view``）再下发，禁止直接透给前端。
+
+
+def _provider_to_dict(r) -> dict:
+    """模型供应商行 → 对外字典（字段与前端 camelCase 口径保持一致）。"""
+    return {
+        "id": r[0], "name": r[1], "protocol": r[2], "baseUrl": r[3], "apiKey": r[4],
+        "models": _json_value(r[5], []), "description": r[6], "enabled": bool(r[7]),
+        "createTime": int(r[8] or 0), "updateTime": int(r[9] or 0),
+    }
+
+
+_PROVIDER_COLUMNS = ("id, name, protocol, base_url, api_key, models, description, enabled, "
+                     "EXTRACT(EPOCH FROM create_time)::bigint, EXTRACT(EPOCH FROM update_time)::bigint")
+
+
+async def list_model_providers() -> List[dict]:
+    """全部模型供应商（含停用项，按创建先后排序）。
+
+    Returns:
+        供应商配置列表（含明文 apiKey，仅供服务端使用）。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛，由路由层转业务错误。
+    """
+    rows = await _run(f"SELECT {_PROVIDER_COLUMNS} FROM ai_model_provider ORDER BY id", fetch=True)
+    return [_provider_to_dict(r) for r in rows or []]
+
+
+async def get_model_provider(provider_id: int) -> Optional[dict]:
+    """按 ID 取单个模型供应商。
+
+    Returns:
+        供应商配置；不存在时返回 None。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    rows = await _run(f"SELECT {_PROVIDER_COLUMNS} FROM ai_model_provider WHERE id=%s",
+                      (provider_id,), fetch=True)
+    return _provider_to_dict(rows[0]) if rows else None
+
+
+async def create_model_provider(data: dict) -> dict:
+    """新增模型供应商。
+
+    Args:
+        data: 已通过接口层校验的配置（name / protocol / baseUrl / apiKey / models /
+            description / enabled）。
+
+    Returns:
+        创建后的完整配置。
+
+    Raises:
+        psycopg.errors.UniqueViolation: 名称重复，由路由层转 409。
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    sql = ("INSERT INTO ai_model_provider (name, protocol, base_url, api_key, models, "
+           "description, enabled) VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id")
+    rows = await _run(sql, (
+        data["name"], data["protocol"], data.get("baseUrl", ""), data.get("apiKey", ""),
+        json.dumps(data.get("models") or [], ensure_ascii=False),
+        data.get("description", ""), bool(data.get("enabled", True)),
+    ), fetch=True)
+    return await get_model_provider(rows[0][0])
+
+
+async def update_model_provider(provider_id: int, data: dict) -> Optional[dict]:
+    """整体更新模型供应商（含启用状态与模型清单）。
+
+    Args:
+        data: 与 ``create_model_provider`` 同构的完整配置（``apiKey`` 由调用方决定
+            是沿用旧值还是替换）。
+
+    Returns:
+        更新后的配置；ID 不存在时返回 None。
+
+    Raises:
+        psycopg.errors.UniqueViolation: 名称与其他供应商重复。
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    sql = ("UPDATE ai_model_provider SET name=%s, protocol=%s, base_url=%s, api_key=%s, "
+           "models=%s::jsonb, description=%s, enabled=%s, update_time=NOW() WHERE id=%s")
+    await _run(sql, (
+        data["name"], data["protocol"], data.get("baseUrl", ""), data.get("apiKey", ""),
+        json.dumps(data.get("models") or [], ensure_ascii=False),
+        data.get("description", ""), bool(data.get("enabled", True)), provider_id,
+    ))
+    return await get_model_provider(provider_id)
+
+
+async def delete_model_provider(provider_id: int) -> bool:
+    """删除模型供应商，并在它正是当前生效来源时清空生效指针。
+
+    Returns:
+        True 表示删掉了；False 表示 ID 不存在。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    rows = await _run("DELETE FROM ai_model_provider WHERE id=%s RETURNING id",
+                      (provider_id,), fetch=True)
+    if not rows:
+        return False
+    # 先删后清：即便清指针失败，运行时解析时也会因供应商不存在而回落到 .env。
+    await _run("UPDATE ai_model_setting SET provider_id=0, model_id='', update_time=NOW() "
+               "WHERE provider_id=%s", (provider_id,))
+    return True
+
+
+async def get_active_model() -> tuple:
+    """读取「当前生效模型」指针。
+
+    Returns:
+        ``(provider_id, model_id)``；从未配置时返回 ``(0, "")``。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛，由调用方降级到 .env。
+    """
+    rows = await _run("SELECT provider_id, model_id FROM ai_model_setting WHERE id=1", fetch=True)
+    if not rows:
+        return 0, ""
+    return int(rows[0][0] or 0), (rows[0][1] or "")
+
+
+async def set_active_model(provider_id: int, model_id: str) -> None:
+    """写入当前生效模型（单行 upsert）。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    await _run("INSERT INTO ai_model_setting (id, provider_id, model_id, update_time) "
+               "VALUES (1, %s, %s, NOW()) "
+               "ON CONFLICT (id) DO UPDATE SET provider_id=EXCLUDED.provider_id, "
+               "model_id=EXCLUDED.model_id, update_time=NOW()", (provider_id, model_id))
+
+
+async def clear_active_model() -> None:
+    """清空当前生效模型（回落到 .env 配置）。
+
+    Raises:
+        RuntimeError / Exception: 存储不可用时向上抛。
+    """
+    await _run("UPDATE ai_model_setting SET provider_id=0, model_id='', update_time=NOW() "
+               "WHERE id=1")

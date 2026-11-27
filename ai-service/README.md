@@ -11,6 +11,7 @@
 | 商品评论摘要 | 汇总真实评论生成情感 / 优缺点 / 关键词 | `app/graph/review_graph.py` |
 | 个性化推荐 | 结合宠物画像、订单、购物车、评价、动态重排 | `app/graph/recommend_graph.py` |
 | MCP / Skill 扩展 | 管理员配置远程 MCP 工具与技能包，热装配进对话 Agent | `app/ext_api.py`、`app/agent/extensions.py` |
+| 模型配置与热切换 | 管理员维护「供应商 + 模型」，支持 OpenAI 兼容与 Anthropic 两种协议，切换后下一轮对话生效 | `app/model_registry.py`、`app/ext_api.py` |
 
 ## 目录结构
 
@@ -26,6 +27,7 @@ ai-service/
 │   ├── graph/             # 健康 / 评论 / 推荐编排图
 │   ├── kb/                # 切分、解析、向量 + BM25 混合检索
 │   ├── knowledge/         # 内置语料（21 md + 1 pdf + 1 docx）
+│   ├── model_registry.py  # 当前生效模型解析（供应商 + 模型，支持 OpenAI / Anthropic 协议）
 │   └── skill_store.py     # Skill 技能包读写
 ├── db/schema_pgvector.sql
 ├── scripts/               # 知识库导入、RAG 评测、MySQL → PG 迁移
@@ -75,20 +77,35 @@ python -m unittest discover -s tests -v
 
 ## 配置
 
-复制 `.env.example` 为 `.env`。LLM 与 Embedding 均为 OpenAI 兼容格式，改 `base_url + model` 即可切换服务商。
+复制 `.env.example` 为 `.env`。Embedding 为 OpenAI 兼容格式；对话模型优先读管理端配置，`.env` 只作兜底。
 
 ### 模型
 
+对话模型不再靠改代码或重启切换：管理员在「AI 扩展 → 模型」页维护**供应商（协议 + Base URL + Key）
+\+ 模型清单**，选中哪个下一轮对话就用哪个（见 `app/model_registry.py`）。
+
+- **两种协议**：`openai` 走 `/chat/completions`（地址一般带 `/v1`，覆盖 DeepSeek、百炼兼容模式、
+  vLLM、Ollama 等）；`anthropic` 走 `/v1/messages`（地址不带 `/v1`，覆盖 Claude 官方与各类
+  Anthropic 兼容网关）。填错 `/v1` 时后端会自动纠正，不需要人工试错。
+- **一个供应商挂多个模型**：同一把 Key 下的快模型 / 旗舰模型共用供应商配置，切换只改一个指针。
+- **热切换**：切换后进程内缓存立即过期，无需重启；正在进行的流式回答继续用旧模型跑完。
+  多 worker 部署时其他进程靠 60s TTL 最终一致（默认单 worker 启动，不涉及）。
+- **解析顺序**：数据库里启用且选中的模型 → `.env` 的 `LLM_*`。后者保证「没配过」与
+  「PostgreSQL 不可用」时对话仍然可用，管理页会明确提示当前是否回落。
+- **凭证**：API Key 明文存于 PostgreSQL（与 `.env` 同级信任域，请在数据库侧做好访问控制与备份加密）；
+  管理接口只回显尾号（`sk-…a8a9`），编辑时留空表示沿用原 Key。
+
 | 变量 | 说明 |
 |---|---|
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 对话模型。DeepSeek：`https://api.deepseek.com/v1` + `deepseek-chat`；百炼：`https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus` |
-| `MOCK_CHAT` | `true` 时走内置模拟回复，无需真实 Key |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | **兜底**对话模型。DeepSeek：`https://api.deepseek.com/v1` + `deepseek-chat`；百炼：`https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus` |
+| `MOCK_CHAT` | `true` 时强制走内置模拟回复，忽略管理端与 `.env` 的所有模型配置 |
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 向量化，知识检索必需。`EMBEDDING_DIM` 必须与 `kb_chunk.embedding` 维度一致，默认 1024 |
-| `LLM_VISION_MODEL` / `LLM_VISION_API_KEY` / `LLM_VISION_BASE_URL` | 图片理解；Key 与地址留空时复用 `LLM_*`。未配置则图片降级为文字占位 |
-| `ASR_API_KEY` / `ASR_BASE_URL` / `ASR_MODEL` | 语音转写，三项须全配；未配置则音频降级为文字占位 |
-| `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数，默认 512 / 0.8 |
+| `LLM_VISION_MODEL` / `LLM_VISION_API_KEY` / `LLM_VISION_BASE_URL` | 视觉**兜底**：仅在对话模型回落到 `.env` 时生效；管理端选中模型时以模型行上的「支持图片」勾选为准，没勾就让图片降级为文字占位 |
+| `LLM_MAX_TOKENS` / `LLM_TEMPERATURE` | 生成参数，默认 `131072`（128K）/ `0.8`；它限的是**单次生成**的输出长度，不是上下文窗口。模型行上的「最大输出」优先于它（管理页可填 `128K` / `1M` 或直接填 token 数） |
 
-Embedding 不会复用 LLM 的 Key（DeepSeek 无 embedding 接口）。未配置时知识类提问返回 `RagUnavailable`，不做关键词降级。
+对话附件只支持图片（jpg / png / webp / gif / bmp，单张 ≤ `MEDIA_MAX_IMAGE_MB`）；音频与视频已下线，
+上传接口会直接拒绝。Embedding 不会复用 LLM 的 Key（DeepSeek 无 embedding 接口），未配置时知识类提问
+返回 `RagUnavailable`，不做关键词降级。
 
 ### 存储
 
@@ -161,7 +178,14 @@ psql -U postgres -c "CREATE DATABASE petverse_ai;"
 psql -U postgres -d petverse_ai -f db/schema_pgvector.sql
 ```
 
-脚本启用 `vector` 扩展并创建 `chat_session`、`chat_message`、`pet_health_report`、`ai_cache`、`kb_document`、`kb_chunk`、`kb_meta`、`ai_mcp_server`。checkpoint 表由服务启动时幂等补建。Skill 不落库，是磁盘上的 `skills/<name>/SKILL.md`。
+脚本启用 `vector` 扩展并创建 16 张表：
+
+- 业务表：`chat_session`、`chat_message`、`pet_health_report`、`ai_cache`；
+- 知识库：`kb_document`、`kb_chunk`、`kb_meta`；
+- 扩展配置：`ai_mcp_server`、`ai_model_provider`、`ai_model_setting`；
+- LangGraph 记忆：`checkpoints` / `checkpoint_blobs` / `checkpoint_writes` / `checkpoint_migrations`、`store` / `store_migrations`。
+
+脚本幂等，可反复执行；所有业务表服务启动时也会自动补建，手工执行只用于首次初始化或结构审阅。LangGraph 的迁移版本表**不要**手工写入版本号——留空，库升级后 `setup()` 会自己补跑缺失迁移。Skill 不落库，是磁盘上的 `skills/<name>/SKILL.md`。
 
 ### 导入
 
@@ -197,7 +221,7 @@ python -m scripts.eval_rag              # 三模式消融对比
 |---|---|---|
 | POST | `/api/ai/chat/stream` | SSE 流式对话；体 `{"message","pet":{...},"sessionId"}` |
 | POST | `/api/ai/chat/approve` | 审批敏感操作并继续；体 `{"sessionId","approvalId","approved","reason"}` |
-| POST | `/api/ai/chat/upload` | 上传对话附件（图片 / 音频 / 视频），返回随消息回传的附件描述 |
+| POST | `/api/ai/chat/upload` | 上传对话图片附件（仅图片），返回随消息回传的附件描述 |
 | GET | `/api/ai/chat/history?sessionId=` | 会话历史，时间正序，助手消息带 `refs` |
 | GET | `/api/ai/chat/sessions` | 用户全部会话，最近活跃在前 |
 | DELETE | `/api/ai/chat/sessions/{id}` | 删除会话（连带消息与 checkpoint） |
@@ -214,6 +238,11 @@ python -m scripts.eval_rag              # 三模式消融对比
 | POST | `/api/ai/admin/mcp/servers/{id}/test` | 连通性测试并列出工具（管理员） |
 | GET/POST | `/api/ai/admin/skills` | 技能列表 / 新增（管理员） |
 | PUT/DELETE | `/api/ai/admin/skills/{name}` | 更新 / 删除技能（管理员） |
+| GET | `/api/ai/admin/models` | 模型供应商列表 + 当前生效模型 + 运行时实际配置（管理员） |
+| POST | `/api/ai/admin/models` | 新增模型供应商（协议 / Base URL / Key / 模型清单，管理员） |
+| PUT/DELETE | `/api/ai/admin/models/{id}` | 更新 / 删除模型供应商（管理员） |
+| POST | `/api/ai/admin/models/activate` | 切换当前生效模型，体 `{"providerId","model"}`（管理员） |
+| POST | `/api/ai/admin/models/test` | 对指定模型发一次最小请求验证连通性（管理员） |
 | POST | `/api/ai/health/assess` | 健康评估 |
 | GET | `/api/ai/health/history?petId=` | 历史评估 |
 | POST | `/api/ai/shop/review/summary` | 商品评论摘要，体 `{"productId"}` |
@@ -230,6 +259,9 @@ SSE 事件顺序：`meta → refs（有命中时）→ delta × n → done`；�
 - **人工审批**：`publish_post` 在工具内调用 `interrupt()`，图在写库前挂起，前端确认后经 `Command(resume=...)` 从 checkpoint 继续；无 checkpointer 时直接拒绝执行。
 - **记忆**：短期用 `PostgresSaver`，`thread_id = 用户:会话`；停止生成时用 `aupdate_state` 把问题与已产出内容（标记 `interrupted`）写回图状态。长期记忆用 runtime store，按用户 / 宠物命名空间隔离，每轮后台抽取偏好与病史。
 - **混合检索**：pgvector 余弦召回 + jieba BM25，融合后按物种降权 / 过滤，双门槛保留；多轮追问先改写为自包含问句。
+- **模型热切换**：`app/model_registry.py` 按「数据库生效模型 → `.env` 兜底」解析配置，并按配置签名缓存客户端；管理页切换后让缓存过期，下一轮对话自动重建（无需重启）。协议不同时结构化输出的降级顺序也随之切换——Anthropic 只支持 `function_calling` / `json_schema`，没有 `json_mode`。
+- **图片输入**：当前生效模型勾选「支持图片」时，用户图片以 `image_url` 内容块直接送给模型（OpenAI 与 Anthropic 都接受该形态）；不支持时提示词里显式声明「你看不到图」，引导用户用文字描述，避免模型按文件名编造内容。
+- **对外口径（重要）**：模型配置是管理端能力，用户侧任何文案都不得出现「模拟 / 未配置 / API Key / `.env` / 管理员 / 供应商」等信息。mock 兜底只给通用养护建议；上传失败、工具异常一律用固定话术（工具异常原本会被 `ToolNode` 把异常原文回填给模型，现在统一经 `agent.graph._tool_error_message` 脱敏，知识检索不可用则整轮失败）；`tests/test_user_facing_text.py` 用关键词清单守住这条线。
 - **引用可追溯**：命中片段以 `refs` 帧在答案首字前下发，并随助手消息落库（`chat_message.refs`）。
 - **韧性**：全局 20 路 / 单用户 2 路并发闸，单条消息 2000 字上限，LLM 首帧静默重试；评论摘要走 Redis + PostgreSQL 两级缓存（推荐结果只走 Redis）；checkpoint 与业务表故障时降级，不阻断对话。
 

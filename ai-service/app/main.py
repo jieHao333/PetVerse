@@ -19,7 +19,7 @@ _PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PACKAGE_ROOT not in sys.path:
     sys.path.insert(0, _PACKAGE_ROOT)
 
-from app import checkpoint, ext_store, memory, memstore, nacos_client, persistence, pg_store
+from app import checkpoint, ext_store, memory, memstore, model_registry, nacos_client, persistence, pg_store
 from app.chat import router as chat_router
 from app.clients import biz
 from app.config import settings
@@ -50,12 +50,6 @@ async def _register_after_ready() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动 / 停机钩子：启动按「被依赖者在前」初始化，停机严格逆序释放。"""
-    if settings.is_mock:
-        logger.warning(
-            "当前运行在 MOCK 模式（MOCK_CHAT=%s，LLM_API_KEY %s），对话返回内置模拟回复；"
-            "如需接入真实模型，请在 .env 中填写 LLM_API_KEY（并将 MOCK_CHAT 置为 false）",
-            settings.MOCK_CHAT, "为空" if not settings.LLM_API_KEY.strip() else "已配置但被开关覆盖",
-        )
     if settings.RAG_ENABLED and not settings.embedding_enabled:
         logger.warning(
             "RAG_ENABLED=true 但未配置 Embedding（EMBEDDING_API_KEY / EMBEDDING_MODEL），"
@@ -69,6 +63,16 @@ async def lifespan(app: FastAPI):
     await pg_store.init()
     await ext_store.init()
     await kb_store.init()
+    # 模型解析依赖 ext_store 的连接池，必须放在它之后；预热后启动日志就能看出
+    # 「实际在用哪个模型 / 是不是回落到了 .env」。
+    await model_registry.prime()
+    if settings.is_mock:
+        logger.warning(
+            "当前运行在 MOCK 模式（MOCK_CHAT=%s，且没有可用的模型配置），对话返回内置模拟回复；"
+            "如需接入真实模型，请在「AI 扩展 → 模型」页配置供应商与模型，"
+            "或在 .env 中填写 LLM_API_KEY（并将 MOCK_CHAT 置为 false）",
+            settings.MOCK_CHAT,
+        )
     if settings.RAG_ENABLED and settings.embedding_enabled:
         logger.info("知识库规模: %s", await kb_store.stats())
     # Nacos 注册放后台任务：lifespan 阶段 uvicorn 还没监听端口，注册前自检会失败。

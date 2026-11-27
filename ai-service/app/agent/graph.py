@@ -26,7 +26,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from app import checkpoint, memstore
+from app import checkpoint, memstore, model_registry
 from app.agent.extensions import get_skills_prompt
 from app.agent.policy import classify_hints, repair_dangling_tool_calls, trim_history
 from app.agent.prompt import build_agent_prompt
@@ -169,7 +169,8 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     medical, needs_evidence = classify_hints(query)
 
     attachments = state.get("attachments") or []
-    vision = settings.vision_enabled and _has_image(attachments)
+    # 看图能力取决于「当前生效模型」是否带视觉能力（可在管理页切换），因此必须异步判定。
+    vision = _has_image(attachments) and await model_registry.vision_ready()
 
     knowledge: List[dict] = []
     knowledge_text = ""
@@ -213,19 +214,20 @@ async def prepare(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     }
 
 
-def _model_for(state: AgentState):
+async def _model_for(state: AgentState):
     """按本轮是否多模态选择模型客户端。
 
     Args:
         state: 图状态（读 ``vision``）。
 
     Returns:
-        对话模型或视觉模型客户端。
+        对话模型或视觉模型客户端（由 ``app.model_registry`` 按当前生效模型构造）。
 
     Raises:
-        ImportError: 未安装 ``langchain-openai`` 时抛出。
+        ImportError: 对应协议的 SDK 未安装时抛出。
+        RuntimeError: 判定为视觉轮次但没有任何可用的视觉模型时抛出。
     """
-    return get_vision_client() if state.get("vision") else get_client()
+    return await get_vision_client() if state.get("vision") else await get_client()
 
 
 async def call_model(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
@@ -253,7 +255,7 @@ async def call_model(state: AgentState, config: RunnableConfig) -> Dict[str, Any
     messages: List[AnyMessage] = [SystemMessage(content=state.get("system_prompt") or "")]
     messages.extend(history)
 
-    model = _model_for(state)
+    model = await _model_for(state)
     if not state.get("vision"):
         tools = await build_tools_async(ToolContext(user_id=state.get("user_id", 0)))
         if tools:
@@ -268,11 +270,41 @@ async def call_model(state: AgentState, config: RunnableConfig) -> Dict[str, Any
     return {"messages": [resp]}
 
 
+def _tool_error_message(exc: Exception) -> str:
+    """工具异常 → 回填给模型的错误说明（工具层面的兜底，不结束整轮）。
+
+    ``ToolNode`` 默认会把异常原文塞进 ``ToolMessage`` 交给模型。原文里可能有内部地址、
+    凭证明细、运维命令，模型完全可能照着复述给用户——所以这里统一改写：
+
+    Args:
+        exc: 工具执行时抛出的异常。
+
+    Returns:
+        给模型看的简短说明。
+
+    Raises:
+        ``kb.search.RagUnavailable``: 知识检索不可用时不降级——知识问答宁可整轮明确失败
+            （路由层下发通用错误帧），也不要让模型拿着「检索不可用」继续编答案。
+    """
+    if isinstance(exc, kb_search.RagUnavailable):
+        raise exc
+    # 参数校验错误的报文来自工具 schema，不包含内部信息，保留给模型自我纠正。
+    from langgraph.prebuilt.tool_node import ToolInvocationError
+
+    if isinstance(exc, ToolInvocationError):
+        return f"工具参数不合法：{exc}"
+    # 原始报文与堆栈留在服务端日志里（管理员排障用），不进模型上下文。
+    logger.warning("工具执行失败: %s: %s", type(exc).__name__, exc, exc_info=exc)
+    return "工具执行失败，请基于已有信息作答；无法完成时如实说明，不要编造结果。"
+
+
 async def run_tools(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """工具执行节点。
 
     用 LangGraph 官方的 ``ToolNode`` 而不是自己写循环：它已经处理好并行调用、
     参数校验失败的错误消息回填、以及 ``InjectedState`` 的状态注入。
+    异常回填文案由 ``_tool_error_message`` 统一改写——默认行为会把异常原文交给模型，
+    内部细节可能被复述给终端用户。
 
     工具若声明了 ``response_format="content_and_artifact"``（知识检索就是这样），
     模型只看 content，结构化命中放在 ``ToolMessage.artifact`` 里，本节点把它收集到
@@ -291,7 +323,7 @@ async def run_tools(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         logger.warning("收到工具调用但无可用工具，跳过执行")
         return {"step": step}
 
-    node = ToolNode(tools)
+    node = ToolNode(tools, handle_tool_errors=_tool_error_message)
     result = await node.ainvoke(dict(state), config)
     produced: List[AnyMessage] = list(result.get("messages") or [])
 
@@ -352,7 +384,7 @@ async def conclude(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     messages: List[AnyMessage] = [SystemMessage(content=prompt)]
     messages.extend(history)
 
-    resp = await get_client().ainvoke(messages)
+    resp = await (await get_client()).ainvoke(messages)
     return {"messages": patches + [resp]}
 
 

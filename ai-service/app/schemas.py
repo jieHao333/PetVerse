@@ -31,26 +31,25 @@ class PetInfo(BaseModel):
 
 
 class AttachmentInfo(BaseModel):
-    """单条多模态附件；``key`` 供服务端二次读取（ASR / 视觉），已有 url 也要保留。"""
+    """单条对话附件；当前只支持图片，``key`` 保留给服务端追溯 OSS 对象。"""
 
-    type: Literal["image", "audio", "video"] = Field(description="附件类型")
+    type: str = Field(default="image", description="附件类型，当前仅支持 image")
     url: str = Field(description="附件地址（OSS 公网 URL）")
     key: Optional[str] = Field(default=None, description="OSS 对象 key")
     mime: str = Field(default="", description="MIME 类型")
     name: str = Field(default="", description="原始文件名")
     size: int = Field(default=0, description="文件大小（字节）")
-    transcript: Optional[str] = Field(default=None, description="音频转写文本（后端转写后回填）")
 
 
 class ChatRequest(BaseModel):
     """对话请求体；``message`` 与 ``attachments`` 至少有一个，校验在路由层做以返回业务错误码。"""
 
-    message: str = Field(default="", description="用户本轮输入的文字消息；纯附件时可缺省")
+    message: str = Field(default="", description="用户本轮输入的文字消息；纯图片时可缺省")
     pet: PetInfo = Field(default_factory=PetInfo, description="当前咨询的宠物信息（缺省时不拼宠物档案）")
     sessionId: Optional[int] = Field(default=None, description="会话 ID；缺省时后端自动新建会话并通过 meta 事件回传")
     # 数量上限由 settings.CHAT_MAX_ATTACHMENTS 在路由层校验，这里不写死。
     attachments: List[AttachmentInfo] = Field(default_factory=list,
-                                             description="本轮多模态附件（图片/音频/视频），先经 /ai/chat/upload 上传")
+                                             description="本轮图片附件（仅图片），先经 /ai/chat/upload 上传")
 
 
 class ApprovalRequest(BaseModel):
@@ -253,3 +252,51 @@ class SkillUpsert(BaseModel):
     description: str = Field(min_length=1, max_length=1024, description="单行说明：做什么 + 何时触发（技能选择的唯一依据）")
     content: str = Field(min_length=1, max_length=20000, description="SKILL.md 正文（Markdown 指令，不超过 500 行）")
     enabled: bool = Field(default=True, description="是否启用（停用后下一轮对话不再出现在技能目录）")
+
+
+class ModelItem(BaseModel):
+    """供应商下的一个模型（「Provider + Model」两级结构里的 Model 层）。
+
+    同一供应商的模型共享协议 / Base URL / Key，只有模型 ID 与能力不同；
+    因此切换模型只需要改一个指针，不必重复填凭证。
+    """
+
+    id: str = Field(min_length=1, max_length=128,
+                    description="模型 ID（服务商要求的 model 名，如 deepseek-chat / claude-sonnet-4-5）")
+    label: str = Field(default="", max_length=64, description="管理页展示名；留空则显示模型 ID")
+    vision: bool = Field(default=False, description="该模型是否支持图片输入（支持时图片会直接送给它）")
+    maxTokens: int = Field(default=0, ge=0, le=1048576,
+                           description="单次生成的最大输出（token）；0 表示沿用全局 LLM_MAX_TOKENS。"
+                                       "管理页支持 128K / 1M 写法，提交前已换算成 token（1K=1024，1M=1048576）")
+
+
+class ModelProviderUpsert(BaseModel):
+    """模型供应商的新增 / 更新请求体（管理员接口）。
+
+    ``protocol`` 决定 Base URL 与 SDK：``openai`` 走 ``/chat/completions``（地址一般带 ``/v1``），
+    ``anthropic`` 走 ``/v1/messages``（地址一般不带 ``/v1``）。更新时 ``apiKey`` 留空表示沿用原 Key，
+    避免管理页把脱敏后的掩码当成新 Key 提交。
+    """
+
+    name: str = Field(min_length=1, max_length=64, description="供应商名称（唯一，管理页展示用）")
+    protocol: Literal["openai", "anthropic"] = Field(
+        default="openai", description="协议：openai = OpenAI 兼容；anthropic = Anthropic Messages")
+    baseUrl: str = Field(default="", max_length=500, description="接口地址（不带 /chat/completions 等具体路径）")
+    apiKey: str = Field(default="", max_length=500, description="API Key；更新时留空表示不修改")
+    models: List[ModelItem] = Field(default_factory=list, description="该供应商下可用的模型清单")
+    description: str = Field(default="", max_length=255, description="用途说明（仅管理页展示）")
+    enabled: bool = Field(default=True, description="是否启用（停用后不能再被选为当前模型）")
+
+
+class ModelActivateRequest(BaseModel):
+    """切换当前生效模型。"""
+
+    providerId: int = Field(description="供应商 ID")
+    model: str = Field(min_length=1, max_length=128, description="模型 ID（须在该供应商的模型清单内）")
+
+
+class ModelTestRequest(BaseModel):
+    """模型连通性测试请求。"""
+
+    providerId: int = Field(description="供应商 ID")
+    model: str = Field(min_length=1, max_length=128, description="要测试的模型 ID")
